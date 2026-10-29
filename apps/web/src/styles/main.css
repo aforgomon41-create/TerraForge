@@ -1,0 +1,100 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #app {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: #0A0C10;
+    color: #E8EAED;
+    font-family: 'Inter', 'Noto Sans SC', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection {
+    background: rgba(201, 162, 39, 0.3);
+  }
+}
+
+@layer components {
+  /* 悬浮面板：毛玻璃 + 细描边 + 柔和阴影 */
+  .glass {
+    background: rgba(18, 21, 28, 0.72);
+    backdrop-filter: blur(24px) saturate(140%);
+    -webkit-backdrop-filter: blur(24px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow:
+      0 8px 32px rgba(0, 0, 0, 0.4),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .panel {
+    @apply glass rounded-2xl;
+  }
+
+  /* 按钮 */
+  .btn {
+    @apply px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150
+           border border-white/10 bg-white/[0.04] hover:bg-white/[0.09]
+           active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply btn border-accent/40 bg-accent/15 text-accent
+           hover:bg-accent/25 hover:border-accent/60;
+  }
+
+  .btn-ghost {
+    @apply btn border-transparent bg-transparent hover:bg-white/[0.06];
+  }
+
+  /* 滑杆 */
+  .slider {
+    @apply w-full h-1 rounded-full appearance-none bg-white/10 cursor-pointer;
+  }
+  .slider::-webkit-slider-thumb {
+    @apply appearance-none w-3.5 h-3.5 rounded-full bg-accent cursor-pointer
+           transition-transform hover:scale-125;
+    box-shadow: 0 0 0 3px rgba(201, 162, 39, 0.2);
+  }
+
+  /* 加载指示 */
+  .spinner {
+    @apply inline-block w-4 h-4 border-2 border-white/20 border-t-accent rounded-full animate-spin;
+  }
+
+  /* 细文字 */
+  .label-xs {
+    @apply text-[11px] uppercase tracking-wider text-dim/70 font-medium;
+  }
+}
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+
+/* 进入动画 */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up {
+  animation: fadeUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+}

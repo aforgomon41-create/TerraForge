@@ -1,0 +1,15 @@
+[package]
+name = "tf-grid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tf-core.workspace = true
+glam.workspace = true
+serde.workspace = true
+rayon.workspace = true
+bitvec.workspace = true
+thiserror.workspace = true
+hashbrown.workspace = true

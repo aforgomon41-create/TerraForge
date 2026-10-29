@@ -1,0 +1,22 @@
+[package]
+name = "terraforge-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "TerraForge 世界生成器桌面版"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tf-server = { path = "../crates/tf-server" }
+tf-core = { path = "../crates/tf-core" }
+tf-grid = { path = "../crates/tf-grid" }
+tf-sim = { path = "../crates/tf-sim" }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
