@@ -31,19 +31,32 @@ use crate::store::{Channel, MapNodeRecord, Store, WorldRecord};
 pub struct AppState {
     pub store: Store,
     pub jobs: JobManager,
+    pub config: Arc<crate::config::ServerConfig>,
+    pub exports: Arc<tokio::sync::Semaphore>,
+    pub reads: Arc<tokio::sync::Semaphore>,
+    pub streams: Arc<tokio::sync::Semaphore>,
+    pub admission: Arc<tokio::sync::Mutex<Vec<u64>>>,
 }
 
 /// 组装路由。
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/api/v1/health", get(health))
+    let body_limit = if state.config.desktop {
+        512 * 1024 * 1024
+    } else {
+        64 * 1024 * 1024
+    };
+    let protected = Router::new()
         .route("/api/v1/worlds", post(create_world).get(list_worlds))
+        .route("/api/v1/projects/import", post(import_project))
         .route("/api/v1/worlds/{id}", get(get_world).delete(delete_world))
         .route("/api/v1/worlds/{id}/maps", get(list_maps))
         .route("/api/v1/worlds/{id}/generate", post(generate_world))
         .route("/api/v1/maps/{id}", get(get_map))
         .route("/api/v1/maps/{id}/field/{channel}", get(get_field))
         .route("/api/v1/maps/{id}/preview", get(get_preview))
+        .route("/api/v1/maps/{id}/grid", get(get_grid))
+        .route("/api/v1/maps/{id}/metadata", get(get_metadata))
+        .route("/api/v1/maps/{id}/sample", get(sample_map))
         .route("/api/v1/maps/{id}/children", post(generate_child))
         .route("/api/v1/maps/{id}/export.json", get(export_json))
         .route("/api/v1/maps/{id}/export.png", get(export_png))
@@ -52,7 +65,68 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/events", get(sse_events))
         .route("/api/v1/system/status", get(system_status))
         .route("/api/v1/system/concurrency", patch(set_concurrency))
+        .route(
+            "/api/v1/session/heartbeat",
+            post(|| async { Json(serde_json::json!({"ok":true})) }),
+        )
+        .route("/api/v1/session", delete(close_session))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::authorize,
+        ));
+    protected
+        .route("/api/v1/health", get(health))
+        .route("/api/v1/session", post(crate::auth::open_session))
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .with_state(state)
+}
+
+pub async fn expire_session(
+    st: &AppState,
+    session: &crate::auth::SessionRecord,
+) -> anyhow::Result<()> {
+    if !st.config.desktop {
+        for world in st.store.list_worlds(&session.owner)? {
+            st.jobs.delete_world(&world.id).await?;
+        }
+    }
+    st.store.delete_session(&session.id)?;
+    Ok(())
+}
+pub async fn expire_if_idle(st: &AppState, id: &str) -> anyhow::Result<()> {
+    let _admission = st.admission.lock().await;
+    if let Some(session) = st.store.get_session(id)? {
+        if !st.config.desktop
+            && now_millis().saturating_sub(session.last_seen)
+                >= st.config.session_ttl.as_millis() as u64
+        {
+            expire_session(st, &session).await?;
+        }
+    }
+    Ok(())
+}
+fn ensure_live(st: &AppState, owner: &str) -> Result<(), ApiError> {
+    if !st.config.desktop && st.store.get_session(owner)?.is_none() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "会话已结束，请重新打开页面",
+        ));
+    }
+    Ok(())
+}
+async fn close_session(
+    State(st): State<AppState>,
+    axum::Extension(session): axum::Extension<crate::auth::SessionRecord>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _admission = st.admission.lock().await;
+    expire_session(&st, &session).await?;
+    Ok((
+        [(
+            "set-cookie",
+            "tf_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+        )],
+        Json(serde_json::json!({"ok":true})),
+    ))
 }
 
 // ---------------- 健康与状态 ----------------
@@ -75,13 +149,16 @@ struct SystemStatus {
 
 static START_TIME: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
-async fn system_status(State(st): State<AppState>) -> Json<SystemStatus> {
+async fn system_status(State(st): State<AppState>, headers: HeaderMap) -> Json<SystemStatus> {
     let start = START_TIME.get_or_init(std::time::Instant::now);
-    let active = st.jobs.max_concurrent();
+    let (active, _) = st.jobs.counts().await;
     Json(SystemStatus {
-        max_concurrent: active,
-        active_jobs: if active > 0 { active } else { 0 },
-        worlds: 0,
+        max_concurrent: st.jobs.max_concurrent().await,
+        active_jobs: active,
+        worlds: st
+            .store
+            .list_worlds(&owner_from_headers(&headers))
+            .map_or(0, |w| w.len()),
         uptime_secs: start.elapsed().as_secs(),
     })
 }
@@ -96,7 +173,7 @@ async fn set_concurrency(
     Json(body): Json<ConcurrencyBody>,
 ) -> Json<serde_json::Value> {
     st.jobs.set_max_concurrent(body.max_concurrent).await;
-    Json(serde_json::json!({ "ok": true, "max_concurrent": st.jobs.max_concurrent() }))
+    Json(serde_json::json!({ "ok": true, "max_concurrent": st.jobs.max_concurrent().await }))
 }
 
 // ---------------- 世界 ----------------
@@ -120,10 +197,10 @@ struct WorldResponse {
 
 fn owner_from_headers(headers: &HeaderMap) -> String {
     headers
-        .get("x-tf-client")
+        .get("x-tf-owner")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "anonymous".to_string())
+        .unwrap_or_default()
 }
 
 fn short_id(prefix: &str) -> String {
@@ -142,12 +219,21 @@ async fn create_world(
     // 部署形态决定精度档位，客户端不能越权。
     // 网页版锁死 Economy（世界层 f=256，约 65 万格）；
     // 本地部署和桌面版可以用 Standard 或 High。
-    if let Ok(level) = std::env::var("TF_QUALITY") {
-        params.quality = match level.to_lowercase().as_str() {
-            "economy" | "low" => tf_core::params::SimQuality::Economy,
-            "high" => tf_core::params::SimQuality::High,
-            _ => tf_core::params::SimQuality::Standard,
-        };
+    params.quality = st.config.quality;
+    if body.name.trim().is_empty() || body.name.chars().count() > 80 {
+        return Err(ApiError::bad_request("世界名称需要 1～80 个字符"));
+    }
+    let owner = owner_from_headers(&headers);
+    let _admission = st.admission.lock().await;
+    ensure_live(&st, &owner)?;
+    if !st.config.desktop && st.store.world_count()? >= 8 {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "体验世界数量已满，请稍后重试",
+        ));
+    }
+    if !st.config.desktop && st.store.list_worlds(&owner)?.len() >= 4 {
+        return Err(ApiError::bad_request("当前体验会话最多创建 4 个世界"));
     }
 
     if let Err(e) = params.validate() {
@@ -155,7 +241,6 @@ async fn create_world(
     }
 
     let id = short_id("world");
-    let owner = owner_from_headers(&headers);
     let now = now_millis() as i64;
 
     let rec = WorldRecord {
@@ -179,7 +264,10 @@ async fn create_world(
     }))
 }
 
-async fn list_worlds(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<WorldResponse>>, ApiError> {
+async fn list_worlds(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WorldResponse>>, ApiError> {
     let owner = owner_from_headers(&headers);
     let worlds = st.store.list_worlds(&owner)?;
     Ok(Json(
@@ -196,8 +284,14 @@ async fn list_worlds(State(st): State<AppState>, headers: HeaderMap) -> Result<J
     ))
 }
 
-async fn get_world(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<serde_json::Value>, ApiError> {
-    let w = st.store.get_world(&id)?.ok_or_else(|| ApiError::not_found("世界不存在"))?;
+async fn get_world(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let w = st
+        .store
+        .get_world(&id)?
+        .ok_or_else(|| ApiError::not_found("世界不存在"))?;
     Ok(Json(serde_json::json!({
         "id": w.id,
         "name": w.name,
@@ -208,8 +302,11 @@ async fn get_world(State(st): State<AppState>, Path(id): Path<String>) -> Result
     })))
 }
 
-async fn delete_world(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<serde_json::Value>, ApiError> {
-    st.store.delete_world(&id)?;
+async fn delete_world(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    st.jobs.delete_world(&id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -219,7 +316,18 @@ async fn generate_world(
     State(st): State<AppState>,
     Path(world_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let world = st.store.get_world(&world_id)?.ok_or_else(|| ApiError::not_found("世界不存在"))?;
+    let _admission = st.admission.lock().await;
+    let existing = st.store.list_map_nodes(&world_id)?;
+    if !st.config.desktop
+        && (existing.len() >= 16
+            || existing.iter().map(|m| m.cells as u64).sum::<u64>() + 655_362 > 4_000_000)
+    {
+        return Err(ApiError::bad_request("当前世界地图数量或总格数已达上限"));
+    }
+    let world = st
+        .store
+        .get_world(&world_id)?
+        .ok_or_else(|| ApiError::not_found("世界不存在"))?;
     let params: tf_core::params::GenerationParams = serde_json::from_str(&world.params_json)?;
 
     let map_id = short_id("map");
@@ -230,6 +338,7 @@ async fn generate_world(
         id: map_id.clone(),
         world_id: world_id.clone(),
         kind: "world".to_string(),
+        name: "世界总图".into(),
         parent: None,
         cells: 10 * freq * freq + 2,
         cell_size_m: cell_size.sqrt(),
@@ -237,10 +346,18 @@ async fn generate_world(
         status: "pending".to_string(),
         created_at: now_millis() as i64,
         completed_at: None,
+        grid: Some(tf_grid::GridDescriptor::sphere(
+            freq,
+            params.planet.radius_m,
+        )),
+        seed: params.seed,
+        generator_version: "tf-0.2".into(),
     };
-    st.store.put_map_node(&node)?;
 
-    let job_id = st.jobs.submit(map_id.clone(), world_id, node, params).await?;
+    let job_id = st
+        .jobs
+        .submit(map_id.clone(), world_id, node, params)
+        .await?;
 
     Ok(Json(serde_json::json!({
         "job_id": job_id,
@@ -248,73 +365,173 @@ async fn generate_world(
     })))
 }
 
-async fn list_maps(State(st): State<AppState>, Path(world_id): Path<String>) -> Result<Json<Vec<MapNodeRecord>>, ApiError> {
+async fn list_maps(
+    State(st): State<AppState>,
+    Path(world_id): Path<String>,
+) -> Result<Json<Vec<MapNodeRecord>>, ApiError> {
     Ok(Json(st.store.list_map_nodes(&world_id)?))
 }
 
-async fn get_map(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<MapNodeRecord>, ApiError> {
-    let m = st.store.get_map_node(&id)?.ok_or_else(|| ApiError::not_found("地图不存在"))?;
+async fn get_map(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<MapNodeRecord>, ApiError> {
+    let m = st
+        .store
+        .get_map_node(&id)?
+        .ok_or_else(|| ApiError::not_found("地图不存在"))?;
     Ok(Json(m))
 }
 
 // ---------------- 场数据 ----------------
 
 fn parse_channel(name: &str) -> Option<Channel> {
-    Some(match name {
-        "elevation" => Channel::Elevation,
-        "crust_thickness" => Channel::CrustThickness,
-        "crust_type" => Channel::CrustType,
-        "crust_age" => Channel::CrustAge,
-        "temperature" => Channel::Temperature,
-        "precipitation" => Channel::Precipitation,
-        "flow_accumulation" => Channel::FlowAccumulation,
-        "lake_depth" => Channel::LakeDepth,
-        "distance_to_sea" => Channel::DistanceToSea,
-        "biome" => Channel::Biome,
-        "soil" => Channel::Soil,
-        "soil_depth" => Channel::SoilDepth,
-        _ => return None,
-    })
+    Channel::parse(name)
 }
 
 async fn get_field(
     State(st): State<AppState>,
     Path((map_id, ch)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let channel = parse_channel(&ch).ok_or_else(|| ApiError::bad_request(format!("未知通道: {}", ch)))?;
-    let data = st
-        .store
-        .get_field(&map_id, channel)?
-        .ok_or_else(|| ApiError::not_found("该地图还没有这个通道的数据"))?;
-
-    // 转成二进制返回，比 JSON 小很多
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for v in &data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    Ok(([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
+    let channel =
+        parse_channel(&ch).ok_or_else(|| ApiError::bad_request(format!("未知通道: {}", ch)))?;
+    field_bytes(st, map_id, channel).await
 }
-
+async fn field_bytes(
+    st: AppState,
+    map_id: String,
+    channel: Channel,
+) -> Result<impl IntoResponse, ApiError> {
+    let permit =
+        st.reads.clone().try_acquire_owned().map_err(|_| {
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "地图读取繁忙，请稍后重试")
+        })?;
+    let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        let _permit = permit;
+        let data = st
+            .store
+            .get_field(&map_id, channel)?
+            .ok_or_else(|| anyhow::anyhow!("地图缺少此通道"))?;
+        Ok(data.iter().flat_map(|v| v.to_le_bytes()).collect())
+    })
+    .await??;
+    Ok(([("content-type", "application/octet-stream")], bytes))
+}
 async fn get_preview(
     State(st): State<AppState>,
-    Path(map_id): Path<String>,
+    Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // 返回高程的降采样 PNG 预览（简化版：返回原始 f32 数据让前端自己渲染）
-    let data = st
+    field_bytes(st, id, Channel::Elevation).await
+}
+
+async fn get_grid(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let node = st
         .store
-        .get_field(&map_id, Channel::Elevation)?
-        .ok_or_else(|| ApiError::not_found("该地图还没有生成"))?;
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for v in &data {
-        bytes.extend_from_slice(&v.to_le_bytes());
+        .get_map_node(&id)?
+        .ok_or_else(|| ApiError::not_found("地图不存在"))?;
+    let descriptor = node
+        .grid
+        .ok_or_else(|| ApiError::bad_request("旧版地图缺少网格描述，请重新生成"))?;
+    let permit = st.exports.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "正在准备地图数据，请稍后重试",
+        )
+    })?;
+    let bytes = tokio::task::spawn_blocking(move || {
+        use tf_grid::GridOps;
+        let grid = descriptor.build();
+        let mut out = Vec::with_capacity(grid.cell_count() * 12);
+        for i in 0..grid.cell_count() {
+            for x in grid.render_center(i) {
+                out.extend_from_slice(&x.to_le_bytes())
+            }
+        }
+        drop(permit);
+        out
+    })
+    .await
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(([("content-type", "application/octet-stream")], bytes))
+}
+
+#[derive(Deserialize)]
+struct SampleQuery {
+    lon: f64,
+    lat: f64,
+}
+async fn sample_map(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SampleQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !q.lon.is_finite()
+        || !q.lat.is_finite()
+        || !(-180.0..=180.0).contains(&q.lon)
+        || !(-90.0..=90.0).contains(&q.lat)
+    {
+        return Err(ApiError::bad_request("坐标无效"));
     }
-    Ok(([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
+    let node = st
+        .store
+        .get_map_node(&id)?
+        .ok_or_else(|| ApiError::not_found("地图不存在"))?;
+    if node.status != "done" {
+        return Err(ApiError::bad_request("地图尚未完成"));
+    }
+    let descriptor = node
+        .grid
+        .ok_or_else(|| ApiError::bad_request("旧版地图需要重新生成"))?;
+    let permit = st.exports.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "正在处理地图数据，请稍后重试",
+        )
+    })?;
+    let store = st.store.clone();
+    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let _permit = permit;
+        let grid = descriptor.build();
+        let dir = tf_core::geo::UnitVec3::from_lat_lon_deg(q.lat, q.lon);
+        let cell = grid
+            .cell_at(dir)
+            .ok_or_else(|| anyhow::anyhow!("坐标超出地图范围"))?;
+        let mut values = serde_json::Map::new();
+        for ch in [
+            Channel::Elevation,
+            Channel::Temperature,
+            Channel::Precipitation,
+            Channel::Biome,
+            Channel::FlowAccumulation,
+            Channel::LakeDepth,
+            Channel::PlateId,
+        ] {
+            if let Some(data) = store.get_field(&id, ch)? {
+                if let Some(value) = data.get(cell) {
+                    values.insert(ch.name().into(), serde_json::json!(value));
+                }
+            }
+        }
+        Ok(serde_json::json!({"cell":cell,"lon":q.lon,"lat":q.lat,"values":values}))
+    })
+    .await
+    .map_err(|e| ApiError::bad_request(e.to_string()))??;
+    Ok(Json(out))
 }
 
 // ---------------- 作业 ----------------
 
-async fn get_job(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<serde_json::Value>, ApiError> {
-    let j = st.store.get_job(&id)?.ok_or_else(|| ApiError::not_found("作业不存在"))?;
+async fn get_job(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let j = st
+        .store
+        .get_job(&id)?
+        .ok_or_else(|| ApiError::not_found("作业不存在"))?;
     Ok(Json(serde_json::json!({
         "id": j.id,
         "map_id": j.map_id,
@@ -328,7 +545,10 @@ async fn get_job(State(st): State<AppState>, Path(id): Path<String>) -> Result<J
     })))
 }
 
-async fn cancel_job(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn cancel_job(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let ok = st.jobs.cancel(&id).await;
     Ok(Json(serde_json::json!({ "ok": ok })))
 }
@@ -337,17 +557,41 @@ async fn cancel_job(State(st): State<AppState>, Path(id): Path<String>) -> Resul
 
 async fn sse_events(
     State(st): State<AppState>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let id = query
+        .get("job_id")
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("需要 job_id"))?;
+    let job = st
+        .store
+        .get_job(&id)?
+        .ok_or_else(|| ApiError::not_found("作业不存在"))?;
+    let world = st
+        .store
+        .get_world(&job.world_id)?
+        .ok_or_else(|| ApiError::not_found("世界不存在"))?;
+    if world.owner_token != owner_from_headers(&headers) {
+        return Err(ApiError::not_found("作业不存在"));
+    }
+    let permit = st
+        .streams
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "实时连接数量已达上限"))?;
     let rx = st.jobs.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| {
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+        let _keep_permit = &permit;
         let event = match msg {
-            Ok(ev) => encode_event(ev),
-            Err(_) => return None,
+            Ok(ev) if ev.job_id() == id => encode_event(ev),
+            Ok(_) => return None,
+            Err(_) => Event::default().event("resync").data("{}"),
         };
         Some(Ok(event))
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 fn encode_event(ev: JobEvent) -> Event {
@@ -369,9 +613,9 @@ fn encode_event(ev: JobEvent) -> Event {
             })
             .to_string(),
         ),
-        JobEvent::Stage { job_id, from, to } => Event::default().event("stage").data(
-            serde_json::json!({ "job_id": job_id, "from": from, "to": to }).to_string(),
-        ),
+        JobEvent::Stage { job_id, from, to } => Event::default()
+            .event("stage")
+            .data(serde_json::json!({ "job_id": job_id, "from": from, "to": to }).to_string()),
         JobEvent::Frame {
             job_id,
             tick,
@@ -387,18 +631,24 @@ fn encode_event(ev: JobEvent) -> Event {
                     "tick": tick,
                     "w": width,
                     "h": height,
-                    "fmt": "zstd+u16le+i8+u8x3",
+                    "fmt": "raw-u16le+u8x3",
                     "stats": {
                         "land_fraction": stats.land_fraction,
                         "max_elevation": stats.max_elevation,
                         "min_elevation": stats.min_elevation,
+                        "max_temperature": stats.max_temperature,
+                        "min_temperature": stats.min_temperature,
                     },
                     "data": encode(&data),
                 })
                 .to_string(),
             )
         }
-        JobEvent::Done { job_id, map_id, duration_ms } => Event::default().event("done").data(
+        JobEvent::Done {
+            job_id,
+            map_id,
+            duration_ms,
+        } => Event::default().event("done").data(
             serde_json::json!({ "job_id": job_id, "map_id": map_id, "duration_ms": duration_ms })
                 .to_string(),
         ),
@@ -436,7 +686,6 @@ mod base64_lite {
     }
 }
 
-
 #[derive(Deserialize)]
 struct ChildRequest {
     /// 子图类型：continent / region / site
@@ -459,6 +708,7 @@ async fn generate_child(
     Path(parent_id): Path<String>,
     Json(body): Json<ChildRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _admission = st.admission.lock().await;
     let parent = st
         .store
         .get_map_node(&parent_id)?
@@ -469,50 +719,103 @@ async fn generate_child(
         .get_world(&parent.world_id)?
         .ok_or_else(|| ApiError::not_found("世界不存在"))?;
 
-    // 层级与格宽
-    let (level_kind, cell_size_m) = match body.kind.as_str() {
-        "continent" => ("continent", 1_000.0),
-        "region" => ("region", 100.0),
-        "site" => ("site", 1.0),
-        other => return Err(ApiError::bad_request(format!("未知层级: {}", other))),
+    if body.name.as_ref().is_some_and(|n| n.chars().count() > 80) {
+        return Err(ApiError::bad_request("地图名称过长"));
+    }
+    let expected = match parent.kind.as_str() {
+        "world" => "continent",
+        "continent" => "region",
+        "region" => "site",
+        _ => return Err(ApiError::bad_request("地点层不能继续细化")),
     };
-
-    // 分辨率 = 覆盖宽度 / 格宽，限制在合理范围
-    let target_cells = (body.width_m / cell_size_m).round() as u32;
-    let cells = target_cells.clamp(256, 4096);
-
-    let map_id = short_id("map");
-
-    // 子种子：由世界种子 + 父图 id 派生，保证可复现
-    let mut params: tf_core::params::GenerationParams =
-        serde_json::from_str(&world.params_json)?;
-    let path_seed = tf_core::rng::derive_child_seed(
-        params.seed,
-        &[hash_str(&parent_id), hash_str(&format!("{:.4},{:.4}", body.center_lon, body.center_lat))],
+    if body.kind != expected || parent.status != "done" {
+        return Err(ApiError::bad_request("只能从已完成的父图生成下一层"));
+    }
+    let cell_size_m = match body.kind.as_str() {
+        "continent" => 1000.,
+        "region" => 100.,
+        "site" => 1.,
+        _ => unreachable!(),
+    };
+    if !body.width_m.is_finite()
+        || body.width_m <= 0.
+        || !body.center_lat.is_finite()
+        || !body.center_lon.is_finite()
+        || !(-90.0..=90.0).contains(&body.center_lat)
+        || !(-180.0..=180.0).contains(&body.center_lon)
+    {
+        return Err(ApiError::bad_request("经纬度或覆盖宽度无效"));
+    }
+    let side_f = (body.width_m / cell_size_m).ceil();
+    let limit = st.config.max_patch_side();
+    if side_f < 4. || side_f > limit as f64 {
+        return Err(ApiError::bad_request(format!(
+            "当前精度最多 {limit}×{limit} 格，请将覆盖宽度设为 {}～{} 米",
+            cell_size_m * 4.,
+            cell_size_m * limit as f64
+        )));
+    }
+    let side = side_f as u32;
+    let width_m = side as f64 * cell_size_m;
+    let params: tf_core::params::GenerationParams = serde_json::from_str(&world.params_json)?;
+    let grid = tf_grid::GridDescriptor::patch(
+        body.center_lat,
+        body.center_lon,
+        width_m,
+        side,
+        params.planet.radius_m,
     );
-    params.seed = path_seed;
-
+    grid.validate().map_err(ApiError::bad_request)?;
+    let parent_desc = parent
+        .grid
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("旧版父图缺少空间描述，请重新生成"))?;
+    if let tf_grid::MapGrid::Patch(parent_grid) = parent_desc.build() {
+        use tf_grid::GridOps;
+        let child_grid = grid.build();
+        for i in [
+            0,
+            side as usize - 1,
+            (side as usize - 1) * side as usize,
+            side as usize * side as usize - 1,
+        ] {
+            if parent_grid.cell_at(child_grid.center_dir(i)).is_none() {
+                return Err(ApiError::bad_request(
+                    "子图超出父图覆盖范围，请缩小选区或移动中心",
+                ));
+            }
+        }
+    }
+    let mut params = params;
+    let descriptor = serde_json::to_string(&grid)?;
+    params.seed = tf_core::rng::derive_child_seed(parent.seed, &[hash_str(&descriptor)]);
+    let cells = side * side;
+    let maps = st.store.list_map_nodes(&parent.world_id)?;
+    if !st.config.desktop
+        && (maps.len() >= 16
+            || maps.iter().map(|m| m.cells as u64).sum::<u64>() + cells as u64 > 4_000_000)
+    {
+        return Err(ApiError::bad_request(
+            "当前世界地图数量或总格数已达网页版上限",
+        ));
+    }
+    let map_id = short_id("map");
     let node = MapNodeRecord {
         id: map_id.clone(),
         world_id: parent.world_id.clone(),
-        kind: level_kind.to_string(),
-        parent: Some(parent_id.clone()),
+        kind: body.kind.clone(),
+        name: body.name.unwrap_or_else(|| expected.to_string()),
+        parent: Some(parent_id),
         cells,
         cell_size_m,
-        extent_json: serde_json::json!({
-            "type": "patch",
-            "center_lon": body.center_lon,
-            "center_lat": body.center_lat,
-            "width_m": body.width_m,
-            "parent": parent_id,
-        })
-        .to_string(),
-        status: "pending".to_string(),
+        extent_json: descriptor,
+        status: "pending".into(),
         created_at: now_millis() as i64,
         completed_at: None,
+        grid: Some(grid),
+        seed: params.seed,
+        generator_version: "tf-0.2".into(),
     };
-    st.store.put_map_node(&node)?;
-
     let job_id = st
         .jobs
         .submit(map_id.clone(), parent.world_id.clone(), node, params)
@@ -521,7 +824,7 @@ async fn generate_child(
     Ok(Json(serde_json::json!({
         "job_id": job_id,
         "map_id": map_id,
-        "kind": level_kind,
+        "kind": body.kind,
         "cells": cells,
         "cell_size_m": cell_size_m,
     })))
@@ -538,128 +841,132 @@ fn hash_str(s: &str) -> u128 {
     u128::from_le_bytes(bytes)
 }
 
-
 // ---------------- 导出 ----------------
 
-/// 导出完整世界数据为 JSON。
+async fn get_metadata(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut metadata = st.store.get_metadata(&id)?.unwrap_or_default();
+    if let Some(cell) = query.get("cell") {
+        let cell = cell
+            .parse::<u64>()
+            .map_err(|_| ApiError::bad_request("格子编号无效"))?;
+        if let Some(minerals) = metadata.get_mut("minerals").and_then(|v| v.as_array_mut()) {
+            minerals.retain(|m| m.get("cell").and_then(|v| v.as_u64()) == Some(cell));
+        }
+    }
+    Ok(Json(metadata))
+}
 async fn export_json(
     State(st): State<AppState>,
     Path(map_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    use base64_lite::encode;
-
     let node = st
         .store
         .get_map_node(&map_id)?
         .ok_or_else(|| ApiError::not_found("地图不存在"))?;
-
-    let world = st
-        .store
-        .get_world(&node.world_id)?
-        .ok_or_else(|| ApiError::not_found("世界不存在"))?;
-
-    let mut channels = serde_json::Map::new();
-    for ch in [
-        Channel::Elevation,
-        Channel::CrustThickness,
-        Channel::CrustType,
-        Channel::CrustAge,
-        Channel::Temperature,
-        Channel::Precipitation,
-        Channel::FlowAccumulation,
-        Channel::LakeDepth,
-        Channel::DistanceToSea,
-        Channel::Biome,
-        Channel::Soil,
-        Channel::SoilDepth,
-    ] {
-        if let Some(data) = st.store.get_field(&map_id, ch)? {
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for v in &data {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            channels.insert(
-                ch.name().to_string(),
-                serde_json::json!({
-                    "encoding": "f32le+base64",
-                    "count": data.len(),
-                    "data": encode(&bytes),
-                }),
-            );
-        }
-    }
-
-    let payload = serde_json::json!({
-        "format": "terraforge-world-v1",
-        "exported_at": now_millis(),
-        "world": {
-            "id": world.id,
-            "name": world.name,
-            "seed": world.seed,
-            "params": serde_json::from_str::<serde_json::Value>(&world.params_json)
-                .unwrap_or(serde_json::Value::Null),
-        },
-        "map": {
-            "id": node.id,
-            "kind": node.kind,
-            "parent": node.parent,
-            "cells": node.cells,
-            "cell_size_m": node.cell_size_m,
-        },
-        "channels": channels,
-    });
-
-    let body = serde_json::to_vec_pretty(&payload)?;
+    let permit = st.exports.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "正在处理另一项数据操作，请稍后再试",
+        )
+    })?;
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::project::export(&st.store, &node.world_id)
+    })
+    .await??;
     Ok((
         [
-            (axum::http::header::CONTENT_TYPE, "application/json"),
+            ("content-type", "application/json"),
             (
-                axum::http::header::CONTENT_DISPOSITION,
-                "attachment; filename=\"world.json\"",
+                "content-disposition",
+                "attachment; filename=terraforge.tfworld",
             ),
         ],
-        body,
+        bytes,
     ))
 }
-
-/// 导出高分辨率 PNG 地图。
+async fn import_project(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = owner_from_headers(&headers);
+    let _admission = st.admission.lock().await;
+    ensure_live(&st, &owner)?;
+    if !st.config.desktop
+        && (st.store.world_count()? >= 8 || st.store.list_worlds(&owner)?.len() >= 4)
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "当前世界数量已达上限",
+        ));
+    }
+    let permit =
+        st.exports.clone().try_acquire_owned().map_err(|_| {
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "请等待另一项数据操作完成")
+        })?;
+    let world = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::project::import(&st.store, &body, &owner, &st.config)
+    })
+    .await?
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(
+        serde_json::json!({"id":world.id,"name":world.name,"seed":world.seed,"created_at":world.created_at}),
+    ))
+}
 async fn export_png(
     State(st): State<AppState>,
     Path(map_id): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let size: u32 = params
+    let max = if st.config.desktop { 8192 } else { 2048 };
+    let size = params
         .get("size")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2048)
-        .clamp(256, 8192);
-
-    let _node = st
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2048);
+    if !(256..=max).contains(&size) {
+        return Err(ApiError::bad_request(format!(
+            "当前模式导出宽度须为 256～{max} 像素"
+        )));
+    }
+    let node = st
         .store
         .get_map_node(&map_id)?
         .ok_or_else(|| ApiError::not_found("地图不存在"))?;
-
-    let elevation = st
-        .store
-        .get_field(&map_id, Channel::Elevation)?
-        .ok_or_else(|| ApiError::not_found("该地图还没有生成"))?;
-
-    let biome = st
-        .store
-        .get_field(&map_id, Channel::Biome)?
-        .unwrap_or_else(|| vec![0.0; elevation.len()]);
-
-    let png = crate::render::render_map_png(&elevation, &biome, size)?;
-
+    if node.status != "done" {
+        return Err(ApiError::bad_request("请等待地图生成完成"));
+    }
+    let descriptor = node
+        .grid
+        .ok_or_else(|| ApiError::bad_request("旧版地图缺少网格描述，请重新生成"))?;
+    let permit =
+        st.exports.clone().try_acquire_owned().map_err(|_| {
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "请等待另一项数据操作完成")
+        })?;
+    let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _permit = permit;
+        let elevation = st
+            .store
+            .get_field(&map_id, Channel::Elevation)?
+            .ok_or_else(|| anyhow::anyhow!("缺少高程"))?;
+        let biome = st
+            .store
+            .get_field(&map_id, Channel::Biome)?
+            .ok_or_else(|| anyhow::anyhow!("缺少生态"))?;
+        crate::render::render_map_png(&elevation, &biome, &descriptor, size)
+    })
+    .await??;
     Ok((
         [
-            (axum::http::header::CONTENT_TYPE, "image/png"),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                "attachment; filename=\"map.png\"",
-            ),
+            ("content-type", "image/png"),
+            ("content-disposition", "attachment; filename=terraforge.png"),
         ],
-        png,
+        bytes,
     ))
 }
 
@@ -687,7 +994,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }
 

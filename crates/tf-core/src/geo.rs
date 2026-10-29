@@ -16,7 +16,11 @@ impl UnitVec3 {
     /// 从已归一化的向量构造。debug 下会检查。
     #[inline]
     pub fn from_normalized(v: DVec3) -> Self {
-        debug_assert!((v.length() - 1.0).abs() < 1e-9, "vector not normalized: {:?}", v);
+        debug_assert!(
+            (v.length() - 1.0).abs() < 1e-9,
+            "vector not normalized: {:?}",
+            v
+        );
         Self(v)
     }
 
@@ -54,14 +58,14 @@ impl UnitVec3 {
     /// 在切平面上的一个正交基，用于把球面方向映射到局部平面。
     #[inline]
     pub fn tangent_frame(&self) -> (DVec3, DVec3) {
-        // 选一个和 self 不平行的参考向量，避免退化
-        let reference = if self.0.y.abs() < 0.9 {
-            DVec3::Y
+        // +longitude is east; keep north aligned with +latitude, including near poles.
+        let horizontal = DVec3::new(-self.0.z, 0.0, self.0.x);
+        let east = if horizontal.length() > 1e-12 {
+            horizontal.normalize()
         } else {
-            DVec3::X
+            DVec3::Z
         };
-        let east = reference.cross(self.0).normalize();
-        let north = self.0.cross(east);
+        let north = east.cross(self.0).normalize();
         (east, north)
     }
 
@@ -147,12 +151,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compass_bearings_increase_correct_coordinate() {
+        let p = UnitVec3::from_lat_lon_deg(30., 100.);
+        let east = p
+            .offset(std::f64::consts::FRAC_PI_2, 0.001)
+            .to_lat_lon_deg();
+        let north = p.offset(0., 0.001).to_lat_lon_deg();
+        assert!(east.1 > 100.);
+        assert!(north.0 > 30.);
+    }
+    #[test]
     fn lat_lon_roundtrip() {
         for &(lat, lon) in &[(0.0, 0.0), (45.0, 90.0), (-30.0, -120.0), (89.0, 179.0)] {
             let p = GeoPoint::new(lat, lon);
             let back = GeoPoint::from_unit(p.to_unit());
-            assert!((back.lat_deg - lat).abs() < 1e-9, "lat {} -> {}", lat, back.lat_deg);
-            assert!((back.lon_deg - lon).abs() < 1e-9, "lon {} -> {}", lon, back.lon_deg);
+            assert!(
+                (back.lat_deg - lat).abs() < 1e-9,
+                "lat {} -> {}",
+                lat,
+                back.lat_deg
+            );
+            assert!(
+                (back.lon_deg - lon).abs() < 1e-9,
+                "lon {} -> {}",
+                lon,
+                back.lon_deg
+            );
         }
     }
 

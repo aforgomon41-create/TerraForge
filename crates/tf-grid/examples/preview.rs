@@ -10,12 +10,19 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let freq: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(32);
     let size: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1200);
-    let out = args.get(3).cloned().unwrap_or_else(|| format!("hexgrid_f{}.png", freq));
+    let out = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| format!("hexgrid_f{}.png", freq));
 
     println!("构建 f={} 的六角球...", freq);
     let t = std::time::Instant::now();
     let grid = SphereHexGrid::build(freq, 6_371_000.0, (glam::DVec3::Z, 0.0));
-    println!("  耗时 {} ms, 格数 {}", t.elapsed().as_millis(), grid.cell_count());
+    println!(
+        "  耗时 {} ms, 格数 {}",
+        t.elapsed().as_millis(),
+        grid.cell_count()
+    );
 
     let mut img = vec![0u8; (size * size * 3) as usize];
     // 深蓝背景
@@ -33,11 +40,15 @@ fn main() {
     println!("光栅化 {} 个格子...", grid.cell_count());
     for i in 0..grid.cell_count() {
         let corners = grid.corners_of(i);
-        if corners.len() < 3 { continue; }
+        if corners.len() < 3 {
+            continue;
+        }
 
         // 只画朝向观察者的格子（z > 0，正交投影下即前半球的）
         let center = grid.center(i).as_vec();
-        if center.z < 0.0 { continue; }
+        if center.z < 0.0 {
+            continue;
+        }
 
         // 按纬度着色：赤道偏暖，两极偏冷
         let lat = center.y.asin();
@@ -47,16 +58,31 @@ fn main() {
         let b = (60.0 + 180.0 * t01) as u8;
 
         // 五边形用亮黄色标记
-        let (r, g, b) = if grid.is_pentagon(i) { (255u8, 220u8, 40u8) } else { (r, g, b) };
+        let (r, g, b) = if grid.is_pentagon(i) {
+            (255u8, 220u8, 40u8)
+        } else {
+            (r, g, b)
+        };
 
         // 投影角点
-        let pts: Vec<(f64, f64)> = corners.iter().map(|p| {
-            (cx + p.x * radius, cy - p.y * radius)
-        }).collect();
+        let pts: Vec<(f64, f64)> = corners
+            .iter()
+            .map(|p| (cx + p.x * radius, cy - p.y * radius))
+            .collect();
 
         // 扫描线填充
-        let min_y = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as i32;
-        let max_y = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max).ceil().min(size as f64 - 1.0) as i32;
+        let min_y = pts
+            .iter()
+            .map(|p| p.1)
+            .fold(f64::INFINITY, f64::min)
+            .floor()
+            .max(0.0) as i32;
+        let max_y = pts
+            .iter()
+            .map(|p| p.1)
+            .fold(f64::NEG_INFINITY, f64::max)
+            .ceil()
+            .min(size as f64 - 1.0) as i32;
         for y in min_y..=max_y {
             let yf = y as f64 + 0.5;
             let mut xs: Vec<f64> = Vec::new();
@@ -88,7 +114,6 @@ fn main() {
     write_png(&out, &img, size, size);
     println!("已写出 {}", out);
 }
-
 
 /// 把数据包成 zlib 流，内部用 deflate 的 stored（不压缩）块。
 ///
@@ -141,7 +166,8 @@ fn write_png(path: &str, rgb: &[u8], w: u32, h: u32) {
     let compressed = zlib_stored(&raw);
 
     let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+    f.write_all(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+        .unwrap();
     let mut ihdr = Vec::new();
     ihdr.extend_from_slice(&w.to_be_bytes());
     ihdr.extend_from_slice(&h.to_be_bytes());
@@ -173,11 +199,18 @@ impl Crc32 {
         for i in 0..256u32 {
             let mut c = i;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB88320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             table[i as usize] = c;
         }
-        Self { table, value: 0xFFFFFFFF }
+        Self {
+            table,
+            value: 0xFFFFFFFF,
+        }
     }
     fn update(&mut self, data: &[u8]) {
         for &b in data {

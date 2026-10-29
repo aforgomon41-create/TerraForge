@@ -8,6 +8,9 @@ use tf_core::geo::UnitVec3;
 
 /// 网格操作的公共接口。
 pub trait GridOps: Send + Sync {
+    fn radius_m(&self) -> f64 {
+        6_371_000.0
+    }
     /// 格子总数。
     fn cell_count(&self) -> usize;
 

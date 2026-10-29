@@ -109,6 +109,6 @@ pub struct BoundaryCell {
     pub other: u32,
     pub kind: BoundaryKind,
     pub subtype: BoundarySubtype,
-    /// 法向相对速度，米每百万年。负值是汇聚。
+    /// 法向相对速度，米每百万年。正值是汇聚（当前格朝相邻格运动）。
     pub normal_velocity: f64,
 }

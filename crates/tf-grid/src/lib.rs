@@ -16,3 +16,6 @@ pub use grid_ops::GridOps;
 pub use patch_grid::{PatchGrid, SphericalPatch};
 pub use plane_hex::{AxialCoord, HexGrid2D};
 pub use sphere_hex::{GridStats, SphereHexGrid};
+
+pub mod descriptor;
+pub use descriptor::{GridDescriptor, MapGrid, GRID_VERSION};

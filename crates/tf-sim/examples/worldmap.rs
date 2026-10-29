@@ -2,7 +2,6 @@
 //!
 //! 用法: cargo run --release --example worldmap -- <freq> <size> <out.png> [seed]
 
-use std::f64::consts::PI;
 use tf_core::params::GenerationParams;
 use tf_grid::{GridOps, SphereHexGrid};
 use tf_sim::ecology::Biome;
@@ -11,7 +10,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let freq: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(128);
     let size: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1600);
-    let out = args.get(3).cloned().unwrap_or_else(|| "world.png".to_string());
+    let out = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "world.png".to_string());
     let seed: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(42);
 
     let mut params = GenerationParams::default();
@@ -24,7 +26,11 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let grid = SphereHexGrid::build(freq, params.planet.radius_m, (glam::DVec3::Z, 0.0));
-    println!("网格: {} 格, 构建 {:.2}s", grid.cell_count(), t0.elapsed().as_secs_f64());
+    println!(
+        "网格: {} 格, 构建 {:.2}s",
+        grid.cell_count(),
+        t0.elapsed().as_secs_f64()
+    );
 
     let t1 = std::time::Instant::now();
     let mut last_stage = String::new();
@@ -45,10 +51,18 @@ fn main() {
     let f = &world.fields;
     let n = grid.cell_count();
     let land = (0..n).filter(|&i| f.elevation[i] > 0.0).count();
-    let max_e = f.elevation.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_e = f
+        .elevation
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
     let min_e = f.elevation.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_p = f.precipitation.iter().cloned().fold(0.0f32, f32::max);
-    let max_t = f.temperature.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_t = f
+        .temperature
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
     let min_t = f.temperature.iter().cloned().fold(f32::INFINITY, f32::min);
     println!();
     println!("陆地占比: {:.1}%", land as f64 / n as f64 * 100.0);
@@ -73,10 +87,14 @@ fn main() {
 
     for i in 0..n {
         let center = grid.center(i).as_vec();
-        if center.z < -0.05 { continue; }
+        if center.z < -0.05 {
+            continue;
+        }
 
         let corners = grid.corners_of(i);
-        if corners.len() < 3 { continue; }
+        if corners.len() < 3 {
+            continue;
+        }
 
         let color = shade_cell(i, &grid, &world, light);
 
@@ -87,22 +105,34 @@ fn main() {
         // 格子很小时这些缝密集排列，看起来就是梳状条纹。
         //
         // 人为放大一点点让相邻格子重叠，是标准的做法。
-        let pts: Vec<(f64, f64)> = corners.iter().map(|p| {
-            let sx = cx + p.x * radius;
-            let sy = cx - p.y * radius;
-            // 沿从中心向外的方向外扩
-            let dx = sx - cx;
-            let dy = sy - cx;
-            let len = (dx * dx + dy * dy).sqrt().max(1e-9);
-            (sx + dx / len * 0.6, sy + dy / len * 0.6)
-        }).collect();
+        let pts: Vec<(f64, f64)> = corners
+            .iter()
+            .map(|p| {
+                let sx = cx + p.x * radius;
+                let sy = cx - p.y * radius;
+                // 沿从中心向外的方向外扩
+                let dx = sx - cx;
+                let dy = sy - cx;
+                let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+                (sx + dx / len * 0.6, sy + dy / len * 0.6)
+            })
+            .collect();
 
         // 海岸线描边：陆地边缘用深色
         let is_land = f.elevation[i] > 0.0;
-        let near_sea = grid.neighbors(i).iter().any(|&nb| (f.elevation[nb as usize] > 0.0) != is_land);
+        let near_sea = grid
+            .neighbors(i)
+            .iter()
+            .any(|&nb| (f.elevation[nb as usize] > 0.0) != is_land);
         let color = if near_sea {
-            if is_land { [230u8, 220, 190] } else { [40, 90, 140] }
-        } else { color };
+            if is_land {
+                [230u8, 220, 190]
+            } else {
+                [40, 90, 140]
+            }
+        } else {
+            color
+        };
 
         fill_polygon(&mut img, size, &pts, color);
     }
@@ -249,18 +279,41 @@ fn shade_cell(
 
 fn biome_color(b: u8) -> [u8; 3] {
     let list = [
-        Biome::Ocean, Biome::IceSheet, Biome::Tundra, Biome::BorealForest,
-        Biome::TemperateForest, Biome::TemperateGrassland, Biome::Mediterranean,
-        Biome::Desert, Biome::Savanna, Biome::TropicalRainforest,
-        Biome::TropicalSeasonalForest, Biome::AlpineMeadow, Biome::Wetland,
+        Biome::Ocean,
+        Biome::IceSheet,
+        Biome::Tundra,
+        Biome::BorealForest,
+        Biome::TemperateForest,
+        Biome::TemperateGrassland,
+        Biome::Mediterranean,
+        Biome::Desert,
+        Biome::Savanna,
+        Biome::TropicalRainforest,
+        Biome::TropicalSeasonalForest,
+        Biome::AlpineMeadow,
+        Biome::Wetland,
     ];
-    list.get(b as usize).map(|x| x.color()).unwrap_or([100, 100, 100])
+    list.get(b as usize)
+        .map(|x| x.color())
+        .unwrap_or([100, 100, 100])
 }
 
 fn fill_polygon(img: &mut [u8], size: u32, pts: &[(f64, f64)], color: [u8; 3]) {
-    if pts.len() < 3 { return; }
-    let min_y = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as i32;
-    let max_y = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max).ceil().min(size as f64 - 1.0) as i32;
+    if pts.len() < 3 {
+        return;
+    }
+    let min_y = pts
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::INFINITY, f64::min)
+        .floor()
+        .max(0.0) as i32;
+    let max_y = pts
+        .iter()
+        .map(|p| p.1)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .ceil()
+        .min(size as f64 - 1.0) as i32;
     for y in min_y..=max_y {
         let yf = y as f64 + 0.5;
         let mut xs: Vec<f64> = Vec::new();
@@ -298,7 +351,8 @@ fn write_png(path: &str, rgb: &[u8], w: u32, h: u32) {
     }
     let compressed = zlib_stored(&raw);
     let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+    f.write_all(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+        .unwrap();
     let mut ihdr = Vec::new();
     ihdr.extend_from_slice(&w.to_be_bytes());
     ihdr.extend_from_slice(&h.to_be_bytes());
@@ -351,7 +405,10 @@ fn write_chunk(f: &mut std::fs::File, tag: &[u8; 4], data: &[u8]) {
     f.write_all(&crc.finish().to_be_bytes()).unwrap();
 }
 
-struct Crc32 { table: [u32; 256], value: u32 }
+struct Crc32 {
+    table: [u32; 256],
+    value: u32,
+}
 
 impl Crc32 {
     fn new() -> Self {
@@ -359,16 +416,25 @@ impl Crc32 {
         for i in 0..256u32 {
             let mut c = i;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB88320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             table[i as usize] = c;
         }
-        Self { table, value: 0xFFFFFFFF }
+        Self {
+            table,
+            value: 0xFFFFFFFF,
+        }
     }
     fn update(&mut self, data: &[u8]) {
         for &b in data {
             self.value = self.table[((self.value ^ b as u32) & 0xFF) as usize] ^ (self.value >> 8);
         }
     }
-    fn finish(&self) -> u32 { self.value ^ 0xFFFFFFFF }
+    fn finish(&self) -> u32 {
+        self.value ^ 0xFFFFFFFF
+    }
 }

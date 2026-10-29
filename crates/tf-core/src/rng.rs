@@ -6,8 +6,6 @@
 
 use rand_chacha::rand_core::{RngCore, SeedableRng};
 use rand_chacha::ChaCha12Rng;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// 包装 ChaCha12 的确定性随机源。
 ///
@@ -21,14 +19,13 @@ impl DeterministicRng {
     ///
     /// 标签的设计原则：用清晰的字符串或整数常量，比如
     /// `derive(seed, &["tectonics", plate_id])`。
-    pub fn derive<H: Hash>(seed: u64, tags: H) -> Self {
-        let mut hasher = DefaultHasher::new();
-        seed.hash(&mut hasher);
-        tags.hash(&mut hasher);
-        let derived = hasher.finish();
-        Self {
-            inner: ChaCha12Rng::seed_from_u64(derived),
+    pub fn derive(seed: u64, tag: &str) -> Self {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in seed.to_le_bytes().into_iter().chain(tag.bytes()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
         }
+        Self::from_seed(hash)
     }
 
     /// 直接用给定种子构造。
@@ -126,12 +123,18 @@ impl DeterministicRng {
 /// 层级结构里每张子图都有自己的种子，由「世界种子 + 该图在树上的路径」派生。
 /// 这样同一位置永远算出同样的结果，删除再重新生成也一致。
 pub fn derive_child_seed(world_seed: u64, path: &[u128]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    world_seed.hash(&mut hasher);
-    for id in path {
-        id.hash(&mut hasher);
+    // Fixed FNV-1a over explicit little-endian bytes: independent of Rust's
+    // unspecified DefaultHasher implementation and of randomly allocated IDs.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in world_seed
+        .to_le_bytes()
+        .into_iter()
+        .chain(path.iter().flat_map(|id| id.to_le_bytes()))
+    {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
     }
-    hasher.finish()
+    hash
 }
 
 #[cfg(test)]

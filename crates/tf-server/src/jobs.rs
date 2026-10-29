@@ -1,27 +1,17 @@
-//! 作业系统。
-//!
-//! 设计要点：
-//! - 单进程内队列，因为部署形态要求单二进制
-//! - 并发数可配，管理界面改，立即生效
-//! - 进度通过 broadcast 广播给所有 SSE 订阅者
-//! - 作业可取消，用原子标志位在每个 tick 检查
-
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, Mutex, Semaphore};
-use tracing::{error, info};
-
+//! Bounded, cancellation-aware in-process scheduling.
 use crate::store::{Channel, JobRecord, MapNodeRecord, Store};
-
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{broadcast, Mutex, Notify};
+use tracing::{error, info};
 /// 作业事件，广播给 SSE 订阅者。
 #[derive(Debug, Clone)]
 pub enum JobEvent {
     /// 状态变化。
-    State {
-        job_id: String,
-        state: String,
-    },
+    State { job_id: String, state: String },
     /// 进度更新。
     Progress {
         job_id: String,
@@ -52,10 +42,7 @@ pub enum JobEvent {
         duration_ms: u64,
     },
     /// 失败。
-    Failed {
-        job_id: String,
-        error: String,
-    },
+    Failed { job_id: String, error: String },
 }
 
 /// 帧的统计信息。
@@ -68,63 +55,84 @@ pub struct FrameStats {
     pub min_temperature: f32,
 }
 
-/// 作业管理器。
+impl JobEvent {
+    pub fn job_id(&self) -> &str {
+        match self {
+            Self::State { job_id, .. }
+            | Self::Progress { job_id, .. }
+            | Self::Stage { job_id, .. }
+            | Self::Frame { job_id, .. }
+            | Self::Done { job_id, .. }
+            | Self::Failed { job_id, .. } => job_id,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct JobManager {
     inner: Arc<Inner>,
 }
-
+struct Ticket {
+    world_id: String,
+    cancel: Arc<AtomicBool>,
+}
+struct Scheduler {
+    limit: usize,
+    active: usize,
+    tickets: std::collections::HashMap<String, Ticket>,
+}
 struct Inner {
     store: Store,
-    /// 并发控制。
-    semaphore: Arc<Semaphore>,
-    /// 事件广播。
+    state: Mutex<Scheduler>,
+    changed: Notify,
     tx: broadcast::Sender<JobEvent>,
-    /// 当前并发上限（可动态调整）。
-    max_concurrent: AtomicU64,
-    /// 作业计数。
-    next_id: AtomicU64,
-    /// 取消标志，按 job_id 分组。
-    cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+    max_queue: usize,
 }
 
 impl JobManager {
-    pub fn new(store: Store, max_concurrent: usize) -> Self {
-        let (tx, _) = broadcast::channel(256);
+    pub fn new(store: Store, limit: usize) -> Self {
+        Self::with_limits(store, limit, 16)
+    }
+    pub fn with_limits(store: Store, limit: usize, max_queue: usize) -> Self {
+        let (tx, _) = broadcast::channel(16);
         Self {
             inner: Arc::new(Inner {
                 store,
-                semaphore: Arc::new(Semaphore::new(max_concurrent)),
+                state: Mutex::new(Scheduler {
+                    limit: limit.clamp(1, 8),
+                    active: 0,
+                    tickets: Default::default(),
+                }),
+                changed: Notify::new(),
                 tx,
-                max_concurrent: AtomicU64::new(max_concurrent as u64),
-                next_id: AtomicU64::new(1),
-                cancel_flags: Mutex::new(std::collections::HashMap::new()),
+                max_queue,
             }),
         }
     }
-
-    /// 订阅事件流。
+    pub fn recover(&self) -> anyhow::Result<()> {
+        for job in self.inner.store.list_active_jobs()? {
+            self.inner.store.transition_job(
+                &job.id,
+                "failed",
+                Some("服务已重启，请重新生成".into()),
+            )?;
+        }
+        Ok(())
+    }
     pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
         self.inner.tx.subscribe()
     }
-
-    /// 当前并发设置。
-    pub fn max_concurrent(&self) -> usize {
-        self.inner.max_concurrent.load(Ordering::Relaxed) as usize
+    pub async fn max_concurrent(&self) -> usize {
+        self.inner.state.lock().await.limit
     }
-
-    /// 修改并发上限。已排队的作业会在有空位时被调度。
+    pub async fn counts(&self) -> (usize, usize) {
+        let st = self.inner.state.lock().await;
+        (st.active, st.tickets.len().saturating_sub(st.active))
+    }
     pub async fn set_max_concurrent(&self, n: usize) {
-        let n = n.clamp(1, 8);
-        let old = self.inner.max_concurrent.swap(n as u64, Ordering::Relaxed) as usize;
-        if n > old {
-            self.inner.semaphore.add_permits(n - old);
-        }
-        // 减小时不主动收回许可，等现有作业自然结束
-        info!("并发上限从 {} 改为 {}", old, n);
+        self.inner.state.lock().await.limit = n.clamp(1, 8);
+        self.inner.changed.notify_waiters();
     }
-
-    /// 提交一个生成作业。返回 job_id。
     pub async fn submit(
         &self,
         map_id: String,
@@ -132,150 +140,172 @@ impl JobManager {
         node: MapNodeRecord,
         params: tf_core::params::GenerationParams,
     ) -> anyhow::Result<String> {
-        let seq = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let job_id = format!("job-{}-{}", now_millis(), seq);
-
+        let mut st = self.inner.state.lock().await;
+        anyhow::ensure!(
+            st.tickets.len() < self.inner.max_queue,
+            "作业队列已满，请稍后重试"
+        );
+        anyhow::ensure!(
+            st.tickets
+                .values()
+                .filter(|t| t.world_id == world_id)
+                .count()
+                < 2,
+            "当前世界已有两个生成任务，请等待或取消"
+        );
+        let job_id = format!("job-{}", uuid::Uuid::new_v4().simple());
         let record = JobRecord {
             id: job_id.clone(),
             map_id: map_id.clone(),
-            world_id,
-            state: "queued".to_string(),
+            world_id: world_id.clone(),
+            state: "queued".into(),
             stage: String::new(),
-            progress: 0.0,
+            progress: 0.,
             error: None,
             created_at: now_millis() as i64,
             started_at: None,
             finished_at: None,
         };
-        self.inner.store.put_job(&record)?;
-
+        self.inner.store.submit_job(&node, &record)?;
         let cancel = Arc::new(AtomicBool::new(false));
-        {
-            let mut flags = self.inner.cancel_flags.lock().await;
-            flags.insert(job_id.clone(), cancel.clone());
-        }
-
+        st.tickets.insert(
+            job_id.clone(),
+            Ticket {
+                world_id,
+                cancel: cancel.clone(),
+            },
+        );
+        drop(st);
         let _ = self.inner.tx.send(JobEvent::State {
             job_id: job_id.clone(),
-            state: "queued".to_string(),
+            state: "queued".into(),
         });
-
-        // 后台执行
         let me = self.clone();
-        let jid = job_id.clone();
+        let id = job_id.clone();
         tokio::spawn(async move {
-            me.run_job(jid, map_id, node, params, cancel).await;
+            me.run_job(id, map_id, node, params, cancel).await;
         });
-
         Ok(job_id)
     }
-
-    /// 取消作业。
-    pub async fn cancel(&self, job_id: &str) -> bool {
-        let flags = self.inner.cancel_flags.lock().await;
-        if let Some(flag) = flags.get(job_id) {
-            flag.store(true, Ordering::Relaxed);
-            true
+    pub async fn cancel(&self, id: &str) -> bool {
+        let st = self.inner.state.lock().await;
+        let found = if let Some(t) = st.tickets.get(id) {
+            if self.inner.store.request_cancel(id).unwrap_or(false) {
+                t.cancel.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
         } else {
             false
-        }
+        };
+        drop(st);
+        self.inner.changed.notify_waiters();
+        found
     }
-
+    pub async fn delete_world(&self, id: &str) -> anyhow::Result<()> {
+        let st = self.inner.state.lock().await;
+        for t in st.tickets.values().filter(|t| t.world_id == id) {
+            t.cancel.store(true, Ordering::Relaxed)
+        }
+        self.inner.store.delete_world(id)?;
+        drop(st);
+        self.inner.changed.notify_waiters();
+        Ok(())
+    }
+    pub async fn cancel_world(&self, id: &str) {
+        let st = self.inner.state.lock().await;
+        for t in st.tickets.values().filter(|t| t.world_id == id) {
+            t.cancel.store(true, Ordering::Relaxed)
+        }
+        drop(st);
+        self.inner.changed.notify_waiters();
+    }
     async fn run_job(
         &self,
-        job_id: String,
+        id: String,
         map_id: String,
         node: MapNodeRecord,
         params: tf_core::params::GenerationParams,
         cancel: Arc<AtomicBool>,
     ) {
-        // 等待并发许可
-        let permit = match self.inner.semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return,
+        let acquired = loop {
+            let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut st = self.inner.state.lock().await;
+            if cancel.load(Ordering::Relaxed) {
+                break false;
+            }
+            if st.active < st.limit {
+                st.active += 1;
+                break true;
+            }
+            drop(st);
+            notified.await;
         };
-
-        if cancel.load(Ordering::Relaxed) {
-            self.finish(&job_id, "cancelled", None).await;
-            drop(permit);
+        if !acquired {
+            self.finish(&id, "cancelled", None);
+            self.inner.state.lock().await.tickets.remove(&id);
             return;
         }
-
-        // 标记为运行中
-        self.finish(&job_id, "running", None).await;
-        let started = std::time::Instant::now();
-        let _ = self.inner.tx.send(JobEvent::State {
-            job_id: job_id.clone(),
-            state: "running".to_string(),
-        });
-
-        // 在阻塞线程池里跑物理模拟（rayon 本来就是 CPU 密集的）
+        self.finish(&id, "running", None);
+        let start = std::time::Instant::now();
         let store = self.inner.store.clone();
         let tx = self.inner.tx.clone();
-        let jid = job_id.clone();
+        let jid = id.clone();
         let mid = map_id.clone();
-
+        let flag = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            // 世界层跑整球模拟，其余层级跑降尺度子图生成
             if node.kind == "world" {
-                crate::generate::run_generation(&store, &tx, &jid, &mid, &node, &params, &cancel)
+                crate::generate::run_generation(&store, &tx, &jid, &mid, &node, &params, &flag)
             } else {
-                crate::child_gen::run_child_generation(&store, &tx, &jid, &node, &params, &cancel)
+                crate::child_gen::run_child_generation(&store, &tx, &jid, &node, &params, &flag)
             }
         })
         .await;
-
-        match result {
-            Ok(Ok(())) => {
-                let dur = started.elapsed().as_millis() as u64;
-                self.finish(&job_id, "done", None).await;
-                let _ = self.inner.tx.send(JobEvent::Done {
-                    job_id: job_id.clone(),
-                    map_id: map_id.clone(),
-                    duration_ms: dur,
-                });
-                info!("作业 {} 完成, 耗时 {} ms", job_id, dur);
-            }
-            Ok(Err(e)) => {
-                let msg = format!("{:#}", e);
-                error!("作业 {} 失败: {}", job_id, msg);
-                self.finish(&job_id, "failed", Some(msg.clone())).await;
-                let _ = self.inner.tx.send(JobEvent::Failed {
-                    job_id: job_id.clone(),
-                    error: msg,
-                });
-            }
-            Err(e) => {
-                let msg = format!("任务 panic: {}", e);
-                error!("{}", msg);
-                self.finish(&job_id, "failed", Some(msg.clone())).await;
-                let _ = self.inner.tx.send(JobEvent::Failed {
-                    job_id: job_id.clone(),
-                    error: msg,
-                });
+        if cancel.load(Ordering::Relaxed) {
+            self.finish(&id, "cancelled", None)
+        } else {
+            match result {
+                Ok(Ok(())) => {
+                    self.finish(&id, "done", None);
+                    let _ = self.inner.tx.send(JobEvent::Done {
+                        job_id: id.clone(),
+                        map_id,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                    info!("生成完成: {id}");
+                }
+                other => {
+                    let message = match other {
+                        Ok(Err(e)) => format!("{e:#}"),
+                        Err(e) => format!("生成线程失败: {e}"),
+                        _ => unreachable!(),
+                    };
+                    error!("{id}: {message}");
+                    self.finish(&id, "failed", Some(message.clone()));
+                    let _ = self.inner.tx.send(JobEvent::Failed {
+                        job_id: id.clone(),
+                        error: message,
+                    });
+                }
             }
         }
-
-        {
-            let mut flags = self.inner.cancel_flags.lock().await;
-            flags.remove(&job_id);
-        }
-        drop(permit);
+        let mut st = self.inner.state.lock().await;
+        st.active = st.active.saturating_sub(1);
+        st.tickets.remove(&id);
+        drop(st);
+        self.inner.changed.notify_waiters();
     }
-
-    async fn finish(&self, job_id: &str, state: &str, error: Option<String>) {
-        if let Ok(Some(mut rec)) = self.inner.store.get_job(job_id) {
-            rec.state = state.to_string();
-            rec.error = error;
-            if state != "queued" && rec.started_at.is_none() {
-                rec.started_at = Some(now_millis() as i64);
-            }
-            if matches!(state, "done" | "failed" | "cancelled") {
-                rec.finished_at = Some(now_millis() as i64);
-                rec.progress = if state == "done" { 1.0 } else { rec.progress };
-            }
-            let _ = self.inner.store.put_job(&rec);
+    fn finish(&self, id: &str, state: &str, error: Option<String>) {
+        if let Err(e) = self.inner.store.transition_job(id, state, error) {
+            error!("保存作业状态失败 {id}: {e}");
         }
+        let _ = self.inner.tx.send(JobEvent::State {
+            job_id: id.into(),
+            state: state.into(),
+        });
     }
 }
 
@@ -285,30 +315,20 @@ pub fn now_millis() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
-/// 把世界场写进存储。
 pub fn persist_fields(
     store: &Store,
     map_id: &str,
     world: &tf_sim::GeneratedWorld,
 ) -> anyhow::Result<()> {
     let f = &world.fields;
-    store.put_field(map_id, Channel::Elevation, &f.elevation)?;
-    store.put_field(map_id, Channel::CrustThickness, &f.crust_thickness)?;
-    store.put_field(map_id, Channel::CrustType, &f.crust_type)?;
-    store.put_field(map_id, Channel::CrustAge, &f.crust_age)?;
-    store.put_field(map_id, Channel::Temperature, &f.temperature)?;
-    store.put_field(map_id, Channel::Precipitation, &f.precipitation)?;
-    store.put_field(map_id, Channel::FlowAccumulation, &f.flow_accumulation)?;
-    store.put_field(map_id, Channel::LakeDepth, &f.lake_depth)?;
-    store.put_field(map_id, Channel::DistanceToSea, &f.distance_to_sea)?;
-
-    // 生态结果转 f32 存储
     let biome: Vec<f32> = world.ecology.biome.iter().map(|&b| b as f32).collect();
-    let soil: Vec<f32> = world.ecology.soil.iter().map(|&s| s as f32).collect();
-    store.put_field(map_id, Channel::Biome, &biome)?;
-    store.put_field(map_id, Channel::Soil, &soil)?;
-    store.put_field(map_id, Channel::SoilDepth, &world.ecology.soil_depth_m)?;
-
-    Ok(())
+    let plate: Vec<f32> = f.plate_id.iter().map(|&v| v as f32).collect();
+    let soil: Vec<f32> = world.ecology.soil.iter().map(|&b| b as f32).collect();
+    store.publish_fields(map_id,&[
+        (Channel::Elevation,&f.elevation),(Channel::CrustThickness,&f.crust_thickness),
+        (Channel::CrustType,&f.crust_type),(Channel::CrustAge,&f.crust_age),
+        (Channel::Temperature,&f.temperature),(Channel::Precipitation,&f.precipitation),
+        (Channel::FlowAccumulation,&f.flow_accumulation),(Channel::LakeDepth,&f.lake_depth),
+        (Channel::DistanceToSea,&f.distance_to_sea),(Channel::Biome,&biome),(Channel::Soil,&soil),(Channel::SoilDepth,&world.ecology.soil_depth_m),(Channel::PlateId,&plate)
+    ],&serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"generator_version":"tf-0.2"}))
 }

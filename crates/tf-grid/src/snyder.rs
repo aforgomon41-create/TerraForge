@@ -108,7 +108,7 @@ pub fn snyder_inverse(v0: DVec3, v1: DVec3, v2: DVec3, beta: [f64; 3]) -> DVec3 
     let det_v = v0.dot(v1.cross(v2));
 
     let sin_a = a.sin();
-    let cos_a_m = 1.0 - a.cos();  // 1 - cos(a)
+    let cos_a_m = 1.0 - a.cos(); // 1 - cos(a)
 
     let f = sin_a * det_v + cos_a_m * (c01 * c12 - c20);
     let g = cos_a_m * s12 * (1.0 + c01);

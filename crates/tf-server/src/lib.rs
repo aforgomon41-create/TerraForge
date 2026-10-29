@@ -1,63 +1,107 @@
-//! TerraForge 服务端库。
-//!
-//! 提供两种用法：
-//! 1. 独立二进制（`tf-server`，见 main.rs）
-//! 2. 被桌面版内嵌（Tauri，调用 `serve`）
-
+//! Shared HTTP runtime for web and desktop deployments.
 pub mod api;
+pub mod auth;
 pub mod child_gen;
+pub mod config;
 pub mod generate;
 pub mod jobs;
+mod project;
 pub mod render;
 pub mod store;
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use tracing::info;
-
 use api::AppState;
+use axum::Router;
+use config::ServerConfig;
 use jobs::JobManager;
+use std::sync::Arc;
 use store::Store;
 
-/// 启动 HTTP 服务。
-///
-/// 配置全部从环境变量读取，和独立二进制保持一致。
 pub async fn serve(port: u16) -> anyhow::Result<()> {
-    let data_dir = std::env::var("TF_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./data"));
-    std::fs::create_dir_all(&data_dir)?;
+    let config = ServerConfig::from_env()?;
+    let listener = tokio::net::TcpListener::bind((config.bind, port)).await?;
+    serve_listener(listener, config, None).await
+}
 
-    let max_jobs: usize = std::env::var("TF_MAX_CONCURRENT_JOBS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-
-    let static_dir = std::env::var("TF_STATIC_DIR").map(PathBuf::from).ok();
-
-    info!("数据目录: {}", data_dir.display());
-    info!("并发上限: {}", max_jobs);
-
-    let db_path = data_dir.join("terraforge.db");
-    let store = Store::open(&db_path)?;
-    let jobs = JobManager::new(store.clone(), max_jobs);
-
-    let state = AppState { store, jobs };
-    let mut router = api::build_router(state);
-
-    if let Some(dir) = static_dir {
-        if dir.exists() {
-            info!("静态资源目录: {}", dir.display());
-            router = router.fallback_service(
-                tower_http::services::ServeDir::new(&dir).append_index_html_on_directories(true),
-            );
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    config: ServerConfig,
+    web: Option<Router>,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&config.data_dir)?;
+    let store = Store::open(config.data_dir.join("terraforge.db"))?;
+    let jobs = JobManager::with_limits(store.clone(), config.max_jobs, config.max_queue);
+    jobs.recover()?;
+    let state = AppState {
+        store,
+        jobs,
+        config: Arc::new(config),
+        exports: Arc::new(tokio::sync::Semaphore::new(1)),
+        reads: Arc::new(tokio::sync::Semaphore::new(8)),
+        streams: Arc::new(tokio::sync::Semaphore::new(32)),
+        admission: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    };
+    let app = application(&state, web)?;
+    let maintenance = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if state.config.desktop {
+                continue;
+            }
+            let sessions = match state.store.sessions() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("读取会话失败: {e}");
+                    continue;
+                }
+            };
+            for session in sessions {
+                if jobs::now_millis().saturating_sub(session.last_seen)
+                    >= state.config.session_ttl.as_millis() as u64
+                {
+                    if let Err(e) = api::expire_if_idle(&state, &session.id).await {
+                        tracing::error!("清理会话失败: {e}");
+                    }
+                }
+            }
         }
-    }
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("监听 http://{}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    });
+    tracing::info!("TerraForge listening on {}", listener.local_addr()?);
+    let result = axum::serve(listener, app).await;
+    maintenance.abort();
+    result?;
     Ok(())
 }
+
+/// Public application assembly is also used by deployment-path regression tests.
+pub fn application(state: &AppState, web: Option<Router>) -> anyhow::Result<Router> {
+    let mut app = api::build_router(state.clone());
+    if let Some(web) = web {
+        app = app.fallback_service(web)
+    } else if let Some(dir) = &state.config.static_dir {
+        anyhow::ensure!(dir.join("index.html").exists(), "前端目录没有 index.html");
+        app = app.fallback_service(tower_http::services::ServeDir::new(dir));
+    }
+    let base = &state.config.base_path;
+    if !base.is_empty() {
+        app = app.clone().nest(base, app);
+        if let Some(dir) = &state.config.static_dir {
+            let target = format!("{base}/");
+            app = app
+                .route(
+                    base,
+                    axum::routing::get(move || async move {
+                        axum::response::Redirect::temporary(&target)
+                    }),
+                )
+                .route_service(
+                    &format!("{base}/"),
+                    tower_http::services::ServeFile::new(dir.join("index.html")),
+                );
+        }
+    }
+    Ok(app)
+}
+
+#[cfg(test)]
+mod tests;

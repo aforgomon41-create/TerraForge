@@ -57,10 +57,26 @@ fn icosahedron_vertices() -> [DVec3; 12] {
 }
 
 const FACES: [[usize; 3]; 20] = [
-    [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
-    [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
-    [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
-    [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
+    [0, 11, 5],
+    [0, 5, 1],
+    [0, 1, 7],
+    [0, 7, 10],
+    [0, 10, 11],
+    [1, 5, 9],
+    [5, 11, 4],
+    [11, 10, 2],
+    [10, 7, 6],
+    [7, 1, 8],
+    [3, 9, 4],
+    [3, 4, 2],
+    [3, 2, 6],
+    [3, 6, 8],
+    [3, 8, 9],
+    [4, 9, 5],
+    [2, 4, 11],
+    [6, 2, 10],
+    [8, 6, 7],
+    [9, 8, 1],
 ];
 
 // ============================================================
@@ -96,7 +112,14 @@ impl PointKey {
 }
 
 /// 把三角面内的重心坐标翻译成全局拓扑键。
-fn face_point_key(face_idx: usize, vids: [usize; 3], freq: u32, i: u32, j: u32, k: u32) -> PointKey {
+fn face_point_key(
+    face_idx: usize,
+    vids: [usize; 3],
+    freq: u32,
+    i: u32,
+    j: u32,
+    k: u32,
+) -> PointKey {
     debug_assert_eq!(i + j + k, freq);
     let [ia, ib, ic] = vids;
 
@@ -188,7 +211,11 @@ pub struct SphereHexGrid {
     areas: Vec<f64>,
     boundary: std::sync::OnceLock<BitVec>,
     /// 空间哈希索引，惰性构建，用于快速查找最近格
-    spatial_index: std::sync::OnceLock<(std::collections::HashMap<(i32, i32, i32), Vec<u32>>, f64, i32)>,
+    spatial_index: std::sync::OnceLock<(
+        std::collections::HashMap<(i32, i32, i32), Vec<u32>>,
+        f64,
+        i32,
+    )>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,7 +270,11 @@ impl SphereHexGrid {
         }
 
         let cell_count = centers.len();
-        assert_eq!(cell_count, expected, "cell count mismatch for freq {}", freq);
+        assert_eq!(
+            cell_count, expected,
+            "cell count mismatch for freq {}",
+            freq
+        );
 
         // 五边形就是二十面体顶点对应的格子。12 个，由拓扑精确确定。
         let mut pentagons: Vec<u32> = (0..12usize)
@@ -494,7 +525,11 @@ impl SphereHexGrid {
             avg_cell_area_km2: total / n as f64 / 1e6,
             min_cell_area_km2: min_hex / 1e6,
             max_cell_area_km2: max_hex / 1e6,
-            area_ratio: if min_hex > 0.0 { max_hex / min_hex } else { 0.0 },
+            area_ratio: if min_hex > 0.0 {
+                max_hex / min_hex
+            } else {
+                0.0
+            },
             avg_edge_length_km: avg_edge_m / 1000.0,
             cell_width_km: avg_edge_m / 1000.0,
             total_area_error_pct: (total / sphere_area - 1.0) * 100.0,
@@ -508,7 +543,13 @@ impl SphereHexGrid {
 
 #[inline]
 fn tri_point_index(freq: u32, i: u32, j: u32) -> u32 {
-    debug_assert!(i + j <= freq, "invalid barycentric ({}, {}) for freq {}", i, j, freq);
+    debug_assert!(
+        i + j <= freq,
+        "invalid barycentric ({}, {}) for freq {}",
+        i,
+        j,
+        freq
+    );
     let before = i * (freq + 1) - i * (i.saturating_sub(1)) / 2;
     before + j
 }
@@ -582,7 +623,11 @@ fn compute_cell_areas(
 }
 
 fn angular_sort_neighbors(center: DVec3, centers: &[UnitVec3], nb: &[u32]) -> Vec<usize> {
-    let reference = if center.y.abs() < 0.9 { DVec3::Y } else { DVec3::X };
+    let reference = if center.y.abs() < 0.9 {
+        DVec3::Y
+    } else {
+        DVec3::X
+    };
     let east = reference.cross(center).normalize();
     let north = center.cross(east);
 
@@ -609,6 +654,9 @@ fn spherical_triangle_solid_angle(a: DVec3, b: DVec3, c: DVec3) -> f64 {
 }
 
 impl crate::GridOps for SphereHexGrid {
+    fn radius_m(&self) -> f64 {
+        self.radius_m
+    }
     fn cell_count(&self) -> usize {
         self.centers.len()
     }
@@ -702,7 +750,6 @@ impl SphereHexGrid {
         out
     }
 
-
     /// 导出预览网格。
     pub fn to_preview_mesh(&self) -> PreviewMesh {
         let n = self.cell_count();
@@ -740,7 +787,8 @@ impl SphereHexGrid {
             corner_counts,
         }
     }
-}#[cfg(test)]
+}
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -752,7 +800,10 @@ mod tests {
     fn cell_count_matches_formula() {
         for f in [1u32, 2, 3, 4, 8, 16] {
             let grid = SphereHexGrid::build(f, 6_371_000.0, unit_rot());
-            assert_eq!(grid.cell_count(), (10 * f as usize * f as usize + 2) as usize);
+            assert_eq!(
+                grid.cell_count(),
+                (10 * f as usize * f as usize + 2) as usize
+            );
         }
     }
 
@@ -799,7 +850,12 @@ mod tests {
                     assert!(
                         (0.6..1.6).contains(&ratio),
                         "freq {} cell {}->{} ratio {:.3} (d={:.5}, ideal={:.5})",
-                        f, i, nb, ratio, d, ideal
+                        f,
+                        i,
+                        nb,
+                        ratio,
+                        d,
+                        ideal
                     );
                 }
             }
@@ -832,7 +888,9 @@ mod tests {
         assert!(
             stats.area_ratio < 1.4,
             "hexagon area ratio {} (min {} max {} km2)",
-            stats.area_ratio, stats.min_cell_area_km2, stats.max_cell_area_km2
+            stats.area_ratio,
+            stats.min_cell_area_km2,
+            stats.max_cell_area_km2
         );
     }
 
@@ -840,7 +898,11 @@ mod tests {
     fn pentagons_are_smaller_than_hexagons() {
         let grid = SphereHexGrid::build(16, 6_371_000.0, unit_rot());
         let pent = grid.area_m2(grid.pentagons()[0] as usize);
-        let hex = grid.area_m2((0..grid.cell_count()).find(|&i| !grid.is_pentagon(i)).unwrap());
+        let hex = grid.area_m2(
+            (0..grid.cell_count())
+                .find(|&i| !grid.is_pentagon(i))
+                .unwrap(),
+        );
         assert!(pent < hex, "pentagon {} vs hexagon {}", pent, hex);
     }
 
@@ -892,13 +954,20 @@ mod tests {
         // 顶点 a 对应 (i=0, j=0, k=freq)
         let v1 = position_for_key(PointKey::Vertex(0), freq, &verts);
         let v2 = position_for_key(face_point_key(0, FACES[0], freq, 0, 0, freq), freq, &verts);
-        assert!((v1 - v2).length() < 1e-15, "vertex a mismatch: {:?} vs {:?}", v1, v2);
+        assert!(
+            (v1 - v2).length() < 1e-15,
+            "vertex a mismatch: {:?} vs {:?}",
+            v1,
+            v2
+        );
         // 顶点 b 对应 (i=freq, j=0, k=0)
         let vb1 = position_for_key(PointKey::Vertex(11), freq, &verts);
         let vb2 = position_for_key(face_point_key(0, FACES[0], freq, freq, 0, 0), freq, &verts);
-        assert!((vb1 - vb2).length() < 1e-15, "vertex b mismatch: {:?} vs {:?}", vb1, vb2);
-
+        assert!(
+            (vb1 - vb2).length() < 1e-15,
+            "vertex b mismatch: {:?} vs {:?}",
+            vb1,
+            vb2
+        );
     }
 }
-
-

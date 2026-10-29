@@ -37,13 +37,22 @@ fn check(freq: u32) {
     }
     let expected_edge = (4.0 * PI / n as f64).sqrt() * 1.0;
 
-    println!("f={:<5} 格数={:<8} 五边形={:<3} 总面积误差={:+.6}%",
-             freq, n, stats.pentagon_count, stats.total_area_error_pct);
-    println!("       六边形面积 max/min={:.3}  格宽={:.2} km  CV={:.4}",
-             stats.area_ratio, stats.cell_width_km,
-             area_cv(&grid));
-    println!("       邻居数异常={}  邻接不对称={}  最小邻居距离/理论={:.3}",
-             bad_neighbor_count, bad_adjacency, min_dist / expected_edge);
+    println!(
+        "f={:<5} 格数={:<8} 五边形={:<3} 总面积误差={:+.6}%",
+        freq, n, stats.pentagon_count, stats.total_area_error_pct
+    );
+    println!(
+        "       六边形面积 max/min={:.3}  格宽={:.2} km  CV={:.4}",
+        stats.area_ratio,
+        stats.cell_width_km,
+        area_cv(&grid)
+    );
+    println!(
+        "       邻居数异常={}  邻接不对称={}  最小邻居距离/理论={:.3}",
+        bad_neighbor_count,
+        bad_adjacency,
+        min_dist / expected_edge
+    );
     println!();
 }
 
@@ -64,16 +73,26 @@ fn main() {
     }
 
     println!("=== 生产档位实测 ===\n");
-    for (label, freq) in [("经济 Economy", 256u32), ("标准 Standard", 512), ("高精度 High", 768)] {
+    for (label, freq) in [
+        ("经济 Economy", 256u32),
+        ("标准 Standard", 512),
+        ("高精度 High", 768),
+    ] {
         let t = std::time::Instant::now();
         let grid = SphereHexGrid::build(freq, 6_371_000.0, (glam::DVec3::Z, 0.0));
         let build_ms = t.elapsed().as_millis();
         let s = grid.stats();
         println!("{} (f={})", label, freq);
         println!("  格数 {}  五边形 {}", s.cell_count, s.pentagon_count);
-        println!("  格宽 {:.2} km  单格面积 {:.1} km²", s.cell_width_km, s.avg_cell_area_km2);
-        println!("  构建耗时 {} ms  内存约 {:.1} MB",
-                 build_ms, s.cell_count as f64 * 4.0 * 3.0 / 1e6);
+        println!(
+            "  格宽 {:.2} km  单格面积 {:.1} km²",
+            s.cell_width_km, s.avg_cell_area_km2
+        );
+        println!(
+            "  构建耗时 {} ms  内存约 {:.1} MB",
+            build_ms,
+            s.cell_count as f64 * 4.0 * 3.0 / 1e6
+        );
         println!();
     }
 }

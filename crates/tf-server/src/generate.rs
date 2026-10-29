@@ -27,6 +27,9 @@ pub fn run_generation(
     params: &tf_core::params::GenerationParams,
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     info!("开始生成 {}: {} 格", map_id, node.cells);
 
     let freq = params.quality.world_subdiv_freq();
@@ -38,7 +41,7 @@ pub fn run_generation(
     let store_ref = store;
     let job_id_owned = job_id.to_string();
 
-    let world = tf_sim::generate_with_frames(
+    let world = tf_sim::generate_cancellable(
         &grid,
         params,
         &mut |stage, progress| {
@@ -58,11 +61,7 @@ pub fn run_generation(
 
             if progress - last_progress >= 0.02 {
                 last_progress = progress;
-                if let Ok(Some(mut rec)) = store_ref.get_job(&job_id_owned) {
-                    rec.progress = progress;
-                    rec.stage = stage_name.clone();
-                    let _ = store_ref.put_job(&rec);
-                }
+                let _ = store_ref.update_progress(&job_id_owned, &stage_name, progress);
                 let _ = tx.send(JobEvent::Progress {
                     job_id: job_id.to_string(),
                     stage: stage_name,
@@ -95,19 +94,20 @@ pub fn run_generation(
                 stats,
             });
         },
+        &|| cancel.load(Ordering::Relaxed),
     );
+    let Some(world) = world else {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        anyhow::bail!("模拟产生无效数值");
+    };
 
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
 
     persist_fields(store, map_id, &world)?;
-
-    if let Ok(Some(mut rec)) = store.get_map_node(map_id) {
-        rec.status = "done".to_string();
-        rec.completed_at = Some(crate::jobs::now_millis() as i64);
-        let _ = store.put_map_node(&rec);
-    }
 
     info!("生成完成 {}: {} 个矿点", map_id, world.minerals.len());
     Ok(())
@@ -124,8 +124,6 @@ pub fn build_field_frame(
     grid: &tf_grid::SphereHexGrid,
     fields: &tf_sim::WorldFields,
 ) -> (Vec<u8>, FrameStats) {
-    use tf_grid::GridOps;
-
     let n = grid.cell_count();
     let mut max_e = f32::NEG_INFINITY;
     let mut min_e = f32::INFINITY;

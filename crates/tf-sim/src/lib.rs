@@ -21,10 +21,10 @@ pub mod landforms;
 pub mod pipeline;
 pub mod plates;
 
-pub use fields::{
-    BoundaryCell, BoundaryKind, BoundarySubtype, Plate, WorldFields,
+pub use fields::{BoundaryCell, BoundaryKind, BoundarySubtype, Plate, WorldFields};
+pub use pipeline::{
+    generate, generate_cancellable, generate_with_frames, FrameFn, GeneratedWorld, ProgressFn,
 };
-pub use pipeline::{generate, generate_with_frames, FrameFn, GeneratedWorld, ProgressFn};
 pub use plates::{build_plates, TectonicState};
 
 use tf_core::params::GenerationParams;

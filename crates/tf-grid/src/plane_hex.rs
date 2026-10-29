@@ -35,21 +35,11 @@ impl AxialCoord {
     /// 六角距离。
     #[inline]
     pub fn distance(&self, other: &Self) -> i32 {
-        ((self.q - other.q).abs()
-            + (self.r - other.r).abs()
-            + (self.s() - other.s()).abs())
-            / 2
+        ((self.q - other.q).abs() + (self.r - other.r).abs() + (self.s() - other.s()).abs()) / 2
     }
 
     /// 六个方向的邻居偏移。
-    pub const DIRECTIONS: [(i32, i32); 6] = [
-        (1, 0),
-        (1, -1),
-        (0, -1),
-        (-1, 0),
-        (-1, 1),
-        (0, 1),
-    ];
+    pub const DIRECTIONS: [(i32, i32); 6] = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)];
 
     /// 第 d 个方向的邻居。
     #[inline]
@@ -148,8 +138,7 @@ impl HexGrid2D {
 
                 // 局部切平面上的经度偏移，按纬度压缩以保持近似等距
                 let lon_offset_m = ((col as f64 + row_shift) - width as f64 / 2.0) * cell_size_m;
-                let lon_rad =
-                    lon_offset_m / (6_371_000.0 * lat_rad.cos().abs().max(0.05));
+                let lon_rad = lon_offset_m / (6_371_000.0 * lat_rad.cos().abs().max(0.05));
 
                 let (sl, cl) = lat_rad.sin_cos();
                 let (so, co) = lon_rad.sin_cos();

@@ -32,7 +32,7 @@ impl LevelKind {
     /// 该层默认的目标边长（格数）。
     pub fn default_target_cells(&self) -> u32 {
         match self {
-            LevelKind::World => 0,        // 世界是整球，由细分频率决定
+            LevelKind::World => 0, // 世界是整球，由细分频率决定
             _ => 2048,
         }
     }
@@ -172,6 +172,7 @@ impl PlanetParams {
 
 /// 完整的世界生成参数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GenerationParams {
     /// 随机种子。同种子同参数必然产出同一世界。
     pub seed: u64,
@@ -255,10 +256,16 @@ impl GenerationParams {
             return Err(format!("板块数量 {} 超出范围 8-30", self.plate_count));
         }
         if !(0.05..=0.90).contains(&self.land_fraction) {
-            return Err(format!("陆地占比 {} 超出范围 0.05-0.90", self.land_fraction));
+            return Err(format!(
+                "陆地占比 {} 超出范围 0.05-0.90",
+                self.land_fraction
+            ));
         }
         if !(0.2..=2.0).contains(&self.tectonic_activity) {
-            return Err(format!("构造活动强度 {} 超出范围 0.2-2.0", self.tectonic_activity));
+            return Err(format!(
+                "构造活动强度 {} 超出范围 0.2-2.0",
+                self.tectonic_activity
+            ));
         }
         if self.hotspot_count > 20 {
             return Err(format!("热点数量 {} 超出范围 0-20", self.hotspot_count));
@@ -267,16 +274,36 @@ impl GenerationParams {
             return Err(format!("侵蚀强度 {} 超出范围 0-2", self.erosion_strength));
         }
         if !(0.3..=2.0).contains(&self.precipitation_scale) {
-            return Err(format!("降水倍率 {} 超出范围 0.3-2.0", self.precipitation_scale));
+            return Err(format!(
+                "降水倍率 {} 超出范围 0.3-2.0",
+                self.precipitation_scale
+            ));
         }
-        if self.planet.radius_m < 1.0e6 || self.planet.radius_m > 5.0e7 {
-            return Err(format!("星球半径 {} m 超出范围 1000-50000 km", self.planet.radius_m));
+        if !(1.0e6..=5.0e7).contains(&self.planet.radius_m) {
+            return Err(format!(
+                "星球半径 {} m 超出范围 1000-50000 km",
+                self.planet.radius_m
+            ));
         }
         if !(0.0..=90.0).contains(&self.planet.axial_tilt_deg) {
-            return Err(format!("自转轴倾角 {} 超出范围 0-90 度", self.planet.axial_tilt_deg));
+            return Err(format!(
+                "自转轴倾角 {} 超出范围 0-90 度",
+                self.planet.axial_tilt_deg
+            ));
         }
-        if self.planet.rotation_period_hours <= 0.0 {
+        if !(1.0..=1000.0).contains(&self.planet.rotation_period_hours) {
             return Err("自转周期必须为正".to_string());
+        }
+        for (name, value, min, max) in [
+            ("太阳辐射", self.planet.solar_constant, 100., 4000.),
+            ("大气密度", self.planet.atmosphere_density, 0.05, 10.),
+            ("温室效应", self.planet.greenhouse_factor, 0.1, 3.),
+            ("扩张速率", self.spreading_rate, 0.1, 3.),
+            ("生态丰度", self.biome_diversity, 0.3, 2.),
+        ] {
+            if !value.is_finite() || !(min..=max).contains(&value) {
+                return Err(format!("{name} 超出范围 {min}～{max}"));
+            }
         }
         Ok(())
     }

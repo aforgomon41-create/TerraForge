@@ -92,6 +92,15 @@ pub struct EcologyResult {
 
 /// 运行生态模拟。
 pub fn run_ecology<G: GridOps>(grid: &G, fields: &WorldFields) -> EcologyResult {
+    run_ecology_with_diversity(grid, fields, 1.)
+}
+
+/// Diversity controls the width of mixed ecotones, without replacing climate.
+pub fn run_ecology_with_diversity<G: GridOps>(
+    grid: &G,
+    fields: &WorldFields,
+    diversity: f64,
+) -> EcologyResult {
     let n = grid.cell_count();
     let mut biome = vec![0u8; n];
     let mut soil = vec![0u8; n];
@@ -117,7 +126,7 @@ pub fn run_ecology<G: GridOps>(grid: &G, fields: &WorldFields) -> EcologyResult 
         // 两个不同频率的扰动：大尺度做区域差异，小尺度做斑驳
         let big = jitter.fbm(p.x * 4.0, p.y * 4.0, p.z * 4.0, 2, 2.0, 0.5);
         let small = jitter.fbm(p.x * 16.0, p.y * 16.0, p.z * 16.0, 2, 2.0, 0.5);
-        let mix = (big * 0.65 + small * 0.35) as f32;
+        let mix = ((big * 0.65 + small * 0.35) * diversity.clamp(0.3, 2.)) as f32;
 
         let t = fields.temperature[i] + mix * 1.8;
         let prec = (fields.precipitation[i] * (1.0 + mix * 0.22)).max(0.0);
@@ -167,7 +176,11 @@ pub fn classify_biome(temp_c: f32, precip_mm: f32, elevation: f32) -> Biome {
         return Biome::IceSheet;
     }
     if t < -2.0 {
-        return if p > 250.0 { Biome::Tundra } else { Biome::IceSheet };
+        return if p > 250.0 {
+            Biome::Tundra
+        } else {
+            Biome::IceSheet
+        };
     }
 
     // 高海拔 = 高山草甸
@@ -180,12 +193,20 @@ pub fn classify_biome(temp_c: f32, precip_mm: f32, elevation: f32) -> Biome {
         return Biome::Desert;
     }
     if p < 400.0 {
-        return if t > 18.0 { Biome::Savanna } else { Biome::TemperateGrassland };
+        return if t > 18.0 {
+            Biome::Savanna
+        } else {
+            Biome::TemperateGrassland
+        };
     }
 
     // 按温度和降水的组合分类
     if t < 5.0 {
-        if p > 400.0 { Biome::BorealForest } else { Biome::TemperateGrassland }
+        if p > 400.0 {
+            Biome::BorealForest
+        } else {
+            Biome::TemperateGrassland
+        }
     } else if t < 20.0 {
         if p > 900.0 {
             Biome::TemperateForest
@@ -343,7 +364,8 @@ pub fn find_minerals<G: GridOps>(
             deposits.push(MineralDeposit {
                 cell: i as u32,
                 kind: MineralKind::Coal,
-                genesis: "古沉积盆地中的植物遗骸经地质作用形成。该地历史上是湿润的沉积环境。".to_string(),
+                genesis: "古沉积盆地中的植物遗骸经地质作用形成。该地历史上是湿润的沉积环境。"
+                    .to_string(),
                 abundance: rng.range_f64(0.4, 1.0) as f32,
             });
         }
@@ -376,7 +398,8 @@ pub fn find_minerals<G: GridOps>(
             deposits.push(MineralDeposit {
                 cell: b.cell,
                 kind: MineralKind::OrogenicGold,
-                genesis: "陆陆碰撞带的变质热液活动形成。碰撞造山时流体沿断裂上升，金富集成矿。".to_string(),
+                genesis: "陆陆碰撞带的变质热液活动形成。碰撞造山时流体沿断裂上升，金富集成矿。"
+                    .to_string(),
                 abundance: rng.range_f64(0.2, 0.8) as f32,
             });
         }

@@ -23,6 +23,62 @@
 
 use tf_grid::{GridOps, PatchGrid, SphereHexGrid};
 
+/// A missing parent cell is an error, never an invented ocean or default climate.
+pub fn sample_from_grid(
+    parent: &tf_grid::MapGrid,
+    child: &PatchGrid,
+    elevation: &[f32],
+    temperature: &[f32],
+    precipitation: &[f32],
+) -> Result<ParentSample, String> {
+    if [elevation.len(), temperature.len(), precipitation.len()]
+        .iter()
+        .any(|&n| n != parent.cell_count())
+    {
+        return Err("父图字段与网格尺寸不一致".into());
+    }
+    let mut sample = ParentSample {
+        elevation: Vec::new(),
+        temperature: Vec::new(),
+        precipitation: Vec::new(),
+        is_land: Vec::new(),
+    };
+    sample.elevation = interpolate_from_grid(parent, child, elevation)?;
+    sample.temperature = interpolate_from_grid(parent, child, temperature)?;
+    sample.precipitation = interpolate_from_grid(parent, child, precipitation)?;
+    sample.is_land = sample.elevation.iter().map(|&v| v > 0.).collect();
+    Ok(sample)
+}
+
+pub fn interpolate_from_grid(
+    parent: &tf_grid::MapGrid,
+    child: &PatchGrid,
+    elevation: &[f32],
+) -> Result<Vec<f32>, String> {
+    if elevation.len() != parent.cell_count() {
+        return Err("父图高程尺寸不一致".into());
+    }
+    (0..child.cell_count())
+        .map(|i| {
+            let dir = child.center_dir(i);
+            let cell = parent.cell_at(dir).ok_or("子图超出父图范围")?;
+            let mut sum = 0.0;
+            let mut weights = 0.0;
+            for j in std::iter::once(cell).chain(parent.neighbors(cell).iter().map(|&j| j as usize))
+            {
+                let d = dir.angle_to(&parent.center_dir(j));
+                if d < 1e-12 {
+                    return Ok(elevation[j]);
+                }
+                let w = 1.0 / (d * d);
+                sum += elevation[j] as f64 * w;
+                weights += w;
+            }
+            Ok((sum / weights) as f32)
+        })
+        .collect()
+}
+
 /// 父图上的一块采样结果。
 pub struct ParentSample {
     /// 每个子图格子的父图高程。
@@ -45,6 +101,9 @@ pub fn sample_from_parent(
     parent_temperature: &[f32],
     parent_precipitation: &[f32],
 ) -> ParentSample {
+    assert_eq!(parent_elevation.len(), parent_grid.cell_count());
+    assert_eq!(parent_temperature.len(), parent_grid.cell_count());
+    assert_eq!(parent_precipitation.len(), parent_grid.cell_count());
     let n = patch.cell_count();
     let mut elevation = Vec::with_capacity(n);
     let mut temperature = Vec::with_capacity(n);
@@ -55,10 +114,10 @@ pub fn sample_from_parent(
         let dir = patch.center_dir(i);
         let parent_cell = parent_grid.cell_at(dir);
 
-        elevation.push(parent_elevation.get(parent_cell).copied().unwrap_or(0.0));
-        temperature.push(parent_temperature.get(parent_cell).copied().unwrap_or(15.0));
-        precipitation.push(parent_precipitation.get(parent_cell).copied().unwrap_or(700.0));
-        is_land.push(parent_elevation.get(parent_cell).copied().unwrap_or(0.0) > 0.0);
+        elevation.push(parent_elevation[parent_cell]);
+        temperature.push(parent_temperature[parent_cell]);
+        precipitation.push(parent_precipitation[parent_cell]);
+        is_land.push(parent_elevation[parent_cell] > 0.0);
     }
 
     ParentSample {
@@ -129,10 +188,10 @@ pub fn blend_with_parent(
                 // 分类冲突，强行回到父图的分类
                 if parent_land && blended <= 0.0 {
                     // 父图是陆，子图算成海：抬到略高于海平面
-                    blended = blended.abs().max(20.0);
+                    blended = 20.0;
                 } else if !parent_land && blended > 0.0 {
                     // 父图是海，子图算成陆：压到海平面以下
-                    blended = -blended.max(20.0);
+                    blended = -20.0;
                 }
             }
         }
@@ -192,6 +251,23 @@ mod tests {
     }
 
     #[test]
+    fn sign_conflicts_clamp_to_the_coast_instead_of_reflecting_mountains() {
+        let patch = PatchGrid::new(&tf_grid::SphericalPatch::new(0., 0., 4000., 4));
+        let mut simulated = vec![3000.; 16];
+        let mut parent = ParentSample {
+            elevation: vec![-10.; 16],
+            temperature: vec![0.; 16],
+            precipitation: vec![0.; 16],
+            is_land: vec![false; 16],
+        };
+        blend_with_parent(&patch, &mut simulated, &parent, &[0.; 16], true);
+        assert_eq!(simulated, vec![-20.; 16]);
+        simulated.fill(-3000.);
+        parent.is_land.fill(true);
+        blend_with_parent(&patch, &mut simulated, &parent, &[0.; 16], true);
+        assert_eq!(simulated, vec![20.; 16]);
+    }
+    #[test]
     fn constraint_is_strong_at_edges_weak_inside() {
         let (_, patch) = make_grids();
         let w = constraint_weights(&patch);
@@ -234,14 +310,14 @@ mod tests {
             is_land: vec![false; n],
         };
 
-        blend_with_parent(&patch, &mut sim, &parent, &weights, true);
+        blend_with_parent(&patch, &mut sim, &parent, &weights, false);
 
         // 角落应该被拉到接近 0（父图是海，所以可能被压成略负的值）
         assert!(sim[0].abs() < 500.0, "corner {}", sim[0]);
         // 中心保留更多原来的值
         let size = patch.size() as usize;
         let center = (size / 2) * size + size / 2;
-        // 中心保留了 70% 的原始幅度。父图是海，所以符号被翻转成负值。
+        // This test isolates soft blending; coastal sign conflicts are tested separately.
         assert!(sim[center].abs() > 3000.0, "center {}", sim[center]);
     }
 

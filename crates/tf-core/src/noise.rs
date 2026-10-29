@@ -17,13 +17,10 @@ impl SimplexNoise {
         for (i, slot) in perm.iter_mut().enumerate() {
             *slot = i as u8;
         }
-        // Fisher-Yates 洗牌，随机源来自种子的简单哈希链
-        let mut state = seed | 1;
+        // Use the same versioned deterministic source as the rest of the engine.
+        let mut rng = crate::DeterministicRng::from_seed(seed);
         for i in (1..256).rev() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            let j = (state % (i as u64 + 1)) as usize;
+            let j = rng.below(i as u32 + 1) as usize;
             perm.swap(i, j);
         }
         let mut full = [0u8; 512];
@@ -37,9 +34,18 @@ impl SimplexNoise {
     fn grad3(hash: u8, x: f64, y: f64, z: f64) -> f64 {
         // 12 个梯度方向，用低位选
         const GRAD: [[f64; 3]; 12] = [
-            [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0], [1.0, -1.0, 0.0], [-1.0, -1.0, 0.0],
-            [1.0, 0.0, 1.0], [-1.0, 0.0, 1.0], [1.0, 0.0, -1.0], [-1.0, 0.0, -1.0],
-            [0.0, 1.0, 1.0], [0.0, -1.0, 1.0], [0.0, 1.0, -1.0], [0.0, -1.0, -1.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [-1.0, -1.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [-1.0, 0.0, 1.0],
+            [1.0, 0.0, -1.0],
+            [-1.0, 0.0, -1.0],
+            [0.0, 1.0, 1.0],
+            [0.0, -1.0, 1.0],
+            [0.0, 1.0, -1.0],
+            [0.0, -1.0, -1.0],
         ];
         let g = GRAD[(hash % 12) as usize];
         g[0] * x + g[1] * y + g[2] * z
@@ -95,33 +101,49 @@ impl SimplexNoise {
         let mut t0 = 0.6 - x0 * x0 - y0 * y0 - z0 * z0;
         if t0 > 0.0 {
             t0 *= t0;
-            n += t0 * t0 * Self::grad3(self.perm[ii + self.perm[jj + self.perm[kk] as usize] as usize], x0, y0, z0);
+            n += t0
+                * t0
+                * Self::grad3(
+                    self.perm[ii + self.perm[jj + self.perm[kk] as usize] as usize],
+                    x0,
+                    y0,
+                    z0,
+                );
         }
         let mut t1 = 0.6 - x1 * x1 - y1 * y1 - z1 * z1;
         if t1 > 0.0 {
             t1 *= t1;
-            n += t1 * t1
+            n += t1
+                * t1
                 * Self::grad3(
                     self.perm[ii + i1 + self.perm[jj + j1 + self.perm[kk + k1] as usize] as usize],
-                    x1, y1, z1,
+                    x1,
+                    y1,
+                    z1,
                 );
         }
         let mut t2 = 0.6 - x2 * x2 - y2 * y2 - z2 * z2;
         if t2 > 0.0 {
             t2 *= t2;
-            n += t2 * t2
+            n += t2
+                * t2
                 * Self::grad3(
                     self.perm[ii + i2 + self.perm[jj + j2 + self.perm[kk + k2] as usize] as usize],
-                    x2, y2, z2,
+                    x2,
+                    y2,
+                    z2,
                 );
         }
         let mut t3 = 0.6 - x3 * x3 - y3 * y3 - z3 * z3;
         if t3 > 0.0 {
             t3 *= t3;
-            n += t3 * t3
+            n += t3
+                * t3
                 * Self::grad3(
                     self.perm[ii + 1 + self.perm[jj + 1 + self.perm[kk + 1] as usize] as usize],
-                    x3, y3, z3,
+                    x3,
+                    y3,
+                    z3,
                 );
         }
 
@@ -140,7 +162,11 @@ impl SimplexNoise {
             amp *= gain;
             freq *= lacunarity;
         }
-        if norm > 0.0 { sum / norm } else { 0.0 }
+        if norm > 0.0 {
+            sum / norm
+        } else {
+            0.0
+        }
     }
 }
 
@@ -148,6 +174,12 @@ impl SimplexNoise {
 mod tests {
     use super::*;
 
+    #[test]
+    fn adjacent_seeds_do_not_share_a_permutation() {
+        let a = SimplexNoise::new(2);
+        let b = SimplexNoise::new(3);
+        assert_ne!(a.perm, b.perm);
+    }
     #[test]
     fn output_within_expected_range() {
         let noise = SimplexNoise::new(42);
@@ -184,7 +216,12 @@ mod tests {
                 diff += 1;
             }
         }
-        assert!(diff > total * 9 / 10, "only {} of {} differences", diff, total);
+        assert!(
+            diff > total * 9 / 10,
+            "only {} of {} differences",
+            diff,
+            total
+        );
     }
 
     #[test]
@@ -195,7 +232,13 @@ mod tests {
         for i in 1..1000 {
             let x = i as f64 * 0.001;
             let cur = noise.sample(x, 0.0, 0.0);
-            assert!((cur - prev).abs() < 0.1, "jump at {}: {} -> {}", i, prev, cur);
+            assert!(
+                (cur - prev).abs() < 0.1,
+                "jump at {}: {} -> {}",
+                i,
+                prev,
+                cur
+            );
             prev = cur;
         }
     }

@@ -8,10 +8,19 @@ fn report(label: &str, elev: &[f32]) {
     let n = s.len();
     let land: Vec<f32> = s.iter().cloned().filter(|&v| v > 0.0).collect();
     let ln = land.len();
-    if ln == 0 { println!("{:<16} 无陆地", label); return; }
-    println!("{:<16} 陆地 {:>6} 格 | p10={:>6.0} p50={:>6.0} p90={:>6.0} max={:>6.0}",
-        label, ln,
-        land[ln/10], land[ln/2], land[ln*9/10], land[ln-1]);
+    if ln == 0 {
+        println!("{:<16} 无陆地", label);
+        return;
+    }
+    println!(
+        "{:<16} 陆地 {:>6} 格 | p10={:>6.0} p50={:>6.0} p90={:>6.0} max={:>6.0}",
+        label,
+        ln,
+        land[ln / 10],
+        land[ln / 2],
+        land[ln * 9 / 10],
+        land[ln - 1]
+    );
     let _ = n;
 }
 
@@ -24,7 +33,9 @@ fn main() {
 
     let (tectonic, plate_id) = tf_sim::build_plates(&grid, &params, &mut rng);
     tf_sim::plates::init_crust(&grid, &plate_id, &tectonic, &mut fields, &mut rng, &params);
-    for _ in 0..8 { tf_sim::plates::step_tectonics(&grid, &tectonic, &mut fields, &params, 12.0); }
+    for _ in 0..8 {
+        tf_sim::plates::step_tectonics(&grid, &tectonic, &mut fields, &params, 12.0);
+    }
     tf_sim::plates::apply_airy_isostasy(&grid, &mut fields, &params);
     report("1.Airy均衡", &fields.elevation);
 

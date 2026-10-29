@@ -17,15 +17,27 @@ pub struct SphericalPatch {
     pub width_m: f64,
     /// 网格边长（格数）。
     pub size: u32,
+    pub radius_m: f64,
 }
 
 impl SphericalPatch {
     pub fn new(center_lat: f64, center_lon: f64, width_m: f64, size: u32) -> Self {
+        Self::with_radius(center_lat, center_lon, width_m, size, 6_371_000.0)
+    }
+
+    pub fn with_radius(
+        center_lat: f64,
+        center_lon: f64,
+        width_m: f64,
+        size: u32,
+        radius_m: f64,
+    ) -> Self {
         let c = UnitVec3::from_lat_lon_deg(center_lat, center_lon);
         Self {
             center: [c.as_vec().x, c.as_vec().y, c.as_vec().z],
             width_m,
             size,
+            radius_m,
         }
     }
 
@@ -46,6 +58,7 @@ impl SphericalPatch {
 pub struct PatchGrid {
     size: u32,
     cell_size_m: f64,
+    radius_m: f64,
     /// 区域中心方向。
     center: UnitVec3,
     /// 切平面基（东、北）。
@@ -61,6 +74,7 @@ pub struct PatchGrid {
 
 impl PatchGrid {
     pub fn new(patch: &SphericalPatch) -> Self {
+        assert!(patch.size > 0 && patch.width_m > 0. && patch.radius_m > 0.);
         let n = (patch.size * patch.size) as usize;
         let center = patch.center_vec();
         let (east, north) = center.tangent_frame();
@@ -74,25 +88,23 @@ impl PatchGrid {
         let hex_size = cell_size / (3.0_f64).sqrt();
         let area = (3.0 * (3.0_f64).sqrt() / 2.0) * hex_size * hex_size;
 
-        let half = patch.size as f64 / 2.0;
+        let half = (patch.size as f64 - 1.0) / 2.0;
 
         for row in 0..patch.size {
             let row_shift = if row % 2 == 0 { 0.0 } else { 0.5 };
             for col in 0..patch.size {
                 // 平面坐标（米）
-                let px = ((col as f64 + row_shift) - half) * cell_size;
-                let py = (row as f64 - half) * cell_size;
+                let px = ((col as f64 + row_shift) - half - 0.25) * cell_size;
+                let py = (half - row as f64) * cell_size * (3.0_f64).sqrt() / 2.0;
 
                 // 切平面投影回球面：
                 // 从中心沿 east/north 走，用 gnomonic 投影的逆变换
-                let angular_x = px / 6_371_000.0;
-                let angular_y = py / 6_371_000.0;
+                let angular_x = px / patch.radius_m;
+                let angular_y = py / patch.radius_m;
 
                 // 小角度近似：先走 east 再走 north
-                let dir = (center.as_vec()
-                    + east * angular_x.tan()
-                    + north * angular_y.tan())
-                .normalize();
+                let dir = (center.as_vec() + east * angular_x.tan() + north * angular_y.tan())
+                    .normalize();
 
                 let u = UnitVec3::from_normalized(dir);
                 let (lat, _lon) = u.to_lat_lon_deg();
@@ -135,6 +147,7 @@ impl PatchGrid {
         Self {
             size: patch.size,
             cell_size_m: cell_size,
+            radius_m: patch.radius_m,
             center,
             east,
             north,
@@ -168,9 +181,58 @@ impl PatchGrid {
         let dy = v.dot(self.north) / v.dot(self.center.as_vec());
         (dx.atan(), dy.atan())
     }
+
+    pub fn local_center(&self, i: usize) -> (f64, f64) {
+        let (row, col) = self.row_col(i);
+        let half = (self.size as f64 - 1.) / 2.;
+        (
+            ((col as f64 + (row % 2) as f64 * 0.5) - half - 0.25) * self.cell_size_m,
+            (half - row as f64) * self.cell_size_m * (3.0_f64).sqrt() / 2.,
+        )
+    }
+
+    pub fn cell_at(&self, dir: UnitVec3) -> Option<usize> {
+        if dir.as_vec().dot(self.center.as_vec()) <= 0. {
+            return None;
+        }
+        let (ax, ay) = self.project(dir);
+        let (x, y) = (ax * self.radius_m, ay * self.radius_m);
+        let half = (self.size as f64 - 1.) / 2.;
+        let rf = half - y / (self.cell_size_m * (3.0_f64).sqrt() / 2.);
+        if rf < -0.5 || rf > self.size as f64 - 0.5 {
+            return None;
+        }
+        let mut best = None;
+        let mut best_d = f64::INFINITY;
+        for row in (rf.round() as i32 - 1)..=(rf.round() as i32 + 1) {
+            if row < 0 || row >= self.size as i32 {
+                continue;
+            }
+            let cf = x / self.cell_size_m + half + 0.25 - (row % 2) as f64 * 0.5;
+            if cf < -0.5 || cf > self.size as f64 - 0.5 {
+                continue;
+            }
+            for col in (cf.round() as i32 - 1)..=(cf.round() as i32 + 1) {
+                if col < 0 || col >= self.size as i32 {
+                    continue;
+                }
+                let i = row as usize * self.size as usize + col as usize;
+                let (px, py) = self.local_center(i);
+                let d = (px - x).powi(2) + (py - y).powi(2);
+                if d < best_d {
+                    best_d = d;
+                    best = Some(i)
+                }
+            }
+        }
+        best
+    }
 }
 
 impl crate::GridOps for PatchGrid {
+    fn radius_m(&self) -> f64 {
+        self.radius_m
+    }
     fn cell_count(&self) -> usize {
         self.centers.len()
     }
@@ -181,8 +243,8 @@ impl crate::GridOps for PatchGrid {
         &self.neighbors[start..end]
     }
 
-    fn distance_m(&self, _a: usize, _b: usize) -> f64 {
-        self.cell_size_m
+    fn distance_m(&self, a: usize, b: usize) -> f64 {
+        self.centers[a].arc_distance_m(&self.centers[b], self.radius_m)
     }
 
     fn area_m2(&self, i: usize) -> f64 {
@@ -206,6 +268,31 @@ impl crate::GridOps for PatchGrid {
 mod tests {
     use super::*;
     use crate::GridOps;
+
+    #[test]
+    fn every_center_round_trips_across_dateline_poles_and_radii() {
+        for (lat, lon, radius) in [
+            (0., 179.9, 6_371_000.),
+            (89.9, -179.9, 3_000_000.),
+            (-90., 120., 12_000_000.),
+        ] {
+            let g = PatchGrid::new(&SphericalPatch::with_radius(lat, lon, 128_000., 32, radius));
+            for i in 0..g.cell_count() {
+                assert_eq!(g.cell_at(g.center_dir(i)), Some(i), "{lat}, {lon}, {i}");
+            }
+            assert!(g
+                .cell_at(UnitVec3::from_lat_lon_deg(-lat, lon + 180.))
+                .is_none());
+        }
+    }
+    #[test]
+    fn north_is_up_and_spacing_is_in_metres() {
+        let g = PatchGrid::new(&SphericalPatch::with_radius(
+            30., 100., 32_000., 32, 3_000_000.,
+        ));
+        assert!(g.latitude_deg(15) > g.latitude_deg(31 * 32 + 15));
+        assert!((g.distance_m(16 * 32 + 15, 16 * 32 + 16) - 1000.).abs() < 1.);
+    }
 
     #[test]
     fn patch_grid_dimensions() {
