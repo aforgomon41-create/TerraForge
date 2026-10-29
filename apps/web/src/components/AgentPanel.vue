@@ -1,252 +1,193 @@
 <script setup lang="ts">
-/**
- * AI 助手面板。
- *
- * 三个状态：
- * 1. 未配置：让用户填提供商、模型、API key
- * 2. 已配置：对话界面
- * 3. 思考中：显示当前在调什么工具
- */
-import { ref, computed, onMounted } from 'vue'
-import {
-  TerraAgent,
-  loadConfig,
-  saveConfig,
-  clearConfig,
-  PROVIDER_PRESETS,
-} from '@/agent/core'
+import { ref, nextTick, onBeforeUnmount } from 'vue'
+import { TerraAgent, loadConfig, saveConfig, clearConfig, validateConfig } from '@/agent/core'
 import { buildTools, buildSystemPrompt, type ToolContext } from '@/agent/tools'
-import type { ProviderConfig, AgentMessage } from '@/agent/types'
-
+import type { ProviderConfig } from '@/agent/types'
 const props = defineProps<{ toolCtx: ToolContext }>()
-
-const cfg = ref<ProviderConfig | null>(null)
-const showSettings = ref(false)
-const input = ref('')
-const busy = ref(false)
-const statusText = ref('')
+const emit = defineEmits<{ close: [] }>()
+const loaded = loadConfig(),
+  settings = ref(!loaded),
+  busy = ref(false),
+  question = ref(''),
+  status = ref(''),
+  remember = ref(false),
+  log = ref<HTMLElement | null>(null)
+const form = ref<ProviderConfig>(loaded || { preset: 'custom', baseUrl: '', model: '', apiKey: '' })
 const messages = ref<{ role: string; text: string }[]>([])
-const streaming = ref('')
-
 let agent: TerraAgent | null = null
-
-// 表单状态
-const formPreset = ref('deepseek')
-const formBaseUrl = ref(PROVIDER_PRESETS.deepseek.baseUrl)
-const formModel = ref(PROVIDER_PRESETS.deepseek.models[0])
-const formKey = ref('')
-
-onMounted(() => {
-  const saved = loadConfig()
-  if (saved) {
-    cfg.value = saved
-    initAgent()
-  } else {
-    showSettings.value = true
-  }
-})
-
-function onPresetChange() {
-  const p = PROVIDER_PRESETS[formPreset.value]
-  if (p) {
-    formBaseUrl.value = p.baseUrl
-    formModel.value = p.models[0] ?? ''
+function init() {
+  agent = new TerraAgent({ ...form.value }, buildTools(props.toolCtx), buildSystemPrompt(), () =>
+    JSON.stringify({
+      world: props.toolCtx.worldId(),
+      map: props.toolCtx.mapId(),
+      selection: props.toolCtx.selection(),
+    }),
+  )
+}
+if (loaded) init()
+function save() {
+  try {
+    validateConfig(form.value)
+    saveConfig(form.value, remember.value)
+    init()
+    settings.value = false
+    status.value = ''
+  } catch (e) {
+    status.value = String(e)
   }
 }
-
-function saveSettings() {
-  if (!formKey.value.trim()) {
-    statusText.value = '请填写 API Key'
-    return
-  }
-  const c: ProviderConfig = {
-    preset: formPreset.value,
-    baseUrl: formBaseUrl.value.trim(),
-    model: formModel.value.trim(),
-    apiKey: formKey.value.trim(),
-  }
-  saveConfig(c)
-  cfg.value = c
-  showSettings.value = false
-  initAgent()
-  statusText.value = ''
-}
-
-function initAgent() {
-  if (!cfg.value) return
-  agent = new TerraAgent(cfg.value, buildTools(props.toolCtx), buildSystemPrompt())
-}
-
-function logout() {
-  clearConfig()
-  cfg.value = null
-  agent = null
-  messages.value = []
-  showSettings.value = true
-}
-
-async function send() {
-  const text = input.value.trim()
-  if (!text || !agent || busy.value) return
-
-  input.value = ''
-  messages.value.push({ role: 'user', text })
-  streaming.value = ''
-  busy.value = true
-  statusText.value = '思考中'
-
-  await agent.send(text, {
-    onText: (delta) => {
-      streaming.value += delta
-    },
-    onTextEnd: () => {
-      if (streaming.value) {
-        messages.value.push({ role: 'assistant', text: streaming.value })
-        streaming.value = ''
-      }
-    },
-    onToolStart: (name) => {
-      statusText.value = '调用 ' + name
-    },
-    onToolEnd: (name, result) => {
-      const brief = JSON.stringify(result).slice(0, 80)
-      messages.value.push({ role: 'tool', text: name + ': ' + brief })
-      statusText.value = ''
-    },
-    onDone: () => {
-      busy.value = false
-      statusText.value = ''
-    },
-    onError: (msg) => {
-      busy.value = false
-      statusText.value = ''
-      messages.value.push({ role: 'error', text: msg })
-    },
-  })
-}
-
-function stop() {
+function forget() {
   agent?.abort()
-  busy.value = false
+  clearConfig()
+  form.value.apiKey = ''
+  agent = null
+  settings.value = true
+  messages.value = []
+  status.value = '已清除已保存的密钥'
 }
-
-const canSend = computed(() => input.value.trim().length > 0 && !busy.value)
+async function scroll() {
+  await nextTick()
+  log.value?.scrollTo({ top: log.value.scrollHeight })
+}
+async function send(text = question.value) {
+  if (busy.value || !agent || !text.trim()) return
+  question.value = ''
+  messages.value.push({ role: 'user', text })
+  const reply = { role: 'assistant', text: '' }
+  messages.value.push(reply)
+  const index = messages.value.length - 1
+  busy.value = true
+  status.value = '正在查看这颗世界…'
+  void scroll()
+  try {
+    await agent.send(text, {
+      onText: (delta) => {
+        messages.value[index].text += delta
+        void scroll()
+      },
+      onToolStart: (name) => {
+        status.value = '正在查询：' + name
+      },
+      onToolEnd: (name) => {
+        status.value = '已完成：' + name
+      },
+      onError: (message) => {
+        messages.value.push({ role: 'error', text: message })
+      },
+      onDone: () => {
+        status.value = ''
+      },
+    })
+  } finally {
+    busy.value = false
+    status.value = ''
+    void scroll()
+  }
+}
+function reset() {
+  if (busy.value) return
+  agent?.reset()
+  messages.value = []
+}
+onBeforeUnmount(() => agent?.abort())
 </script>
-
 <template>
-  <div class="flex flex-col h-full">
-    <!-- 未配置 -->
-    <div v-if="showSettings" class="p-4 space-y-3 text-sm">
-      <div class="text-xs text-dim/70 leading-relaxed">
-        API Key 只保存在这台设备的浏览器里，
-        请求直接从浏览器发往 AI 提供商，网站服务器全程不接触密钥。
-      </div>
-
+  <aside class="paper-panel agent-panel" aria-label="AI 地理助手">
+    <header class="panel-heading">
       <div>
-        <label class="label-xs block mb-1">提供商</label>
-        <select
-          v-model="formPreset"
-          class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm
-                 focus:outline-none focus:border-accent/50"
-          @change="onPresetChange"
-        >
-          <option v-for="(p, k) in PROVIDER_PRESETS" :key="k" :value="k">{{ p.label }}</option>
-        </select>
+        <span class="eyebrow">GEOGRAPHY COMPANION</span>
+        <h2>与世界对话</h2>
       </div>
-
-      <div>
-        <label class="label-xs block mb-1">API 地址</label>
+      <button class="icon-button" aria-label="关闭 AI 助手" @click="emit('close')">×</button>
+    </header>
+    <form v-if="settings" class="agent-settings" @submit.prevent="save">
+      <p class="muted">连接你自己的 AI。填写兼容 OpenAI Chat Completions 的地址和模型名称。</p>
+      <label>
+        服务地址
         <input
-          v-model="formBaseUrl"
-          class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm font-mono
-                 focus:outline-none focus:border-accent/50"
+          v-model="form.baseUrl"
+          type="url"
+          placeholder="https://你的服务地址/v1"
+          required
+          spellcheck="false"
         />
-      </div>
-
-      <div>
-        <label class="label-xs block mb-1">模型</label>
+      </label>
+      <label>
+        模型名称
         <input
-          v-model="formModel"
-          class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm font-mono
-                 focus:outline-none focus:border-accent/50"
+          v-model="form.model"
+          placeholder="填写服务商提供的模型 ID"
+          required
+          spellcheck="false"
         />
-      </div>
-
-      <div>
-        <label class="label-xs block mb-1">API Key</label>
+      </label>
+      <label>
+        API 密钥
         <input
-          v-model="formKey"
+          v-model="form.apiKey"
           type="password"
-          placeholder="sk-..."
-          class="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm font-mono
-                 focus:outline-none focus:border-accent/50"
+          autocomplete="off"
+          placeholder="仅用于浏览器直连 AI 服务"
+          required
         />
+      </label>
+      <label class="check-label">
+        <input v-model="remember" type="checkbox" />
+        在此设备记住密钥
+      </label>
+      <p class="hint">
+        默认只在当前页面使用。网站后端不接收密钥；AI
+        请求会把问题和所查询的地图数据发给你填写的服务。
+      </p>
+      <button class="primary" type="submit">连接并开始对话 ↗</button>
+      <button type="button" class="text-button" @click="forget">清除已保存配置</button>
+      <p v-if="status" role="alert" class="error-text">{{ status }}</p>
+    </form>
+    <template v-else>
+      <div class="agent-toolbar">
+        <span class="mono">{{ form.model }}</span>
+        <button :disabled="busy" @click="settings = true">设置</button>
+        <button :disabled="busy" @click="reset">清空</button>
       </div>
-
-      <div v-if="statusText" class="text-xs text-danger/90">{{ statusText }}</div>
-
-      <button class="btn-primary w-full py-2.5" @click="saveSettings">开始使用</button>
-    </div>
-
-    <!-- 对话界面 -->
-    <div v-else class="flex flex-col h-full min-h-0">
-      <div class="flex items-center justify-between px-3 py-2 border-b border-white/5">
-        <span class="text-[11px] text-dim/60 font-mono truncate">{{ cfg?.model }}</span>
-        <button class="text-[10px] text-dim/50 hover:text-ink" @click="logout">重置</button>
-      </div>
-
-      <div class="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
-        <div v-if="messages.length === 0" class="text-xs text-dim/50 leading-relaxed">
-          试试问：<br />
-          「这颗星球有几个大洲？」<br />
-          「最高的山在哪里？」<br />
-          「生成一块大陆的详细地图」
-        </div>
-
-        <div
-          v-for="(m, i) in messages"
-          :key="i"
-          class="text-xs leading-relaxed"
-          :class="{
-            'text-ink': m.role === 'user',
-            'text-dim/80': m.role === 'assistant',
-            'text-accent/70 font-mono text-[10px]': m.role === 'tool',
-            'text-danger/80': m.role === 'error',
-          }"
-        >
-          <div v-if="m.role === 'user'" class="flex justify-end">
-            <span class="bg-accent/15 border border-accent/25 rounded-lg px-3 py-1.5 max-w-[85%]">
-              {{ m.text }}
-            </span>
-          </div>
-          <div v-else-if="m.role === 'tool'" class="bg-white/[0.03] rounded px-2 py-1 break-all">
-            {{ m.text }}
-          </div>
-          <div v-else class="whitespace-pre-wrap">{{ m.text }}</div>
-        </div>
-
-        <div v-if="streaming" class="text-xs text-dim/80 whitespace-pre-wrap">{{ streaming }}</div>
-        <div v-if="statusText" class="text-[10px] text-accent/60 flex items-center gap-1.5">
-          <span class="spinner" style="width: 10px; height: 10px; border-width: 1.5px"></span>
-          {{ statusText }}
-        </div>
-      </div>
-
-      <div class="p-2 border-t border-white/5">
-        <div class="flex gap-1.5">
-          <input
-            v-model="input"
-            placeholder="问点什么..."
-            class="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-xs
-                   focus:outline-none focus:border-accent/50"
-            @keydown.enter.exact.prevent="send"
-          />
-          <button v-if="busy" class="btn-ghost px-3 text-xs" @click="stop">停</button>
-          <button v-else class="btn-primary px-3 text-xs" :disabled="!canSend" @click="send">
-            发送
+      <div ref="log" class="chat-log" role="log" aria-label="对话记录">
+        <div v-if="!messages.length" class="chat-welcome">
+          <span class="compass-mark">✧</span>
+          <h3>从一个地理问题开始。</h3>
+          <p>
+            读懂一片河谷，或为下一次探索
+            <br />
+            找到一个落点。
+          </p>
+          <button @click="send('请查询当前地图，介绍它的地形与生态。')">
+            这颗世界有哪些地貌？ ↗
+          </button>
+          <button @click="send('请查询我选中的位置，介绍当地气候，并区分数据与成因推断。')">
+            解读我选中的位置 ↗
           </button>
         </div>
+        <div v-for="(m, i) in messages" :key="i" class="chat-message" :class="m.role">
+          <small>{{ m.role === 'user' ? '你' : m.role === 'error' ? '提示' : '地理助手' }}</small>
+          <p>{{ m.text || '…' }}</p>
+        </div>
       </div>
-    </div>
-  </div>
+      <form class="chat-compose" @submit.prevent="send()">
+        <span class="hint" role="status">
+          {{ status || '基于当前地图回答，成因解释仅作近似参考。' }}
+        </span>
+        <textarea
+          v-model="question"
+          aria-label="地理问题"
+          placeholder="这片山地为什么多雨？"
+          rows="3"
+          maxlength="12000"
+          @keydown.ctrl.enter.prevent="send()"
+        />
+        <div>
+          <small>Ctrl + Enter 发送</small>
+          <button v-if="busy" type="button" @click="agent?.abort()">停止回复</button>
+          <button v-else type="submit" class="primary" :disabled="!question.trim()">发送 ↗</button>
+        </div>
+      </form>
+    </template>
+  </aside>
 </template>

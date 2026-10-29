@@ -1,63 +1,46 @@
-/**
- * 后端 API 客户端。
- *
- * 所有请求自动带上客户端令牌。令牌首次访问时生成，存在 localStorage。
- */
-
-// 部署在 /map/ 子路径下时，API 也在 /map/api/
-// 开发环境用 Vite 代理，生产环境用相对路径
-// API_BASE 只到站点根（含子路径），request() 里会拼 /api/v1/...
+/** Same-origin API. Every tab gets a server-issued, temporary capability. */
 export const API_BASE = import.meta.env.DEV
   ? ''
-  : import.meta.env.BASE_URL.replace(/\/$/, '')
-
-/** 客户端身份令牌。用来区分「我的世界」。 */
-export function getClientToken(): string {
-  const KEY = 'tf-client-token'
-  let token = localStorage.getItem(KEY)
-  if (!token) {
-    token = 'ct_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24)
-    localStorage.setItem(KEY, token)
-  }
-  return token
+  : new URL(import.meta.env.BASE_URL, window.location.href).pathname.replace(/\/$/, '')
+let token = sessionStorage.getItem('tf-session-v2') || ''
+export interface Session {
+  token: string
+  mode: 'web' | 'desktop'
+  quality: string
+  max_patch_side: number
+  expires_in_secs: number
 }
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(API_BASE + path, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      'x-tf-client': getClientToken(),
-      ...init?.headers,
-    },
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(`请求失败 ${res.status}: ${text.slice(0, 200)}`)
-  }
-  return res.json() as Promise<T>
-}
-
 export interface World {
   id: string
   name: string
   seed: number
   created_at: number
-  share_token: string | null
+  params?: Record<string, unknown>
 }
-
+export type GridDescriptor =
+  | { type: 'sphere'; frequency: number; radius_m: number; version: number }
+  | {
+      type: 'patch'
+      center_lat: number
+      center_lon: number
+      width_m: number
+      size: number
+      radius_m: number
+      version: number
+    }
 export interface MapNode {
   id: string
   world_id: string
   kind: string
+  name: string
   parent: string | null
   cells: number
   cell_size_m: number
   status: string
-  created_at: number
-  completed_at: number | null
+  grid: GridDescriptor | null
+  seed: number
+  generator_version: string
 }
-
 export interface JobStatus {
   id: string
   map_id: string
@@ -66,60 +49,108 @@ export interface JobStatus {
   progress: number
   error: string | null
 }
-
+export interface ChildRequest {
+  kind: string
+  center_lon: number
+  center_lat: number
+  width_m: number
+  name?: string
+}
+export function authHeaders(): Record<string, string> {
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+export async function authorizedFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const res = await fetch(API_BASE + path, {
+    ...init,
+    credentials: 'omit',
+    headers: { ...authHeaders(), ...init.headers },
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => null)
+    throw new Error(body?.error || `请求未完成（${res.status}）`)
+  }
+  return res
+}
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const r = await authorizedFetch('/api/v1' + path, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...init.headers },
+  })
+  return r.json()
+}
+async function binary(path: string, signal?: AbortSignal) {
+  const r = await authorizedFetch('/api/v1' + path, { signal })
+  const bytes = await r.arrayBuffer()
+  if (bytes.byteLength % 4) throw new Error('地图数据长度无效')
+  return new Float32Array(bytes)
+}
 export const api = {
-  health: () => request<{ status: string; version: string }>('/api/v1/health'),
-
-  createWorld: (name: string, seed: number) =>
-    request<World>('/api/v1/worlds', {
+  async openSession() {
+    const session = await request<Session>('/session', { method: 'POST' })
+    token = session.token
+    sessionStorage.setItem('tf-session-v2', token)
+    return session
+  },
+  heartbeat: () => request('/session/heartbeat', { method: 'POST' }),
+  async closeSession() {
+    await request('/session', { method: 'DELETE', keepalive: true })
+    token = ''
+    sessionStorage.removeItem('tf-session-v2')
+  },
+  leave() {
+    void fetch(API_BASE + '/api/v1/session', {
+      method: 'DELETE',
+      headers: authHeaders(),
+      credentials: 'omit',
+      keepalive: true,
+    }).catch(() => {})
+    sessionStorage.removeItem('tf-session-v2')
+  },
+  listWorlds: () => request<World[]>('/worlds'),
+  getWorld: (id: string) => request<World>(`/worlds/${id}`),
+  createWorld: (name: string, seed: number, params?: Record<string, unknown>) =>
+    request<World>('/worlds', {
       method: 'POST',
-      body: JSON.stringify({ name, seed }),
+      body: JSON.stringify({ name, seed, params }),
     }),
-
-  listWorlds: () => request<World[]>('/api/v1/worlds'),
-
-  getWorld: (id: string) => request<any>(`/api/v1/worlds/${id}`),
-
-  generateWorld: (worldId: string) =>
-    request<{ job_id: string; map_id: string }>(`/api/v1/worlds/${worldId}/generate`, {
+  deleteWorld: (id: string) => request(`/worlds/${id}`, { method: 'DELETE' }),
+  listMaps: (id: string) => request<MapNode[]>(`/worlds/${id}/maps`),
+  getMap: (id: string) => request<MapNode>(`/maps/${id}`),
+  getJob: (id: string) => request<JobStatus>(`/jobs/${id}`),
+  generateWorld: (id: string) =>
+    request<{ job_id: string; map_id: string }>(`/worlds/${id}/generate`, {
       method: 'POST',
     }),
-
-  listMaps: (worldId: string) => request<MapNode[]>(`/api/v1/worlds/${worldId}/maps`),
-
-  getMap: (id: string) => request<MapNode>(`/api/v1/maps/${id}`),
-
-  getJob: (id: string) => request<JobStatus>(`/api/v1/jobs/${id}`),
-
-  cancelJob: (id: string) =>
-    request<{ ok: boolean }>(`/api/v1/jobs/${id}/cancel`, { method: 'POST' }),
-
-  systemStatus: () => request<any>('/api/v1/system/status'),
-
-  /** 导出 PNG 地图（服务端渲染）。 */
-  exportPng: (mapId: string, size = 2048) =>
-    `${API_BASE}/api/v1/maps/${mapId}/export.png?size=${size}`,
-
-  /** 导出 JSON 世界数据。 */
-  exportJson: (mapId: string) => `${API_BASE}/api/v1/maps/${mapId}/export.json`,
-
-  /** 生成子图（大陆/区域/地点）。 */
-  generateChild: (
-    parentId: string,
-    body: { kind: string; center_lon: number; center_lat: number; width_m: number; name?: string }
-  ) =>
-    request<{ job_id: string; map_id: string; kind: string; cells: number; cell_size_m: number }>(
-      `/api/v1/maps/${parentId}/children`,
-      { method: 'POST', body: JSON.stringify(body) }
+  generateChild: (id: string, body: ChildRequest) =>
+    request<{ job_id: string; map_id: string }>(`/maps/${id}/children`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  cancelJob: (id: string) => request<{ ok: boolean }>(`/jobs/${id}/cancel`, { method: 'POST' }),
+  getField: (id: string, ch: string, signal?: AbortSignal) =>
+    binary(`/maps/${id}/field/${ch}`, signal),
+  getGrid: (id: string, signal?: AbortSignal) => binary(`/maps/${id}/grid`, signal),
+  metadata: (id: string, cell?: number) =>
+    request<Record<string, unknown>>(
+      `/maps/${id}/metadata${cell === undefined ? '' : '?cell=' + cell}`,
     ),
-
-  /** 取某个通道的原始 f32 数据。 */
-  async getField(mapId: string, channel: string): Promise<Float32Array> {
-    const res = await fetch(API_BASE + `/api/v1/maps/${mapId}/field/${channel}`, {
-      headers: { 'x-tf-client': getClientToken() },
+  sample: (id: string, lat: number, lon: number) =>
+    request(`/maps/${id}/sample?lat=${lat}&lon=${lon}`),
+  async importProject(file: File) {
+    const r = await authorizedFetch('/api/v1/projects/import', {
+      method: 'POST',
+      body: file,
+      headers: { 'Content-Type': 'application/json' },
     })
-    if (!res.ok) throw new Error(`取字段失败: ${res.status}`)
-    const buf = await res.arrayBuffer()
-    return new Float32Array(buf)
+    return r.json() as Promise<World>
+  },
+  async download(id: string, format: 'png' | 'json', filename: string) {
+    const res = await authorizedFetch(`/api/v1/maps/${id}/export.${format}`)
+    const url = URL.createObjectURL(await res.blob())
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 10000)
   },
 }

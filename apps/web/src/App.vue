@@ -1,621 +1,981 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useWorldStore } from '@/stores/world'
+import { api, type MapNode } from '@/api/client'
 import { HexSphereRenderer, MapStyle } from '@/renderer/HexSphereRenderer'
 import { buildSphereGrid } from '@/renderer/sphereGrid'
-import { openEventStream, decodeBase64, type FrameEvent } from '@/api/sse'
+import { direction, latLon, patchDirection, patchProject, nearestCell } from '@/renderer/geometry'
+import type { Vec3 } from '@/renderer/math'
+import { bindMapInput } from '@/renderer/interaction'
+import { decodeBase64 } from '@/api/sse'
+import type { ToolContext } from '@/agent/tools'
 import MapTree from '@/components/MapTree.vue'
 import AgentPanel from '@/components/AgentPanel.vue'
-import type { ToolContext } from '@/agent/tools'
-import { api, type MapNode } from '@/api/client'
-
-const store = useWorldStore()
-const canvasRef = ref<HTMLCanvasElement | null>(null)
-let renderer: HexSphereRenderer | null = null
-
-// 界面状态
-const showNewWorld = ref(true)
-const worldName = ref('Aetheria')
-const seed = ref(42)
-const progress = ref(0)
-const currentStage = ref('')
-const fps = ref(0)
-const hasMap = ref(false)
-const errorMsg = ref('')
-const styleName = ref<MapStyle>(MapStyle.Realistic)
-const layerName = ref(0)
-const exporting = ref(false)
-
-/** 导出 PNG。用浏览器下载。 */
-function exportPng() {
-  if (!currentMapId.value) return
-  const url = api.exportPng(currentMapId.value, 4096)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = 'terraforge-map.png'
-  link.target = '_blank'
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
-}
-
-/** 导出 JSON 世界数据。 */
-function exportJson() {
-  if (!currentMapId.value) return
-  const url = api.exportJson(currentMapId.value)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = 'terraforge-world.json'
-  link.target = '_blank'
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
-}
-
-const LAYERS = [
-  { id: 0, label: '地形' },
-  { id: 1, label: '温度' },
-  { id: 2, label: '降水' },
-  { id: 3, label: '生态' },
-  { id: 4, label: '高程' },
-]
-
-const STYLES: { id: MapStyle; label: string }[] = [
-  { id: MapStyle.Realistic, label: '写实' },
-  { id: MapStyle.Watercolor, label: '水彩' },
-  { id: MapStyle.Parchment, label: '羊皮纸' },
-  { id: MapStyle.Contour, label: '等高线' },
-]
-
-onMounted(() => {
-  if (!canvasRef.value) return
-  try {
-    renderer = new HexSphereRenderer(canvasRef.value)
-    renderer.start()
-
-    // 先画一个空的六角球，让用户看到背景
-    const preview = buildSphereGrid(96)
-    renderer.setCells({
-      centers: preview.centers,
-      heights: new Float32Array(preview.count),
-      biomes: new Uint8Array(preview.count),
-      count: preview.count,
-    })
-
-    // 鼠标交互
-    setupInteraction(canvasRef.value)
-  } catch (e) {
-    errorMsg.value = String(e)
+const store = useWorldStore(),
+  canvas = ref<HTMLCanvasElement | null>(null),
+  fileInput = ref<HTMLInputElement | null>(null)
+const scaleText = ref('')
+const worldProjection = ref<'sphere' | 'flat'>('sphere')
+const tab = ref<'tree' | 'create'>('create'),
+  panel = ref<'project' | 'layers' | 'ai' | null>('project'),
+  projectOpen = ref(true)
+const name = ref('Aetheria'),
+  seed = ref('42'),
+  land = ref(29),
+  plates = ref(14),
+  erosion = ref(1)
+const style = ref(MapStyle.Parchment),
+  layer = ref(0),
+  notice = ref(''),
+  ready = ref(false),
+  busy = ref(false),
+  loadLabel = ref('正在打开工作台…'),
+  selection = ref<{ lat: number; lon: number; cell: number } | null>(null),
+  pin = ref<{ x: number; y: number } | null>(null)
+const manualLat = ref('0'),
+  manualLon = ref('0'),
+  childWidth = ref(256),
+  childName = ref(''),
+  refine = ref(false),
+  ended = ref(false)
+let renderer: HexSphereRenderer | null = null,
+  heartbeat: ReturnType<typeof setInterval> | undefined,
+  uiTimer: ReturnType<typeof setInterval> | undefined,
+  interaction: AbortController | undefined
+const kinds: Record<string, string> = {
+    world: '世界',
+    continent: '大陆',
+    region: '区域',
+    site: '地点',
+  },
+  nextKind: Record<string, string> = {
+    world: 'continent',
+    continent: 'region',
+    region: 'site',
   }
-
-  setInterval(() => {
-    if (renderer) fps.value = renderer.getFps()
-  }, 500)
-})
-
-onBeforeUnmount(() => {
-  renderer?.dispose()
-})
-
-function setupInteraction(el: HTMLCanvasElement) {
-  let dragging = false
-  let lastX = 0
-  let lastY = 0
-
-  el.addEventListener('pointerdown', (e) => {
-    dragging = true
-    lastX = e.clientX
-    lastY = e.clientY
-    el.setPointerCapture(e.pointerId)
-  })
-
-  el.addEventListener('pointermove', (e) => {
-    if (!dragging) return
-    renderer?.rotate(e.clientX - lastX, e.clientY - lastY)
-    lastX = e.clientX
-    lastY = e.clientY
-  })
-
-  el.addEventListener('pointerup', (e) => {
-    dragging = false
-    el.releasePointerCapture(e.pointerId)
-  })
-
-  el.addEventListener(
-    'wheel',
-    (e) => {
-      e.preventDefault()
-      renderer?.zoom(-e.deltaY)
-    },
-    { passive: false }
+const biomes = [
+  '海洋',
+  '冰盖',
+  '苔原',
+  '针叶林',
+  '温带阔叶林',
+  '温带草原',
+  '地中海灌丛',
+  '沙漠',
+  '稀树草原',
+  '热带雨林',
+  '热带季雨林',
+  '高山草甸',
+  '湿地',
+]
+const layers = [
+  {
+    id: 0,
+    name: '地形地图',
+    icon: '◈',
+    unit: '海底深度 / 陆地地貌',
+    ends: ['深海', '平原', '山地'],
+    gradient: 'linear-gradient(90deg,#4d7b87,#9ebbb2,#9daa76,#b59d7d)',
+  },
+  {
+    id: 4,
+    name: '高程',
+    icon: '≋',
+    unit: '米 · 相对海平面',
+    ends: ['−6,000', '0', '6,000'],
+    gradient: 'linear-gradient(90deg,#4d7b87,#92b397,#c0ba80,#eeeadd)',
+  },
+  {
+    id: 1,
+    name: '温度',
+    icon: '◌',
+    unit: '℃ · 年均温',
+    ends: ['−40', '0', '40'],
+    gradient: 'linear-gradient(90deg,#597ab3,#c7d1a3,#c4593d)',
+  },
+  {
+    id: 2,
+    name: '降水',
+    icon: '☂',
+    unit: '毫米 / 年',
+    ends: ['0', '1,500', '3,000+'],
+    gradient: 'linear-gradient(90deg,#d4bd82,#8eada0,#367394)',
+  },
+  {
+    id: 5,
+    name: '水文',
+    icon: '⌁',
+    unit: '平方公里 · 上游汇水面积',
+    ends: ['1,000', '30,000', '1,000,000+'],
+    gradient: 'linear-gradient(90deg,#d6d6b5,#819fa1,#29668c)',
+  },
+  {
+    id: 3,
+    name: '生态',
+    icon: '❋',
+    unit: '13 类生物群系',
+    ends: ['冰原', '森林', '荒漠'],
+    gradient: 'linear-gradient(90deg,#e8ede5,#597b56,#cfb580)',
+  },
+]
+const activeLayer = computed(() => layers.find((l) => l.id === layer.value)!),
+  modeText = computed(() =>
+    store.session?.mode === 'desktop' ? '本地工程 · 自动保存' : '网页体验 · 临时会话',
   )
-
-  // 触摸双指缩放
-  let lastPinch = 0
-  el.addEventListener('touchmove', (e) => {
-    if (e.touches.length === 2) {
-      const d = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY
-      )
-      if (lastPinch > 0) renderer?.zoom((d - lastPinch) * 3)
-      lastPinch = d
-      e.preventDefault()
-    }
-  })
-  el.addEventListener('touchend', () => {
-    lastPinch = 0
-  })
-}
-
-async function handleGenerate() {
-  if (!renderer) return
-  errorMsg.value = ''
-  progress.value = 0
-  currentStage.value = '准备中'
-
+const locked = computed(() => busy.value || store.generating || store.loading || !ready.value),
+  hasMap = computed(() => !!store.currentMap)
+const next = computed(() => nextKind[store.currentMap?.kind || ''] || ''),
+  spacing = computed(() => ({ continent: 1000, region: 100, site: 1 })[next.value] || 1),
+  maxWidthKm = computed(() => (spacing.value * (store.session?.max_patch_side || 512)) / 1000)
+const childSide = computed(() => Math.ceil((childWidth.value * 1000) / spacing.value)),
+  validSelection = computed(() => selection.value && store.currentMap?.status === 'done')
+const selectedFacts = computed(() => {
+  const i = selection.value?.cell
+  if (i === undefined || !store.elevation) return null
+  return {
+    height: store.elevation[i],
+    temp: store.temperature?.[i] || 0,
+    rain: store.precipitation?.[i] || 0,
+    biome: biomes[store.biome?.[i] || 0],
+    flow: (store.flow?.[i] || 0) / 1e6,
+  }
+})
+const progress = computed(() => Math.round((store.job?.progress || 0) * 100)),
+  jobState = computed(
+    () =>
+      ({
+        queued: '排队中',
+        running: '正在演化',
+        cancelling: '正在取消',
+        done: '地图已完成',
+        cancelled: '生成已取消',
+        failed: '生成未完成',
+      })[store.job?.state || ''] || '等待开始',
+  )
+const mapStats = computed(() => {
+  const f = store.elevation
+  if (!f) return null
+  let land = 0,
+    min = Infinity,
+    max = -Infinity
+  for (const x of f) {
+    if (x > 0) land++
+    min = Math.min(min, x)
+    max = Math.max(max, x)
+  }
+  return {
+    land: Math.round((land / f.length) * 100),
+    min: Math.round(min),
+    max: Math.round(max),
+  }
+})
+async function guard(fn: () => Promise<unknown>) {
+  notice.value = ''
   try {
-    const w = await store.createWorld(worldName.value, Number(seed.value))
-    const mapId = await store.generate(w.id, (j) => {
-      progress.value = j.progress
-      currentStage.value = j.stage || '生成中'
-    })
-
-    // 用真实数据重建网格
-    const elev = store.elevation!
-    const biome = store.biome!
-
-    // 推断网格频率：格子数满足 10f²+2
-    const n = elev.length
-    const freq = Math.round(Math.sqrt((n - 2) / 10))
-    const grid = buildSphereGrid(freq)
-
-    if (grid.count !== n) {
-      throw new Error(`网格不匹配: 前端 ${grid.count} vs 后端 ${n}（freq=${freq}）`)
-    }
-
-    renderer.setCells({
-      centers: grid.centers,
-      heights: elev,
-      biomes: biome,
-      count: n,
-    })
-
-    // 按高程范围设置缩放
-    let maxElev = 0
-    for (let i = 0; i < n; i++) if (elev[i] > maxElev) maxElev = elev[i]
-    renderer.heightScale = 0.12 / Math.max(maxElev, 1)
-
-    // 切回真实数据渲染：预览帧只有 384x192，细节远不如完整数据
-    renderer.exitPreview()
-
-    // 刷新地图树，并把当前图设为选中
-    if (store.current) await refreshMaps(store.current.id)
-    currentMapId.value = mapId
-    hasMap.value = true
-    currentStage.value = '完成'
-    progress.value = 1
-
-    // 稍等一下让用户看到 100%，然后关掉面板显示地图
-    setTimeout(() => {
-      showNewWorld.value = false
-    }, 600)
+    await fn()
   } catch (e) {
-    errorMsg.value = String(e)
+    if ((e as Error)?.name !== 'AbortError')
+      notice.value = e instanceof Error ? e.message : String(e)
   }
 }
-
-watch(styleName, (v) => {
-  if (renderer) renderer.style = v
-})
-
-watch(layerName, (v) => {
+function startNew() {
+  tab.value = 'create'
+  projectOpen.value = true
+  panel.value = 'project'
+}
+function collapseProject() {
+  projectOpen.value = false
+  panel.value = null
+}
+function openProject() {
+  projectOpen.value = true
+  panel.value = 'project'
+}
+function toggleProject() {
+  panel.value = panel.value === 'project' ? null : 'project'
+  projectOpen.value = true
+}
+function reload() {
+  window.location.reload()
+}
+function randomSeed() {
+  seed.value = String(crypto.getRandomValues(new Uint32Array(1))[0])
+}
+async function generate() {
+  await guard(async () => {
+    const n = Number(seed.value)
+    if (!Number.isSafeInteger(n) || n < 0) throw new Error('种子请填写 0～9007199254740991 的整数')
+    if (!name.value.trim()) throw new Error('请填写世界名称')
+    await store.createWorld(name.value.trim(), n, {
+      land_fraction: land.value / 100,
+      plate_count: plates.value,
+      erosion_strength: erosion.value,
+    })
+    tab.value = 'tree'
+    await store.generate(store.current!.id)
+  })
+}
+async function regenerate() {
+  if (!store.current) return
+  await guard(() => store.generate(store.current!.id))
+}
+function applyMap() {
+  const node = store.currentMap
+  if (!renderer) return
+  if (!node || !store.centers || !store.elevation || !store.biome) {
+    renderer.clear()
+    selection.value = null
+    return
+  }
+  let centers = store.centers,
+    hex: number | undefined
+  if (node.grid?.type === 'patch') {
+    const g = node.grid
+    renderer.setPlanarMode(g.size)
+    centers = centers.map((v) => (v * 2) / g.width_m)
+    hex = (2 / g.size / Math.sqrt(3)) * 1.035
+    renderer.planarHalfHeight =
+      1.08 * Math.max(Math.sqrt(3) / 2, canvas.value!.clientHeight / canvas.value!.clientWidth)
+  } else if (worldProjection.value === 'flat') renderer.setWorldFlatMode()
+  else renderer.setSphereMode()
+  renderer.setCells(
+    {
+      centers,
+      heights: store.elevation,
+      biomes: store.biome,
+      temperatures: store.temperature || undefined,
+      precipitations: store.precipitation || undefined,
+      flows: store.flow || undefined,
+      count: node.cells,
+    },
+    hex,
+  )
+  renderer.heightScale = 0.025 / Math.max(mapStats.value?.max || 1, 1)
+  renderer.layer = layer.value
+  renderer.style = style.value
+  renderer.exitPreview()
+  selection.value = null
+  pin.value = null
+  refine.value = false
+}
+watch(() => store.currentMap, applyMap)
+watch(worldProjection, applyMap)
+watch(layer, (v) => {
   if (renderer) renderer.layer = v
 })
-
-// SSE 事件流
-let closeStream: (() => void) | null = null
-
-function startStream() {
-  closeStream?.()
-  // SSE 流也走 /map/api 前缀
-  const base = import.meta.env.DEV ? '' : import.meta.env.BASE_URL.replace(/\/$/, '')
-  closeStream = openEventStream(base, {
-    onFrame: (f: FrameEvent) => {
-      try {
-        const bytes = decodeBase64(f.data)
-        renderer?.uploadFrame(bytes, f.w, f.h, f.stats)
-        liveStats.value = f.stats
-      } catch (e) {
-        console.warn('帧处理失败', e)
-      }
-    },
-    onProgress: (p) => {
-      progress.value = p.progress
-      if (p.stage) currentStage.value = p.stage
-    },
-    onStage: (s) => {
-      currentStage.value = s.to
-    },
-    onDone: () => {
-      currentStage.value = '完成'
-    },
-    onFailed: (f) => {
-      errorMsg.value = f.error
-    },
+watch(style, (v) => {
+  if (renderer) renderer.style = v
+})
+watch(next, () => {
+  childWidth.value = (spacing.value * Math.min(256, store.session?.max_patch_side || 512)) / 1000
+  childName.value = next.value ? kinds[next.value] + '选区' : ''
+})
+function chooseAt(p: Vec3) {
+  const node = store.currentMap
+  if (!node?.grid || !store.centers || !renderer || store.generating) return
+  const g = node.grid
+  let geo, point: Vec3
+  if (g.type === 'patch') {
+    point = [(p[0] * g.width_m) / 2, (p[1] * g.width_m) / 2, 0]
+    const half = g.width_m / 2
+    if (Math.abs(point[0]) > half || Math.abs(point[1]) > (half * Math.sqrt(3)) / 2) return
+    geo = latLon(patchDirection(g.center_lat, g.center_lon, point[0], point[1], g.radius_m))
+  } else {
+    point = p
+    geo = latLon(p)
+  }
+  const i = nearestCell(store.centers, point, g.type === 'sphere')
+  if (i < 0) return
+  selection.value = { ...geo, cell: i }
+  manualLat.value = geo.lat.toFixed(5)
+  manualLon.value = geo.lon.toFixed(5)
+  refine.value = false
+  if (innerWidth < 760) panel.value = 'layers'
+  updatePin()
+}
+function manualSelect() {
+  const lat = Number(manualLat.value),
+    lon = Number(manualLon.value)
+  if (!Number.isFinite(lat) || Math.abs(lat) > 90 || !Number.isFinite(lon) || Math.abs(lon) > 180) {
+    notice.value = '经度范围 −180～180，纬度范围 −90～90'
+    return
+  }
+  const node = store.currentMap
+  if (!node?.grid) return
+  const d = direction(lat, lon)
+  if (node.grid.type === 'sphere') {
+    chooseAt(d)
+    renderer?.centerAt(d)
+  } else {
+    const g = node.grid,
+      p = patchProject(g.center_lat, g.center_lon, d, g.radius_m)
+    if (!p) {
+      notice.value = '坐标超出当前地图'
+      return
+    }
+    const renderPoint: Vec3 = [(p[0] * 2) / g.width_m, (p[1] * 2) / g.width_m, 0]
+    chooseAt(renderPoint)
+    renderer?.centerAt(renderPoint)
+  }
+}
+function updatePin() {
+  const node = store.currentMap,
+    s = selection.value
+  if (!node?.grid || !s || !renderer) {
+    pin.value = null
+    return
+  }
+  const g = node.grid
+  const p: Vec3 =
+    g.type === 'sphere'
+      ? direction(s.lat, s.lon)
+      : [
+          (store.centers![s.cell * 3] * 2) / g.width_m,
+          (store.centers![s.cell * 3 + 1] * 2) / g.width_m,
+          0,
+        ]
+  pin.value = renderer.project(p)
+}
+async function generateChild(parentId = store.currentMap?.id, kind = next.value) {
+  if (!parentId || !kind || !selection.value) throw new Error('请先在父图上选择位置')
+  if (store.currentMap?.id !== parentId) throw new Error('请先切换到父图并选择位置')
+  if (kind !== next.value) throw new Error('只能生成下一层地图')
+  await store.child(parentId, {
+    kind,
+    center_lat: selection.value.lat,
+    center_lon: selection.value.lon,
+    width_m: childWidth.value * 1000,
+    name: childName.value.trim() || kinds[kind] + '选区',
+  })
+  tab.value = 'tree'
+  refine.value = false
+}
+async function exportFile(format: 'png' | 'json') {
+  if (!store.currentMap) return
+  busy.value = true
+  loadLabel.value = format === 'png' ? '正在绘制地图…' : '正在保存完整工程…'
+  try {
+    await api.download(
+      store.currentMap.id,
+      format,
+      (store.current?.name || 'TerraForge') + (format === 'png' ? '.png' : '.tfworld'),
+    )
+  } finally {
+    busy.value = false
+  }
+}
+async function importFile(event: Event) {
+  const input = event.target as HTMLInputElement,
+    file = input.files?.[0]
+  if (!file) return
+  busy.value = true
+  loadLabel.value = '正在还原工程…'
+  await guard(async () => {
+    const max = store.session?.mode === 'desktop' ? 512 : 64
+    if (file.size > max * 1024 * 1024) throw new Error(`当前模式最多导入 ${max} MB 工程`)
+    const w = await api.importProject(file)
+    await store.refreshWorlds()
+    await store.selectWorld(w.id)
+    tab.value = 'tree'
+  })
+  busy.value = false
+  input.value = ''
+}
+async function deleteCurrent() {
+  const world = store.current
+  if (!world || !confirm(`删除「${world.name}」及其全部地图？请先保存需要的工程。`)) return
+  await guard(async () => {
+    await api.deleteWorld(world.id)
+    store.clearMap()
+    store.current = null
+    store.maps = []
+    await store.refreshWorlds()
+    if (store.worlds[0]) await store.selectWorld(store.worlds[0].id)
+    else tab.value = 'create'
   })
 }
-
-function stopStream() {
-  closeStream?.()
-  closeStream = null
+async function endSession() {
+  await guard(async () => {
+    await api.closeSession()
+    ended.value = true
+    store.dispose()
+    if (heartbeat) clearInterval(heartbeat)
+    renderer?.clear()
+  })
 }
-
-const liveStats = ref<any>(null)
-
-// 地图树
-const maps = ref<MapNode[]>([])
-const currentMapId = ref<string | null>(null)
-const showTree = ref(true)
-const showAgent = ref(false)
-
-// Agent 工具上下文：把 App 的能力暴露给 Agent
 const toolCtx: ToolContext = {
-  worldId: () => store.current?.id ?? null,
-  mapId: () => currentMapId.value,
-  maps: () => maps.value,
+  worldId: () => store.current?.id || null,
+  mapId: () => store.currentMap?.id || null,
+  maps: () => store.maps,
   elevation: () => store.elevation,
   biome: () => store.biome,
+  selection: () => selection.value,
   generate: async () => {
-    if (!store.current) throw new Error('还没有世界')
+    if (!store.current) throw new Error('请先创建世界')
     await store.generate(store.current.id)
-    await refreshMaps(store.current.id)
   },
-  drillDown: async (parentId, kind) => {
-    const parent = maps.value.find((m) => m.id === parentId)
-    if (!parent) throw new Error('找不到父图')
-    await handleGenerateChild(parent, kind)
-  },
+  drillDown: async (id, kind) => generateChild(id, kind),
   selectMap: async (id) => {
-    await handleSelectMap(id)
+    if (!store.maps.some((m) => m.id === id)) throw new Error('地图不属于当前工程')
+    await store.loadMapData(id)
   },
-  setLayer: (layer) => {
-    const map: Record<string, number> = {
+  setLayer: (key) => {
+    const v: Record<string, number> = {
       terrain: 0,
       temperature: 1,
       precipitation: 2,
       biome: 3,
       elevation: 4,
+      hydrology: 5,
     }
-    if (map[layer] !== undefined) layerName.value = map[layer]
+    if (v[key] === undefined) throw new Error('未知图层')
+    layer.value = v[key]
   },
-  setStyle: (style) => {
-    const map: Record<string, MapStyle> = {
+  setStyle: (key) => {
+    const v: Record<string, MapStyle> = {
       realistic: MapStyle.Realistic,
       watercolor: MapStyle.Watercolor,
       parchment: MapStyle.Parchment,
       contour: MapStyle.Contour,
     }
-    if (map[style] !== undefined) styleName.value = map[style]
+    if (v[key] === undefined) throw new Error('未知风格')
+    style.value = v[key]
   },
 }
-
-async function refreshMaps(worldId: string) {
-  try {
-    maps.value = await api.listMaps(worldId)
-    if (maps.value.length > 0 && !currentMapId.value) {
-      currentMapId.value = maps.value[0].id
-    }
-  } catch (e) {
-    console.warn('地图列表加载失败', e)
-  }
+function leave(e: PageTransitionEvent) {
+  if (!e.persisted && store.session?.mode === 'web' && !ended.value) api.leave()
 }
-
-/** 生成子图（下钻到更细层级）。 */
-async function handleGenerateChild(parent: MapNode, kind: string) {
+onMounted(async () => {
   try {
-    // 子图参数：以父图中心为中心，覆盖宽度按层级递减
-    const widthByKind: Record<string, number> = {
-      continent: 4_000_000,   // 4000 km
-      region: 400_000,        // 400 km
-      site: 20_000,           // 20 km
-    }
-    const res = await api.generateChild(parent.id, {
-      kind,
-      center_lon: 0,
-      center_lat: 0,
-      width_m: widthByKind[kind] ?? 400_000,
+    if (!canvas.value) return
+    renderer = new HexSphereRenderer(canvas.value)
+    renderer.start()
+    interaction = bindMapInput(canvas.value, renderer, chooseAt, updatePin)
+    store.onFrame((f) => {
+      if (!renderer || !store.generating) return
+      const node = store.maps.find((m) => m.id === store.job?.map_id)
+      if (node && node.kind !== 'world') return
+      if (!renderer.isPreviewMode()) {
+        const g = buildSphereGrid(32)
+        renderer.setSphereMode()
+        renderer.setCells({
+          centers: g.centers,
+          heights: new Float32Array(g.count),
+          biomes: new Uint8Array(g.count),
+          count: g.count,
+        })
+      }
+      renderer.uploadFrame(decodeBase64(f.data), f.w, f.h, f.stats)
     })
-    currentMapId.value = res.map_id
-    if (store.current) refreshMaps(store.current.id)
-
-    // 轮询到完成
-    while (true) {
-      await new Promise((r) => setTimeout(r, 700))
-      const j = await api.getJob(res.job_id)
-      if (j.state === 'done') break
-      if (j.state === 'failed') throw new Error(j.error || '生成失败')
-    }
-    if (store.current) await refreshMaps(store.current.id)
-  } catch (e) {
-    errorMsg.value = String(e)
-  }
-}
-
-async function handleSelectMap(id: string) {
-  currentMapId.value = id
-  const node = maps.value.find((m) => m.id === id)
-  if (!node || node.status !== 'done') return
-
-  try {
-    const elev = await api.getField(id, 'elevation')
-    const biome = await api.getField(id, 'biome')
-    const biomes = Uint8Array.from(biome, (v) => Math.round(v))
-
-    let maxE = 0
-    for (let i = 0; i < elev.length; i++) if (elev[i] > maxE) maxE = elev[i]
-
-    if (node.kind === 'world') {
-      renderer?.setSphereMode()
-      const freq = Math.round(Math.sqrt((elev.length - 2) / 10))
-      const grid = buildSphereGrid(freq)
-      // 加载温度和降水（图层切换要用）
-      let temps: Float32Array | undefined
-      let precs: Float32Array | undefined
-      try {
-        temps = await api.getField(id, 'temperature')
-        precs = await api.getField(id, 'precipitation')
-      } catch {
-        // 可选通道，失败就跳过
-      }
-
-      renderer?.setCells({
-        centers: grid.centers,
-        heights: elev,
-        biomes,
-        temperatures: temps,
-        precipitations: precs,
-        count: elev.length,
+    await store.init()
+    ready.value = true
+    if (store.current) tab.value = 'tree'
+    heartbeat = setInterval(() => {
+      void api.heartbeat().catch((e) => {
+        notice.value = '会话连接中断：' + e.message
       })
-    } else {
-      // 子图：平面网格。
-      // 格子中心铺在一个平面的球冠上，六角格半径必须与格间距匹配。
-      const size = Math.round(Math.sqrt(node.cells))
-      renderer?.setPlanarMode(size)
-
-      // span 控制平面网格的物理跨度。相机在 z 轴上方，距离 2.0，
-      // 视野 45 度，可见范围约 2*tan(22.5°)*2 = 1.66 个单位
-      // 六角格网的正确排布：
-      // - 行内相邻格水平间距 = cellStep
-      // - 行间垂直间距 = cellStep * sqrt(3)/2（约 0.866 倍）
-      // - 奇数行水平偏移半格
-      //
-      // 之前行间距用了 cellStep，导致行与行之间空隙过大，
-      // 渲染出来就是一条条斜纹。
-      const cellStep = 1.9 / size
-      const rowSpacing = cellStep * 0.866
-      const totalW = size * cellStep
-      const totalH = size * rowSpacing
-      // 六边形外接圆半径 = 对边距 / sqrt(3)，略放大消除接缝
-      const hexR = cellStep * 0.60
-
-      // 相机半高：让整块网格刚好铺满画面
-      if (renderer) renderer.planarHalfHeight = (totalH / 2) * 1.05
-
-      const centers = new Float32Array(elev.length * 3)
-      for (let r = 0; r < size; r++) {
-        const rowShift = r % 2 === 0 ? 0 : 0.5 * cellStep
-        for (let c = 0; c < size; c++) {
-          const idx2 = r * size + c
-          const px = c * cellStep + rowShift - totalW / 2
-          const py = r * rowSpacing - totalH / 2
-          centers[idx2 * 3] = px / 1.0
-          centers[idx2 * 3 + 1] = -py
-          centers[idx2 * 3 + 2] = 0
-        }
+    }, 30000)
+    uiTimer = setInterval(() => {
+      updatePin()
+      const g = store.currentMap?.grid
+      const value = renderer?.measureScale()
+      if (!g || value == null) {
+        scaleText.value = ''
+        return
       }
-      renderer?.setCells(
-        { centers, heights: elev, biomes, count: elev.length },
-        hexR * 1.02
-      )
-    }
-
-    if (renderer) {
-      renderer.heightScale = 0.12 / Math.max(maxE, 1)
-      renderer.layer = layerName.value
-    }
-    hasMap.value = true
+      const metres = value * (g.type === 'sphere' ? g.radius_m : g.width_m / 2)
+      scaleText.value =
+        metres >= 1000
+          ? (metres / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 }) + ' km'
+          : metres.toFixed(1) + ' m'
+    }, 100)
+    window.addEventListener('pagehide', leave)
   } catch (e) {
-    errorMsg.value = String(e)
+    notice.value = e instanceof Error ? e.message : String(e)
+    loadLabel.value = '工作台尚未连接；请刷新重试'
   }
-}
-
-
-const stageLabel = computed(() => {
-  if (progress.value >= 1) return '世界已成形'
-  return currentStage.value || '等待开始'
+})
+onBeforeUnmount(() => {
+  store.dispose()
+  renderer?.dispose()
+  interaction?.abort()
+  clearInterval(heartbeat)
+  clearInterval(uiTimer)
+  window.removeEventListener('pagehide', leave)
 })
 </script>
 
 <template>
-  <div class="relative w-full h-full overflow-hidden">
-    <!-- 全屏地图画布 -->
-    <canvas ref="canvasRef" class="absolute inset-0 w-full h-full" />
-
-    <!-- 暗角 -->
-    <div class="absolute inset-0 pointer-events-none"
-         style="background: radial-gradient(circle at 50% 45%, transparent 30%, rgba(0,0,0,0.55) 100%)" />
-
-    <!-- 左上：标题 -->
-    <div class="absolute top-6 left-6 animate-fade-up pointer-events-none">
-      <h1 class="text-2xl font-serif tracking-wide text-ink/95">
-        TerraForge
-      </h1>
-      <p class="text-xs text-dim/60 mt-1 tracking-wider">世界生成器</p>
-    </div>
-
-    <!-- 左侧：地图树 -->
-    <div
-      v-if="hasMap"
-      class="absolute top-24 left-6 w-64 panel p-3 animate-fade-up max-h-[60vh] overflow-y-auto z-40"
-    >
-      <div class="flex items-center justify-between mb-2 px-1">
-        <span class="label-xs">地图层级</span>
-        <button
-          class="text-[10px] text-dim/50 hover:text-ink transition-colors"
-          @click="showTree = !showTree"
-        >
-          {{ showTree ? '收起' : '展开' }}
-        </button>
-      </div>
-      <MapTree
-        v-if="showTree"
-        :maps="maps"
-        :current-id="currentMapId"
-        @select="handleSelectMap"
-        @generate="handleGenerateChild"
-      />
-    </div>
-
-    <!-- 右上：图层切换 -->
-    <div v-if="hasMap" class="absolute top-24 right-6 panel px-3 py-2 animate-fade-up z-40">
-      <div class="label-xs mb-1.5 px-1">图层</div>
-      <div class="flex flex-col gap-0.5">
-        <button
-          v-for="l in LAYERS"
-          :key="l.id"
-          class="px-3 py-1 text-xs rounded text-left transition-colors"
-          :class="layerName === l.id
-            ? 'bg-cool/20 text-cool border border-cool/40'
-            : 'text-dim/70 hover:text-ink hover:bg-white/5 border border-transparent'"
-          @click="layerName = l.id"
-        >
-          {{ l.label }}
-        </button>
-      </div>
-    </div>
-
-    <!-- 右上：风格切换 -->
-    <div v-if="hasMap" class="absolute top-6 right-6 panel px-3 py-2 animate-fade-up">
-      <div class="flex gap-1">
-        <button
-          v-for="s in STYLES"
-          :key="s.id"
-          class="px-3 py-1.5 text-xs rounded-lg transition-all"
-          :class="styleName === s.id
-            ? 'bg-accent/20 text-accent border border-accent/40'
-            : 'text-dim/70 hover:text-ink hover:bg-white/5 border border-transparent'"
-          @click="styleName = s.id"
-        >
-          {{ s.label }}
-        </button>
-      </div>
-    </div>
-
-    <!-- 左下：状态 -->
-    <div class="absolute bottom-6 left-6 text-xs text-dim/50 font-mono pointer-events-none">
-      <div v-if="fps > 0">{{ fps }} fps</div>
-      <div v-if="hasMap">{{ store.elevation?.length.toLocaleString() }} 格</div>
-    </div>
-
-    <!-- 创建面板 -->
-    <div
-      v-if="showNewWorld"
-      class="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-sm z-50"
-    >
-      <div class="panel w-[420px] p-8 animate-fade-up">
-        <h2 class="text-xl font-serif mb-1">创造一颗星球</h2>
-        <p class="text-sm text-dim/70 mb-6">
-          用真实的地球物理过程，从板块运动开始演化
+  <main class="workbench">
+    <canvas
+      ref="canvas"
+      class="map-canvas"
+      tabindex="0"
+      aria-label="交互地图：拖动旋转或平移，滚轮缩放，点击选择位置；方向键移动，Enter 选择中心，Home 复位"
+    />
+    <div class="paper-texture" aria-hidden="true" />
+    <div v-if="!hasMap && !store.generating" class="blank-atlas" aria-hidden="true">
+      <svg viewBox="0 0 700 700">
+        <defs>
+          <clipPath id="globeClip">
+            <circle cx="350" cy="350" r="252" />
+          </clipPath>
+        </defs>
+        <g fill="none" stroke="currentColor" stroke-width=".8">
+          <circle cx="350" cy="350" r="252" />
+          <circle cx="350" cy="350" r="270" stroke-dasharray="2 7" />
+          <g clip-path="url(#globeClip)">
+            <ellipse cx="350" cy="350" rx="80" ry="252" />
+            <ellipse cx="350" cy="350" rx="178" ry="252" />
+            <path d="M98 350H602M350 98V602" />
+            <ellipse cx="350" cy="350" rx="252" ry="84" />
+            <ellipse cx="350" cy="350" rx="252" ry="176" />
+          </g>
+          <path d="M350 55V80M350 620V645M55 350H80M620 350H645" />
+        </g>
+      </svg>
+      <div>
+        <span class="eyebrow">A WORLD, WAITING TO UNFOLD</span>
+        <h1>绘一颗世界。</h1>
+        <p>
+          从板块的相遇，到河流的去向。
+          <br />
+          创建你的第一份地理手记。
         </p>
-
-        <div class="space-y-5">
-          <div>
-            <label class="label-xs block mb-2">世界名称</label>
-            <input
-              v-model="worldName"
-              class="w-full px-3 py-2.5 rounded-lg bg-white/5 border border-white/10
-                     text-sm focus:outline-none focus:border-accent/50 transition-colors"
-            />
-          </div>
-
-          <div>
-            <label class="label-xs block mb-2">随机种子</label>
-            <div class="flex gap-2">
-              <input
-                v-model.number="seed"
-                type="number"
-                class="flex-1 px-3 py-2.5 rounded-lg bg-white/5 border border-white/10
-                       text-sm font-mono focus:outline-none focus:border-accent/50"
-              />
-              <button class="btn-ghost px-3" @click="seed = Math.floor(Math.random() * 99999)">
-                随机
-              </button>
-            </div>
-          </div>
-
-          <div v-if="store.generating" class="pt-2">
-            <div class="flex justify-between text-xs text-dim/70 mb-2">
-              <span>{{ stageLabel }}</span>
-              <span class="font-mono">{{ Math.round(progress * 100) }}%</span>
-            </div>
-            <div class="h-1 rounded-full bg-white/10 overflow-hidden">
-              <div
-                class="h-full bg-accent transition-all duration-300 rounded-full"
-                :style="{ width: (progress * 100) + '%' }"
-              />
-            </div>
-          </div>
-
-          <div v-if="errorMsg" class="text-xs text-danger/90 p-3 rounded-lg bg-danger/10 border border-danger/20">
-            {{ errorMsg }}
-          </div>
-
-          <button
-            class="btn-primary w-full py-3 text-sm"
-            :disabled="store.generating"
-            @click="handleGenerate"
-          >
-            <span v-if="!store.generating">开始生成</span>
-            <span v-else class="flex items-center justify-center gap-2">
-              <span class="spinner" />
-              演化中...
+      </div>
+    </div>
+    <header class="paper-panel topbar">
+      <a class="brand" href="#" @click.prevent="renderer?.resetView()">
+        <svg viewBox="0 0 36 36" aria-hidden="true">
+          <circle cx="18" cy="18" r="15" />
+          <path d="m18 5 5 13-5 13-5-13Zm-13 13h26M18 3v30" />
+        </svg>
+        <span>
+          TerraForge
+          <small>世界地理工作台</small>
+        </span>
+      </a>
+      <div class="top-divider" />
+      <div class="project-title">
+        <strong>{{ store.current?.name || '未命名的探索' }}</strong>
+        <span>
+          <i class="status-dot" />
+          {{ modeText }}
+        </span>
+      </div>
+      <nav aria-label="工程工具">
+        <select
+          v-if="store.currentMap?.kind === 'world'"
+          v-model="worldProjection"
+          aria-label="世界投影"
+          :disabled="locked"
+          class="projection-select"
+        >
+          <option value="sphere">球面视图</option>
+          <option value="flat">平面总图</option>
+        </select>
+        <button :disabled="!ready || store.generating" @click="startNew">＋ 新建</button>
+        <button :disabled="locked" @click="fileInput?.click()">打开工程</button>
+        <button :disabled="locked || !hasMap" @click="guard(() => exportFile('json'))">
+          保存工程
+        </button>
+        <button :disabled="locked || !hasMap" @click="guard(() => exportFile('png'))">
+          导出地图 ↗
+        </button>
+        <button
+          class="ai-button"
+          :aria-expanded="panel === 'ai'"
+          @click="panel = panel === 'ai' ? 'layers' : 'ai'"
+        >
+          ✧ 地理助手
+        </button>
+      </nav>
+      <input
+        ref="fileInput"
+        type="file"
+        accept=".tfworld,.json,application/json"
+        hidden
+        @change="importFile"
+      />
+    </header>
+    <div v-if="notice" class="notice paper-panel" role="alert">
+      <span>{{ notice }}</span>
+      <button aria-label="关闭提示" @click="notice = ''">×</button>
+    </div>
+    <div v-if="hasMap" class="map-caption">
+      <span class="eyebrow">{{ kinds[store.currentMap!.kind] }} · {{ activeLayer.name }}</span>
+      <h1>{{ store.currentMap?.name || store.current?.name }}</h1>
+      <span class="mono">
+        {{ store.currentMap?.cells.toLocaleString() }} CELLS ·
+        {{
+          store.currentMap!.cell_size_m >= 1000
+            ? (store.currentMap!.cell_size_m / 1000).toFixed(1) + ' km'
+            : store.currentMap!.cell_size_m.toFixed(0) + ' m'
+        }}
+        / 格
+      </span>
+    </div>
+    <aside
+      v-if="projectOpen"
+      class="paper-panel project-panel"
+      :class="{ 'mobile-hidden': panel !== 'project' }"
+      aria-label="工程与创建"
+    >
+      <header class="panel-heading">
+        <span class="eyebrow">FIELD NOTES / 地理手记</span>
+        <button class="icon-button" aria-label="收起工程面板" @click="collapseProject">−</button>
+      </header>
+      <div class="tabs" role="tablist" aria-label="工程面板">
+        <button role="tab" :aria-selected="tab === 'tree'" @click="tab = 'tree'">
+          地图册
+          <small>{{ store.maps.length || '—' }}</small>
+        </button>
+        <button role="tab" :aria-selected="tab === 'create'" @click="tab = 'create'">
+          创建世界
+        </button>
+      </div>
+      <div class="panel-body">
+        <template v-if="tab === 'tree'">
+          <label class="world-switch">
+            当前工程
+            <select
+              :value="store.current?.id || ''"
+              :disabled="locked"
+              @change="guard(() => store.selectWorld(($event.target as HTMLSelectElement).value))"
+            >
+              <option value="" disabled>还没有工程</option>
+              <option v-for="w in store.worlds" :key="w.id" :value="w.id">
+                {{ w.name }}
+              </option>
+            </select>
+          </label>
+          <MapTree
+            :maps="store.maps"
+            :current-id="store.currentMap?.id || null"
+            :disabled="locked"
+            @select="(id) => guard(() => store.loadMapData(id))"
+          />
+          <div v-if="mapStats" class="world-facts">
+            <span>
+              陆地
+              <b>{{ mapStats.land }}%</b>
             </span>
+            <span>
+              最高
+              <b>{{ mapStats.max.toLocaleString() }} m</b>
+            </span>
+            <span>
+              最深
+              <b>{{ mapStats.min.toLocaleString() }} m</b>
+            </span>
+          </div>
+          <div v-if="store.current" class="project-actions">
+            <button :disabled="locked" @click="regenerate">重新生成总图</button>
+            <button :disabled="locked" class="danger-link" @click="deleteCurrent">删除工程</button>
+          </div>
+        </template>
+        <form id="world-create" v-else class="create-form" @submit.prevent="generate">
+          <div class="intro">
+            <span class="eyebrow">01 / BEGIN A WORLD</span>
+            <h2>山海，由此开始。</h2>
+            <p>设定起点，观察地形与气候如何成形。</p>
+          </div>
+          <label>
+            世界名称
+            <input v-model="name" maxlength="80" required placeholder="给这颗世界起个名字" />
+          </label>
+          <label>
+            世界种子
+            <span class="input-action">
+              <input v-model="seed" inputmode="numeric" pattern="[0-9]+" required />
+              <button type="button" aria-label="随机选择种子" @click="randomSeed">↻</button>
+            </span>
+            <small>相同种子、参数与版本，可重现同一结果。</small>
+          </label>
+          <label class="range-label">
+            目标陆地占比
+            <b>{{ land }}%</b>
+            <input v-model.number="land" type="range" min="5" max="90" step="1" />
+            <span>
+              <small>群岛星球</small>
+              <small>辽阔大陆</small>
+            </span>
+          </label>
+          <details>
+            <summary>更多生成参数</summary>
+            <label>
+              构造板块数量
+              <input v-model.number="plates" type="number" min="8" max="30" required />
+            </label>
+            <label>
+              侵蚀强度
+              <input v-model.number="erosion" type="number" min="0" max="2" step="0.1" required />
+            </label>
+          </details>
+          <div class="quality-note">
+            <span class="status-dot" />
+            <div>
+              {{
+                store.session?.quality === 'economy'
+                  ? '经济精度'
+                  : store.session?.quality === 'high'
+                    ? '高精度'
+                    : '标准精度'
+              }}
+              <small>
+                {{
+                  store.session?.mode === 'desktop'
+                    ? '保存在本机，可离线打开'
+                    : '网页版按资源预算生成，局部图最多 ' +
+                      (store.session?.max_patch_side || 512) +
+                      ' × ' +
+                      (store.session?.max_patch_side || 512) +
+                      ' 格'
+                }}
+              </small>
+            </div>
+          </div>
+        </form>
+      </div>
+      <footer class="panel-footer">
+        <button
+          class="primary start-button"
+          type="submit"
+          form="world-create"
+          v-if="tab === 'create'"
+          :disabled="locked"
+        >
+          {{ store.generating ? '世界正在成形…' : '开始演化' }}
+          <span>→</span>
+        </button>
+
+        <template v-if="store.session?.mode === 'web'">
+          体验数据在离开后清理。保存工程，留住这次探索。
+          <button :disabled="locked" class="text-button" @click="endSession">结束本次体验</button>
+        </template>
+        <template v-else>工程保存在本机。也可以导出 .tfworld 文件备份。</template>
+      </footer>
+    </aside>
+    <button v-else class="paper-panel reopen-project" @click="openProject">☷ 工程与创建</button>
+    <div class="north-mark" aria-hidden="true">
+      <span>N</span>
+      <svg viewBox="0 0 32 48">
+        <path d="m16 2 10 38-10-9L6 40Z" />
+        <path d="M16 2v29" />
+      </svg>
+    </div>
+    <div
+      v-if="pin"
+      class="selection-pin"
+      :style="{ left: pin.x + 'px', top: pin.y + 'px' }"
+      aria-hidden="true"
+    >
+      <i />
+      <span>{{ selection?.lat.toFixed(2) }}°, {{ selection?.lon.toFixed(2) }}°</span>
+    </div>
+    <div v-if="panel !== 'ai'" class="right-stack" :class="{ 'mobile-hidden': panel !== 'layers' }">
+      <aside class="paper-panel layers-panel" aria-label="地图图层">
+        <span class="eyebrow">MAP LAYERS / 图层</span>
+        <div role="radiogroup" aria-label="地图图层">
+          <button
+            v-for="l in layers"
+            :key="l.id"
+            role="radio"
+            :aria-checked="layer === l.id"
+            :class="{ active: layer === l.id }"
+            :disabled="!hasMap && !store.generating"
+            @click="layer = l.id"
+          >
+            <span>{{ l.icon }}</span>
+            {{ l.name }}
+            <i v-if="layer === l.id">●</i>
           </button>
         </div>
+        <label class="style-select">
+          地图笔触
+          <select v-model.number="style" aria-label="地图视觉风格">
+            <option :value="MapStyle.Parchment">纸张地形</option>
+            <option :value="MapStyle.Realistic">自然设色</option>
+            <option :value="MapStyle.Watercolor">淡彩</option>
+            <option :value="MapStyle.Contour">等高线</option>
+          </select>
+        </label>
+      </aside>
+      <aside class="paper-panel selection-panel" aria-label="选区信息">
+        <span class="eyebrow">SELECTED LANDSCAPE</span>
+        <h2>{{ selection ? '此处的地理' : '为探索，选一个落点。' }}</h2>
+        <template v-if="selectedFacts && selection">
+          <p class="coordinates mono">
+            {{ Math.abs(selection.lat).toFixed(3) }}° {{ selection.lat >= 0 ? 'N' : 'S' }} ·
+            {{ Math.abs(selection.lon).toFixed(3) }}°
+            {{ selection.lon >= 0 ? 'E' : 'W' }}
+          </p>
+          <dl class="selection-facts">
+            <div>
+              <dt>高程</dt>
+              <dd>
+                {{ Math.round(selectedFacts.height).toLocaleString() }}
+                <small>m</small>
+              </dd>
+            </div>
+            <div>
+              <dt>年均温</dt>
+              <dd>
+                {{ selectedFacts.temp.toFixed(1) }}
+                <small>℃</small>
+              </dd>
+            </div>
+            <div>
+              <dt>年降水</dt>
+              <dd>
+                {{ Math.round(selectedFacts.rain).toLocaleString() }}
+                <small>mm</small>
+              </dd>
+            </div>
+            <div>
+              <dt>生态</dt>
+              <dd>{{ selectedFacts.biome }}</dd>
+            </div>
+          </dl>
+          <button v-if="next && !refine" class="primary" :disabled="locked" @click="refine = true">
+            以此为中心，细化地图 →
+          </button>
+          <form
+            v-if="refine && next"
+            class="refine-form"
+            @submit.prevent="guard(() => generateChild())"
+          >
+            <label>
+              {{ kinds[next] }}图名称
+              <input v-model="childName" maxlength="80" />
+            </label>
+            <label>
+              覆盖宽度（km）
+              <input
+                v-model.number="childWidth"
+                type="number"
+                :min="(spacing * 4) / 1000"
+                :max="maxWidthKm"
+                :step="spacing / 1000"
+                required
+              />
+            </label>
+            <small>
+              {{ spacing >= 1000 ? spacing / 1000 + ' km' : spacing + ' m' }} / 格 ·
+              {{ childSide }} × {{ childSide }} 格
+              <br />
+              宽度上限 {{ maxWidthKm }} km，需完整位于父图内。
+            </small>
+            <button
+              class="primary"
+              :disabled="
+                locked || childSide < 4 || childSide > (store.session?.max_patch_side || 512)
+              "
+            >
+              生成{{ kinds[next] }}图 ↗
+            </button>
+          </form>
+          <p v-else-if="!next" class="hint">已到地点层，可继续查看各项数据。</p>
+        </template>
+        <p v-else class="muted">
+          点击地图查看海拔、温度与降水。
+          <br />
+          从这里，进入更细的地图。
+        </p>
+        <details v-if="hasMap">
+          <summary>按经纬度选择</summary>
+          <form class="coordinate-form" @submit.prevent="manualSelect">
+            <label>
+              纬度
+              <input v-model="manualLat" type="number" min="-90" max="90" step="any" required />
+            </label>
+            <label>
+              经度
+              <input v-model="manualLon" type="number" min="-180" max="180" step="any" required />
+            </label>
+            <button>选择</button>
+          </form>
+        </details>
+      </aside>
+    </div>
+    <AgentPanel v-if="panel === 'ai'" :tool-ctx="toolCtx" @close="panel = 'layers'" />
+    <div class="map-controls paper-panel">
+      <button aria-label="放大地图" @click="renderer?.zoom(180)">＋</button>
+      <button aria-label="缩小地图" @click="renderer?.zoom(-180)">−</button>
+      <button aria-label="复位地图视图" @click="renderer?.resetView()">⌖</button>
+    </div>
+    <div v-if="hasMap || store.generating" class="map-legend">
+      <div v-if="scaleText" class="distance-scale">
+        <i />
+        {{ scaleText }}
+      </div>
+      <span>{{ activeLayer.unit }}</span>
+      <i :style="{ background: activeLayer.gradient }" />
+      <div>
+        <span v-for="end in activeLayer.ends" :key="end">{{ end }}</span>
+      </div>
+      <small>
+        {{
+          store.currentMap?.grid?.type === 'patch'
+            ? '局部切平面 · 北向上'
+            : worldProjection === 'flat'
+              ? '平面总图 · 等距圆柱投影'
+              : '球面视图 · 拖动旋转'
+        }}
+        · {{ style === 2 ? '纸张地形' : '地理地图' }}
+      </small>
+    </div>
+    <section
+      v-if="store.generating || store.job"
+      class="paper-panel generation-bar"
+      :class="{ settled: !store.generating }"
+      aria-label="生成进度"
+    >
+      <div>
+        <div class="generation-label">
+          <strong>{{ jobState }}</strong>
+          <span>{{ store.job?.stage || '等待任务启动' }} · {{ progress }}%</span>
+        </div>
+        <progress :value="store.job?.progress || 0" max="1" :aria-label="jobState" />
+        <div v-if="store.generating" class="generation-steps">
+          <span>板块</span>
+          <span>地貌</span>
+          <span>水文</span>
+          <span>气候</span>
+          <span>生态</span>
+        </div>
+      </div>
+      <button
+        v-if="store.generating"
+        :disabled="store.job?.state === 'cancelling'"
+        @click="guard(store.cancel)"
+      >
+        {{ store.job?.state === 'cancelling' ? '取消中…' : '取消' }}
+      </button>
+      <button v-else class="icon-button" aria-label="收起生成结果" @click="store.job = null">
+        ×
+      </button>
+    </section>
+    <div v-if="busy || store.loading || !ready" class="loading-chip paper-panel" role="status">
+      <i class="spinner" />
+      {{ store.loading ? '正在展开地图…' : loadLabel }}
+    </div>
+    <nav class="mobile-nav paper-panel" aria-label="移动工作台面板">
+      <button @click="toggleProject">☷ 工程</button>
+      <button @click="panel = panel === 'layers' ? null : 'layers'">◈ 图层与选区</button>
+      <button @click="panel = panel === 'ai' ? null : 'ai'">✧ AI</button>
+    </nav>
+    <div v-if="ended" class="ended-screen">
+      <div class="paper-panel">
+        <span class="eyebrow">FIELD NOTES / 已结束</span>
+        <h1>这次探索已收笔。</h1>
+        <p>
+          临时世界与地图已清理。
+          <br />
+          保存的工程文件仍可在下一次探索中打开。
+        </p>
+        <button class="primary" @click="reload">开始新的探索 →</button>
       </div>
     </div>
-
-    <!-- 导出 -->
-    <div v-if="hasMap" class="absolute bottom-6 right-[21rem] flex gap-1.5 z-40">
-      <button class="btn-ghost text-xs" @click="exportPng">导出 PNG</button>
-      <button class="btn-ghost text-xs" @click="exportJson">导出 JSON</button>
-    </div>
-
-    <!-- AI 助手 -->
-    <button
-      v-if="hasMap"
-      class="absolute bottom-6 right-6 btn-primary text-xs z-40"
-      :class="{ 'mr-40': showAgent }"
-      @click="showAgent = !showAgent"
-    >
-      {{ showAgent ? '关闭助手' : 'AI 助手' }}
-    </button>
-
-    <div
-      v-if="showAgent"
-      class="absolute bottom-20 right-6 w-96 h-[520px] panel overflow-hidden animate-fade-up z-40"
-    >
-      <AgentPanel :tool-ctx="toolCtx" />
-    </div>
-
-    <!-- 重新生成按钮 -->
-    <button
-      v-if="hasMap"
-      class="absolute bottom-6 right-6 btn-ghost text-xs"
-      @click="showNewWorld = true"
-    >
-      创造新的世界
-    </button>
-  </div>
+  </main>
 </template>

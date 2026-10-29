@@ -10,7 +10,8 @@
  */
 
 import { FRAG, VERT } from './shaders'
-import { lookAt, mat4Mul, perspective, type Vec3 } from './math'
+import { worldMapDirection, worldMapPoint } from './geometry'
+import { lookAt, mat4Mul, perspective, cross, dot, norm, type Vec3 } from './math'
 
 export interface CellData {
   /** 格子中心方向 xyz 交错，长度 = count * 3 */
@@ -23,6 +24,7 @@ export interface CellData {
   temperatures?: Float32Array
   /** 每格降水（毫米/年）。可选。 */
   precipitations?: Float32Array
+  flows?: Float32Array
   count: number
 }
 
@@ -44,6 +46,11 @@ export class HexSphereRenderer {
   private instBiomeBuf: WebGLBuffer | null = null
   private instTempBuf: WebGLBuffer | null = null
   private instPrecipBuf: WebGLBuffer | null = null
+  private instFlowBuf: WebGLBuffer | null = null
+  private pan: Vec3 = [0, 0, 0]
+  private planarZoom = 1
+  private matrix: Float32Array = new Float32Array(16)
+  private eye: Vec3 = [0, 0, 3.2]
 
   private cellCount = 0
   private hexRadius = 0.02
@@ -53,10 +60,10 @@ export class HexSphereRenderer {
   private pitch = 0.35
   private distance = 3.2
   private targetDistance = 3.2
-  private autoRotate = true
+  private autoRotate = false
 
   // 渲染参数
-  public style = MapStyle.Realistic
+  public style = MapStyle.Parchment
   /** 当前图层：0=地形 1=温度 2=降水 3=生物群系 4=高程 */
   public layer = 0
   public radius = 1.0
@@ -73,6 +80,7 @@ export class HexSphereRenderer {
 
   /** 平面补丁模式：子图用平面网格渲染而不是整球。 */
   private planarMode = false
+  private worldFlatMode = false
   private planarSize = 0
   /** 平面模式的正交相机半高，由网格尺寸决定。 */
   public planarHalfHeight = 1.0
@@ -135,7 +143,7 @@ export class HexSphereRenderer {
     gl.enable(gl.DEPTH_TEST)
     gl.enable(gl.CULL_FACE)
     gl.cullFace(gl.BACK)
-    gl.clearColor(0.039, 0.047, 0.063, 1)
+    gl.clearColor(245 / 255, 242 / 255, 233 / 255, 1)
   }
 
   private compileShader(type: number, src: string): WebGLShader {
@@ -161,14 +169,18 @@ export class HexSphereRenderer {
     data: Uint8Array,
     w: number,
     h: number,
-    stats: { land_fraction: number; max_elevation: number; min_elevation: number }
+    stats: {
+      land_fraction: number
+      max_elevation: number
+      min_elevation: number
+    },
   ) {
     const gl = this.gl
     if (!this.frameTexture) return
 
     const rgba = new Uint8Array(w * h * 4)
     const eMin = stats.min_elevation
-    const eSpan = Math.max(stats.max_elevation - eMin, 1)
+    if (data.length !== w * h * 5) throw new Error('预览帧尺寸无效')
 
     for (let i = 0; i < w * h; i++) {
       const src = i * 5
@@ -196,6 +208,9 @@ export class HexSphereRenderer {
    * 相机改为俯视，用户看到的是「一张地图」而不是「一颗星球」。
    */
   setPlanarMode(size: number) {
+    this.worldFlatMode = false
+    this.planarZoom = 1
+    this.pan = [0, 0, 0]
     this.planarMode = true
     this.planarSize = size
     this.targetDistance = 2.0
@@ -204,12 +219,22 @@ export class HexSphereRenderer {
     this.autoRotate = false
   }
 
+  /** World atlas retains the same cell IDs and geographic picking as the globe. */
+  setWorldFlatMode() {
+    this.setPlanarMode(0)
+    this.worldFlatMode = true
+    this.planarHalfHeight =
+      1.08 * Math.max(1, (2 * this.canvas.clientHeight) / this.canvas.clientWidth)
+  }
+
   /** 切回球面模式。 */
   setSphereMode() {
+    this.worldFlatMode = false
+    this.autoRotate = false
     this.planarMode = false
     this.targetDistance = 3.2
     this.pitch = 0.35
-    this.autoRotate = true
+    this.autoRotate = false
   }
 
   isPlanarMode(): boolean {
@@ -296,9 +321,97 @@ export class HexSphereRenderer {
       gl.vertexAttribDivisor(5, 1)
     }
 
+    if (data.flows) {
+      if (!this.instFlowBuf) this.instFlowBuf = gl.createBuffer()
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.instFlowBuf)
+      gl.bufferData(gl.ARRAY_BUFFER, data.flows, gl.STATIC_DRAW)
+      gl.enableVertexAttribArray(6)
+      gl.vertexAttribPointer(6, 1, gl.FLOAT, false, 4, 0)
+      gl.vertexAttribDivisor(6, 1)
+    } else {
+      gl.disableVertexAttribArray(6)
+      gl.vertexAttrib1f(6, 0)
+    }
+    if (!data.temperatures) {
+      gl.disableVertexAttribArray(4)
+      gl.vertexAttrib1f(4, 0)
+    }
+    if (!data.precipitations) {
+      gl.disableVertexAttribArray(5)
+      gl.vertexAttrib1f(5, 0)
+    }
     gl.bindVertexArray(null)
   }
 
+  clear() {
+    this.cellCount = 0
+    this.previewMode = false
+  }
+  resetView() {
+    this.yaw = 0
+    this.pitch = 0.35
+    this.targetDistance = 3.2
+    this.pan = [0, 0, 0]
+    this.planarZoom = 1
+  }
+  centerAt(p: Vec3) {
+    if (this.worldFlatMode) p = worldMapPoint(p)
+    if (this.planarMode) {
+      this.pan = [p[0], p[1], 0]
+    } else {
+      const n = norm(p)
+      this.yaw = Math.atan2(n[0], n[2])
+      this.pitch = Math.asin(n[1])
+      this.autoRotate = false
+    }
+  }
+  measureScale(pixels = 100) {
+    const r = this.canvas.getBoundingClientRect(),
+      x = r.left + r.width / 2,
+      y = r.top + r.height / 2,
+      a = this.pick(x - pixels / 2, y),
+      b = this.pick(x + pixels / 2, y)
+    if (!a || !b) return null
+    if (this.planarMode && !this.worldFlatMode) return Math.hypot(a[0] - b[0], a[1] - b[1])
+    return 2 * Math.asin(Math.min(1, Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) / 2))
+  }
+  pick(clientX: number, clientY: number): Vec3 | null {
+    const rect = this.canvas.getBoundingClientRect(),
+      x = ((clientX - rect.left) / rect.width) * 2 - 1,
+      y = 1 - ((clientY - rect.top) / rect.height) * 2,
+      aspect = rect.width / rect.height
+    if (this.planarMode) {
+      const half = this.planarHalfHeight / this.planarZoom
+      const p: Vec3 = [this.pan[0] + x * half * aspect, this.pan[1] + y * half, 0]
+      if (!this.worldFlatMode) return p
+      if (Math.abs(p[0]) > 2 || Math.abs(p[1]) > 1) return null
+      return worldMapDirection(p)
+    }
+    const back = norm(this.eye),
+      right = norm(cross([0, 1, 0], back)),
+      up = cross(back, right),
+      t = Math.tan(Math.PI / 8)
+    const ray = norm(back.map((v, i) => -v + right[i] * x * t * aspect + up[i] * y * t) as Vec3),
+      b = dot(this.eye, ray),
+      disc = b * b - dot(this.eye, this.eye) + this.radius * this.radius
+    if (disc < 0) return null
+    const distance = -b - Math.sqrt(disc)
+    if (distance < 0) return null
+    return norm(this.eye.map((v, i) => v + ray[i] * distance) as Vec3)
+  }
+  project(p: Vec3): { x: number; y: number } | null {
+    if (this.worldFlatMode) p = worldMapPoint(p)
+    if (!this.planarMode && dot(norm(p), this.eye) < this.radius) return null
+    const m = this.matrix,
+      w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15]
+    if (w <= 0) return null
+    const x = (m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12]) / w,
+      y = (m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13]) / w
+    return {
+      x: ((x + 1) * this.canvas.clientWidth) / 2,
+      y: ((1 - y) * this.canvas.clientHeight) / 2,
+    }
+  }
   start() {
     if (this.running) return
     this.running = true
@@ -321,13 +434,28 @@ export class HexSphereRenderer {
     const gl = this.gl
     if (this.program) gl.deleteProgram(this.program)
     if (this.vao) gl.deleteVertexArray(this.vao)
-    for (const b of [this.cornerBuf, this.instCenterBuf, this.instHeightBuf, this.instBiomeBuf]) {
+    if (this.frameTexture) gl.deleteTexture(this.frameTexture)
+    for (const b of [
+      this.cornerBuf,
+      this.instCenterBuf,
+      this.instHeightBuf,
+      this.instBiomeBuf,
+      this.instTempBuf,
+      this.instPrecipBuf,
+      this.instFlowBuf,
+    ]) {
       if (b) gl.deleteBuffer(b)
     }
   }
 
   /** 拖拽旋转。 */
   rotate(dx: number, dy: number) {
+    if (this.planarMode) {
+      const unit = ((this.planarHalfHeight / this.planarZoom) * 2) / this.canvas.clientHeight
+      this.pan[0] -= dx * unit
+      this.pan[1] += dy * unit
+      return
+    }
     this.autoRotate = false
     this.yaw -= dx * 0.005
     this.pitch = Math.max(-1.5, Math.min(1.5, this.pitch + dy * 0.005))
@@ -335,6 +463,10 @@ export class HexSphereRenderer {
 
   /** 缩放。delta 大于 0 表示放大。 */
   zoom(delta: number) {
+    if (this.planarMode) {
+      this.planarZoom = Math.max(0.5, Math.min(30, this.planarZoom * Math.exp(delta * 0.001)))
+      return
+    }
     this.targetDistance = Math.max(1.4, Math.min(8.0, this.targetDistance * (1 - delta * 0.0012)))
   }
 
@@ -379,7 +511,7 @@ export class HexSphereRenderer {
     let eye: Vec3
     if (this.planarMode) {
       // 平面模式：正对平面（+z 方向）俯视，相机距离随缩放变化
-      eye = [0, 0, this.distance]
+      eye = [this.pan[0], this.pan[1], this.distance]
     } else {
       const cp = Math.cos(this.pitch)
       eye = [
@@ -388,13 +520,16 @@ export class HexSphereRenderer {
         Math.cos(this.yaw) * cp * this.distance,
       ]
     }
-    const view = lookAt(eye, [0, 0, 0], [0, 1, 0])
+    this.eye = eye
+    const view = lookAt(eye, this.planarMode ? this.pan : [0, 0, 0], [0, 1, 0])
     const aspect = this.canvas.width / Math.max(this.canvas.height, 1)
     // 平面模式用正交投影：格子大小严格一致，不会因透视产生远近差异
+    if (this.worldFlatMode) this.planarHalfHeight = 1.08 * Math.max(1, 2 / aspect)
     const proj = this.planarMode
-      ? orthographic(this.planarHalfHeight, aspect, -10, 10)
+      ? orthographic(this.planarHalfHeight / this.planarZoom, aspect, -10, 10)
       : perspective(Math.PI / 4, aspect, 0.01, 100)
     const viewProj = mat4Mul(proj, view)
+    this.matrix = viewProj
 
     gl.useProgram(this.program)
     gl.bindVertexArray(this.vao)
@@ -405,8 +540,9 @@ export class HexSphereRenderer {
     gl.uniform1f(u('uHeightScale'), this.heightScale)
     gl.uniform1f(u('uHexRadius'), this.hexRadius)
     gl.uniform1i(u('uPlanarMode'), this.planarMode ? 1 : 0)
+    gl.uniform1i(u('uWorldFlatMode'), this.worldFlatMode ? 1 : 0)
     if (this.planarMode) {
-      gl.uniform3f(u('uLightDir'), -0.45, 0.55, 0.70)
+      gl.uniform3f(u('uLightDir'), -0.45, 0.55, 0.7)
     } else {
       gl.uniform3f(u('uLightDir'), -0.4, 0.6, 0.7)
     }
@@ -430,7 +566,6 @@ export class HexSphereRenderer {
   }
 }
 
-
 /** 正交投影。halfHeight 是半高（世界单位）。 */
 function orthographic(halfHeight: number, aspect: number, near: number, far: number): Float32Array {
   const halfWidth = halfHeight * aspect
@@ -440,9 +575,21 @@ function orthographic(halfHeight: number, aspect: number, near: number, far: num
   const tp = halfHeight
   const nf = 1 / (near - far)
   return new Float32Array([
-    2 / (r - l), 0, 0, 0,
-    0, 2 / (tp - b), 0, 0,
-    0, 0, 2 * nf, 0,
-    -(r + l) / (r - l), -(tp + b) / (tp - b), (far + near) * nf, 1,
+    2 / (r - l),
+    0,
+    0,
+    0,
+    0,
+    2 / (tp - b),
+    0,
+    0,
+    0,
+    0,
+    2 * nf,
+    0,
+    -(r + l) / (r - l),
+    -(tp + b) / (tp - b),
+    (far + near) * nf,
+    1,
   ])
 }

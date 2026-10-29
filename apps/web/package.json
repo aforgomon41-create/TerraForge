@@ -1,25 +1,27 @@
 {
   "name": "terraforge-web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --experimental-transform-types --test tests/*.test.ts",
+    "format:check": "prettier --check src tests index.html vite.config.ts"
   },
   "dependencies": {
-    "vue": "^3.5.13",
     "pinia": "^2.3.0",
-    "@earendil-works/pi-ai": "^1.4.0"
+    "vue": "^3.5.13"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.1",
-    "vite": "^6.0.7",
-    "typescript": "^5.7.3",
-    "vue-tsc": "^2.2.0",
-    "tailwindcss": "^3.4.17",
     "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.49"
-  }
+    "postcss": "^8.4.49",
+    "prettier": "3.6.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.0"
+  },
+  "packageManager": "pnpm@11.28.6"
 }

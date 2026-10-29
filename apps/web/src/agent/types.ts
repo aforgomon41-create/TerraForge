@@ -7,7 +7,7 @@ export interface ProviderConfig {
   baseUrl: string
   /** 模型 id。 */
   model: string
-  /** API 密钥。只存 localStorage。 */
+  /** API 密钥。默认仅本次页面使用，可由用户选择保存在设备。 */
   apiKey: string
 }
 
