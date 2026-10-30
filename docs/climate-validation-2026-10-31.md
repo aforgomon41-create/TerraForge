@@ -2,6 +2,8 @@
 
 本轮在 `codex/generation-fields` 上继续 tf-0.4 内核工作。新建面板仍等待明确的布局审阅，未提前接入正式界面。
 
+[在线修正前后对照](https://aforgomon.win/terraforge-previews/science-v041-20261031/index.html)，对应内核提交 `0090dc5`。服务器目录与独立预览路由见 [发布记录](preview-deployment-2026-10-31.md)。
+
 ## 已修正：空气错误地翻越海底
 
 `climate_transport.rs` 原来把负的海底高程直接累加进大气网格，随后用于气流抬升。海底山脉和海沟因此会产生虚假的地形雨；沿海格子的深海部分也会抵消陆地的平均高度。
@@ -55,4 +57,4 @@ artifacts/science-venv/Scripts/python scripts/science_ebm_reference.py
 - `cargo test --locked -p tf-core -p tf-grid -p tf-sim -p tf-server`：118 项通过。原始日志 `artifacts/science-v041-tests.log`。
 - 实际生成记录：`artifacts/science-v041-plane/report.json` 和 `artifacts/science-v041-sphere/report.json`。两张地形 PNG 和平面降雨图已逐张查看；PNG 是生成数据输出，不是浏览器截图。
 - DSH 本轮连接曾恢复，但在审查中断开。应用仍在运行；插件多次继续及 Skill CLI 继续均返回“DSH 模型连接桥未就绪”。按既有规则使用 Luna Max 只读审查，主 Agent 核对并补充逐月资料和水账不变性测试；没有委派实现或修改模型权限。
-- 正式站仍使用先前部署版本；本轮内核尚未覆盖在线正式应用。
+- 现场核实发现 `/map/` 现在代理到另一套 `geogen` 容器的 8790 端口；原 TerraForge 服务仍在 8791 端口运行。本轮保留现有入口，另建仅供静态结果使用的 `/terraforge-previews/` 路由；未把本轮内核覆盖到任一正式程序。
