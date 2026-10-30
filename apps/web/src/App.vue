@@ -9,6 +9,7 @@ import type { Vec3 } from '@/renderer/math'
 import { bindMapInput } from '@/renderer/interaction'
 import { decodeBase64 } from '@/api/sse'
 import type { ToolContext } from '@/agent/tools'
+import { flatDirection, flatProject } from '@/renderer/geometry'
 import MapTree from '@/components/MapTree.vue'
 import AgentPanel from '@/components/AgentPanel.vue'
 const store = useWorldStore(),
@@ -219,37 +220,81 @@ async function regenerate() {
   if (!store.current) return
   await guard(() => store.generate(store.current!.id))
 }
+const displaySpacingKm = ref(100)
+const actualDisplaySpacing = ref(0)
+watch(
+  () => store.current?.id,
+  () => {
+    const preferred = Number(store.current?.params?.display_grid_m ?? 100000)
+    displaySpacingKm.value = Number.isFinite(preferred) ? Math.max(0, preferred / 1000) : 100
+  },
+)
+let overlayController: AbortController | undefined
+let overlayDebounce: ReturnType<typeof setTimeout> | undefined
+let overlayCache: { key: string; lines: Float32Array; spacing: number } | undefined
+async function refreshOverlay() {
+  overlayController?.abort()
+  const node = store.currentMap
+  if (!node?.grid || !renderer) return
+  const controller = new AbortController()
+  overlayController = controller
+  const key = `${node.id}:${displaySpacingKm.value}`
+  try {
+    const result =
+      overlayCache?.key === key
+        ? overlayCache
+        : await api.getOverlay(node.id, displaySpacingKm.value * 1000, controller.signal)
+    if (controller.signal.aborted || store.currentMap?.id !== node.id) return
+    overlayCache = { key, ...result }
+    actualDisplaySpacing.value = result.spacing
+    const width = node.grid.type === 'sphere' ? 0 : node.grid.width_m
+    const lines = width ? result.lines.map((v) => (v * 2) / width) : result.lines
+    renderer.setOverlay(lines)
+  } catch (e) {
+    if ((e as Error).name !== 'AbortError') notice.value = '显示网格未加载：' + (e as Error).message
+  }
+}
+watch(displaySpacingKm, () => {
+  clearTimeout(overlayDebounce)
+  overlayDebounce = setTimeout(() => {
+    void refreshOverlay()
+  }, 200)
+})
 function applyMap() {
   const node = store.currentMap
   if (!renderer) return
-  if (!node || !store.centers || !store.elevation || !store.biome) {
+  if (!node || !store.centers || !store.indices || !store.elevation || !store.biome) {
     renderer.clear()
     selection.value = null
     return
   }
-  let centers = store.centers,
-    hex: number | undefined
-  if (node.grid?.type === 'patch') {
+  let centers = store.centers
+  if (node.grid && node.grid.type !== 'sphere') {
     const g = node.grid
-    renderer.setPlanarMode(g.size)
+    renderer.setPlanarMode()
     centers = centers.map((v) => (v * 2) / g.width_m)
-    hex = (2 / g.size / Math.sqrt(3)) * 1.035
     renderer.planarHalfHeight =
-      1.08 * Math.max(Math.sqrt(3) / 2, canvas.value!.clientHeight / canvas.value!.clientWidth)
+      1.08 *
+      Math.max(
+        (Math.sqrt(3) / 2) * (g.type === 'plane' ? g.rows / g.size : 1),
+        canvas.value!.clientHeight / canvas.value!.clientWidth,
+      )
   } else if (worldProjection.value === 'flat') renderer.setWorldFlatMode()
   else renderer.setSphereMode()
-  renderer.setCells(
-    {
-      centers,
-      heights: store.elevation,
-      biomes: store.biome,
-      temperatures: store.temperature || undefined,
-      precipitations: store.precipitation || undefined,
-      flows: store.flow || undefined,
-      count: node.cells,
-    },
-    hex,
-  )
+  renderer.setCells({
+    centers,
+    indices: store.indices,
+    heights: store.elevation,
+    biomes: store.biome,
+    temperatures: store.temperature || undefined,
+    precipitations: store.precipitation || undefined,
+    flows: store.flow || undefined,
+    count: node.cells,
+  })
+  renderer.mapMetres =
+    node.grid?.type === 'sphere' ? node.grid.radius_m : (node.grid?.width_m || 2) / 2
+  renderer.setOverlay(new Float32Array())
+  void refreshOverlay()
   renderer.heightScale = 0.025 / Math.max(mapStats.value?.max || 1, 1)
   renderer.layer = layer.value
   renderer.style = style.value
@@ -260,6 +305,18 @@ function applyMap() {
 }
 watch(() => store.currentMap, applyMap)
 watch(worldProjection, applyMap)
+watch(
+  () => store.generating,
+  (active) => {
+    if (!active) applyMap()
+  },
+)
+watch(
+  () => store.error,
+  (message) => {
+    if (message) notice.value = message
+  },
+)
 watch(layer, (v) => {
   if (renderer) renderer.layer = v
 })
@@ -275,11 +332,26 @@ function chooseAt(p: Vec3) {
   if (!node?.grid || !store.centers || !renderer || store.generating) return
   const g = node.grid
   let geo, point: Vec3
-  if (g.type === 'patch') {
+  if (g.type !== 'sphere') {
     point = [(p[0] * g.width_m) / 2, (p[1] * g.width_m) / 2, 0]
     const half = g.width_m / 2
-    if (Math.abs(point[0]) > half || Math.abs(point[1]) > (half * Math.sqrt(3)) / 2) return
-    geo = latLon(patchDirection(g.center_lat, g.center_lon, point[0], point[1], g.radius_m))
+    if (
+      Math.abs(point[0]) > half ||
+      Math.abs(point[1]) > ((half * Math.sqrt(3)) / 2) * (g.type === 'plane' ? g.rows / g.size : 1)
+    )
+      return
+    geo = latLon(
+      g.type === 'plane'
+        ? flatDirection(
+            g.center_lat,
+            g.center_lon,
+            point[0],
+            point[1],
+            g.radius_m,
+            g.reference_lat ?? g.center_lat,
+          )
+        : patchDirection(g.center_lat, g.center_lon, point[0], point[1], g.radius_m),
+    )
   } else {
     point = p
     geo = latLon(p)
@@ -308,7 +380,10 @@ function manualSelect() {
     renderer?.centerAt(d)
   } else {
     const g = node.grid,
-      p = patchProject(g.center_lat, g.center_lon, d, g.radius_m)
+      p =
+        g.type === 'plane'
+          ? flatProject(g.center_lat, g.center_lon, d, g.radius_m, g.reference_lat ?? g.center_lat)
+          : patchProject(g.center_lat, g.center_lon, d, g.radius_m)
     if (!p) {
       notice.value = '坐标超出当前地图'
       return
@@ -454,12 +529,20 @@ onMounted(async () => {
     store.onFrame((f) => {
       if (!renderer || !store.generating) return
       const node = store.maps.find((m) => m.id === store.job?.map_id)
-      if (node && node.kind !== 'world') return
+      if (
+        !node ||
+        node.grid?.type !== 'sphere' ||
+        store.current?.params?.world_shape === 'plane' ||
+        (store.current?.params?.start_level && store.current.params.start_level !== 'world')
+      )
+        return
       if (!renderer.isPreviewMode()) {
         const g = buildSphereGrid(32)
-        renderer.setSphereMode()
+        if (worldProjection.value === 'flat') renderer.setWorldFlatMode()
+        else renderer.setSphereMode()
         renderer.setCells({
           centers: g.centers,
+          indices: g.indices,
           heights: new Float32Array(g.count),
           biomes: new Uint8Array(g.count),
           count: g.count,
@@ -501,6 +584,8 @@ onBeforeUnmount(() => {
   interaction?.abort()
   clearInterval(heartbeat)
   clearInterval(uiTimer)
+  clearTimeout(overlayDebounce)
+  overlayController?.abort()
   window.removeEventListener('pagehide', leave)
 })
 </script>
@@ -606,7 +691,7 @@ onBeforeUnmount(() => {
       <span class="eyebrow">{{ kinds[store.currentMap!.kind] }} · {{ activeLayer.name }}</span>
       <h1>{{ store.currentMap?.name || store.current?.name }}</h1>
       <span class="mono">
-        {{ store.currentMap?.cells.toLocaleString() }} CELLS ·
+        {{ store.currentMap?.cells.toLocaleString() }} 采样点 ·
         {{
           store.currentMap!.cell_size_m >= 1000
             ? (store.currentMap!.cell_size_m / 1000).toFixed(1) + ' km'
@@ -791,6 +876,39 @@ onBeforeUnmount(() => {
             <i v-if="layer === l.id">●</i>
           </button>
         </div>
+        <label class="style-select">
+          显示网格
+          <select
+            v-model.number="displaySpacingKm"
+            :disabled="!hasMap"
+            aria-label="六角显示网格间距"
+          >
+            <option
+              v-if="![0, 0.001, 0.01, 0.1, 1, 10, 50, 100, 250, 500].includes(displaySpacingKm)"
+              :value="displaySpacingKm"
+            >
+              自定义 · {{ displaySpacingKm }} km
+            </option>
+            <option :value="0">隐藏网格</option>
+            <option :value="0.001">1 m / 格</option>
+            <option :value="0.01">10 m / 格</option>
+            <option :value="0.1">100 m / 格</option>
+            <option :value="1">1 km / 格</option>
+            <option :value="10">10 km / 格</option>
+            <option :value="50">50 km / 格</option>
+            <option :value="100">100 km / 格</option>
+            <option :value="250">250 km / 格</option>
+            <option :value="500">500 km / 格</option>
+          </select>
+        </label>
+        <small v-if="actualDisplaySpacing && displaySpacingKm">
+          实际显示格距约
+          {{
+            actualDisplaySpacing >= 1000
+              ? (actualDisplaySpacing / 1000).toFixed(1) + ' km'
+              : actualDisplaySpacing.toFixed(1) + ' m'
+          }}
+        </small>
         <label class="style-select">
           地图笔触
           <select v-model.number="style" aria-label="地图视觉风格">

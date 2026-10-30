@@ -1,15 +1,6 @@
-/**
- * WebGL2 球面六角格渲染器。
- *
- * 目标：把 65 万到 590 万个六角格实时画成一颗星球，稳定 60fps。
- *
- * 核心技术是**实例化渲染**：一次 draw call 画完全部格子。
- * 顶点着色器里根据实例的球面方向和角点参数算出六边形的位置，
- * 所以 CPU 只需要传「每格的中心方向 + 高程 + 生物群系」三个数组，
- * 不需要传任何顶点缓冲。
- */
-
-import { FRAG, VERT } from './shaders'
+/** Continuous globe/plane renderer with an independent shared-edge hex overlay. */
+import { FRAG, VERT, LINE_VERT, LINE_FRAG } from './shaders'
+import { atlasSurface, atlasLines } from './surface'
 import { worldMapDirection, worldMapPoint } from './geometry'
 import { lookAt, mat4Mul, perspective, cross, dot, norm, type Vec3 } from './math'
 
@@ -25,6 +16,7 @@ export interface CellData {
   /** 每格降水（毫米/年）。可选。 */
   precipitations?: Float32Array
   flows?: Float32Array
+  indices: Uint32Array
   count: number
 }
 
@@ -39,8 +31,16 @@ export enum MapStyle {
 export class HexSphereRenderer {
   private gl: WebGL2RenderingContext
   private program: WebGLProgram | null = null
+  private uniforms = new Map<string, WebGLUniformLocation | null>()
+  private lineUniforms = new Map<string, WebGLUniformLocation | null>()
   private vao: WebGLVertexArrayObject | null = null
-  private cornerBuf: WebGLBuffer | null = null
+  private indexBuf: WebGLBuffer | null = null
+  private indexCount = 0
+  private lineProgram: WebGLProgram | null = null
+  private lineVao: WebGLVertexArrayObject | null = null
+  private lineBuf: WebGLBuffer | null = null
+  private lineCount = 0
+  public mapMetres = 6371000
   private instCenterBuf: WebGLBuffer | null = null
   private instHeightBuf: WebGLBuffer | null = null
   private instBiomeBuf: WebGLBuffer | null = null
@@ -53,7 +53,6 @@ export class HexSphereRenderer {
   private eye: Vec3 = [0, 0, 3.2]
 
   private cellCount = 0
-  private hexRadius = 0.02
 
   // 相机状态
   private yaw = 0
@@ -68,12 +67,9 @@ export class HexSphereRenderer {
   public layer = 0
   public radius = 1.0
   public heightScale = 0.00006
-  public seaLevel = 0.0
 
   /** 实时预览帧纹理。生成过程中用它覆盖真实数据。 */
   private frameTexture: WebGLTexture | null = null
-  private frameW = 0
-  private frameH = 0
   private previewMode = false
   private previewMinElev = 0
   private previewMaxElev = 1
@@ -81,7 +77,6 @@ export class HexSphereRenderer {
   /** 平面补丁模式：子图用平面网格渲染而不是整球。 */
   private planarMode = false
   private worldFlatMode = false
-  private planarSize = 0
   /** 平面模式的正交相机半高，由网格尺寸决定。 */
   public planarHalfHeight = 1.0
 
@@ -116,22 +111,22 @@ export class HexSphereRenderer {
     }
     this.program = prog
 
-    // 六边形角点：7 个点构成三角扇
-    const corners: number[] = []
-    for (let i = 0; i <= 6; i++) {
-      const a = (i / 6) * Math.PI * 2 + Math.PI / 6
-      corners.push(Math.cos(a), Math.sin(a))
-    }
-    this.cornerBuf = gl.createBuffer()
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(corners), gl.STATIC_DRAW)
-
+    gl.deleteShader(vs)
+    gl.deleteShader(fs)
     this.vao = gl.createVertexArray()
-    gl.bindVertexArray(this.vao)
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.cornerBuf)
-    gl.enableVertexAttribArray(3)
-    gl.vertexAttribPointer(3, 2, gl.FLOAT, false, 0, 0)
-    gl.bindVertexArray(null)
+    this.indexBuf = gl.createBuffer()
+    this.lineVao = gl.createVertexArray()
+    this.lineBuf = gl.createBuffer()
+    const lvs = this.compileShader(gl.VERTEX_SHADER, LINE_VERT),
+      lfs = this.compileShader(gl.FRAGMENT_SHADER, LINE_FRAG)
+    this.lineProgram = gl.createProgram()!
+    gl.attachShader(this.lineProgram, lvs)
+    gl.attachShader(this.lineProgram, lfs)
+    gl.linkProgram(this.lineProgram)
+    if (!gl.getProgramParameter(this.lineProgram, gl.LINK_STATUS))
+      throw new Error('网格着色器链接失败: ' + gl.getProgramInfoLog(this.lineProgram))
+    gl.deleteShader(lvs)
+    gl.deleteShader(lfs)
 
     this.frameTexture = gl.createTexture()
     gl.bindTexture(gl.TEXTURE_2D, this.frameTexture)
@@ -161,7 +156,7 @@ export class HexSphereRenderer {
    * 上传一帧实时预览数据。
    *
    * 帧是等距圆柱投影图像，每像素 5 字节：
-   *   高程（u16 LE）、温度（u8 偏移128）、降水（u8 对数）、流量（u8 对数）
+   *   高程（u16 LE）、温度（u8 映射 −40～40℃）、降水（u8 对数）、流量（u8 对数）
    *
    * 生成过程中用这个纹理做屏幕上采样，让用户看到星球在演化。
    */
@@ -194,8 +189,6 @@ export class HexSphereRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.frameTexture)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba)
 
-    this.frameW = w
-    this.frameH = h
     this.previewMode = true
     this.previewMinElev = eMin
     this.previewMaxElev = stats.max_elevation
@@ -207,12 +200,11 @@ export class HexSphereRenderer {
    * 子图不是整球，而是球面上的一块区域，展开成平面网格渲染。
    * 相机改为俯视，用户看到的是「一张地图」而不是「一颗星球」。
    */
-  setPlanarMode(size: number) {
+  setPlanarMode() {
     this.worldFlatMode = false
     this.planarZoom = 1
     this.pan = [0, 0, 0]
     this.planarMode = true
-    this.planarSize = size
     this.targetDistance = 2.0
     this.distance = 2.0
     this.pitch = Math.PI / 2 - 0.02
@@ -221,7 +213,7 @@ export class HexSphereRenderer {
 
   /** World atlas retains the same cell IDs and geographic picking as the globe. */
   setWorldFlatMode() {
-    this.setPlanarMode(0)
+    this.setPlanarMode()
     this.worldFlatMode = true
     this.planarHalfHeight =
       1.08 * Math.max(1, (2 * this.canvas.clientHeight) / this.canvas.clientWidth)
@@ -256,95 +248,65 @@ export class HexSphereRenderer {
   }
 
   /** 上传格子数据。 */
-  setCells(data: CellData, hexRadiusOverride?: number) {
+  setCells(data: CellData) {
     const gl = this.gl
     this.cellCount = data.count
-
-    if (hexRadiusOverride !== undefined) {
-      // 平面模式：格子半径由平面网格的格间距直接给出
-      this.hexRadius = hexRadiusOverride
-    } else {
-      // 球面模式：单位球面积除以格数得到格面积，
-      // 六边形面积 = (3*sqrt(3)/2) * r^2，反解 r。
-      const cellArea = (4 * Math.PI) / Math.max(data.count, 1)
-      this.hexRadius = Math.sqrt(cellArea / 2.598) * 1.04
+    let centers = data.centers,
+      indices = data.indices,
+      sourceIds: Uint32Array | undefined
+    if (this.worldFlatMode) {
+      const atlas = atlasSurface(centers, indices)
+      centers = atlas.positions
+      indices = atlas.indices
+      sourceIds = atlas.sourceIds
     }
-
-    if (!this.instCenterBuf) this.instCenterBuf = gl.createBuffer()
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instCenterBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, data.centers, gl.STATIC_DRAW)
-
-    if (!this.instHeightBuf) this.instHeightBuf = gl.createBuffer()
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instHeightBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, data.heights, gl.STATIC_DRAW)
-
-    const biomeF = new Float32Array(data.biomes.length)
-    for (let i = 0; i < data.biomes.length; i++) biomeF[i] = data.biomes[i]
-    if (!this.instBiomeBuf) this.instBiomeBuf = gl.createBuffer()
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instBiomeBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, biomeF, gl.STATIC_DRAW)
-
+    this.indexCount = indices.length
     gl.bindVertexArray(this.vao)
+    const upload = (
+      location: number,
+      values: Float32Array,
+      components: number,
+      previous: WebGLBuffer | null,
+    ) => {
+      const buffer = previous || gl.createBuffer()!
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+      gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW)
+      gl.enableVertexAttribArray(location)
+      gl.vertexAttribPointer(location, components, gl.FLOAT, false, 0, 0)
+      return buffer
+    }
+    const channel = (values: ArrayLike<number> | undefined) =>
+      sourceIds
+        ? Float32Array.from(sourceIds, (id) => values?.[id] || 0)
+        : values instanceof Float32Array
+          ? values
+          : Float32Array.from({ length: data.count }, (_, i) => values?.[i] || 0)
+    this.instCenterBuf = upload(0, centers, 3, this.instCenterBuf)
+    this.instHeightBuf = upload(1, channel(data.heights), 1, this.instHeightBuf)
+    this.instBiomeBuf = upload(2, channel(data.biomes), 1, this.instBiomeBuf)
+    this.instTempBuf = upload(4, channel(data.temperatures), 1, this.instTempBuf)
+    this.instPrecipBuf = upload(5, channel(data.precipitations), 1, this.instPrecipBuf)
+    this.instFlowBuf = upload(6, channel(data.flows), 1, this.instFlowBuf)
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuf)
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
+    gl.bindVertexArray(null)
+  }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instCenterBuf)
+  setOverlay(lines: Float32Array) {
+    const gl = this.gl
+    if (this.worldFlatMode) lines = atlasLines(lines)
+    this.lineCount = lines.length / 3
+    gl.bindVertexArray(this.lineVao)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf)
+    gl.bufferData(gl.ARRAY_BUFFER, lines, gl.STATIC_DRAW)
     gl.enableVertexAttribArray(0)
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 12, 0)
-    gl.vertexAttribDivisor(0, 1)
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instHeightBuf)
-    gl.enableVertexAttribArray(1)
-    gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 4, 0)
-    gl.vertexAttribDivisor(1, 1)
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instBiomeBuf)
-    gl.enableVertexAttribArray(2)
-    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 4, 0)
-    gl.vertexAttribDivisor(2, 1)
-
-    // 温度（attribute 4）
-    if (data.temperatures) {
-      if (!this.instTempBuf) this.instTempBuf = gl.createBuffer()
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.instTempBuf)
-      gl.bufferData(gl.ARRAY_BUFFER, data.temperatures, gl.STATIC_DRAW)
-      gl.enableVertexAttribArray(4)
-      gl.vertexAttribPointer(4, 1, gl.FLOAT, false, 4, 0)
-      gl.vertexAttribDivisor(4, 1)
-    }
-
-    // 降水（attribute 5）
-    if (data.precipitations) {
-      if (!this.instPrecipBuf) this.instPrecipBuf = gl.createBuffer()
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.instPrecipBuf)
-      gl.bufferData(gl.ARRAY_BUFFER, data.precipitations, gl.STATIC_DRAW)
-      gl.enableVertexAttribArray(5)
-      gl.vertexAttribPointer(5, 1, gl.FLOAT, false, 4, 0)
-      gl.vertexAttribDivisor(5, 1)
-    }
-
-    if (data.flows) {
-      if (!this.instFlowBuf) this.instFlowBuf = gl.createBuffer()
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.instFlowBuf)
-      gl.bufferData(gl.ARRAY_BUFFER, data.flows, gl.STATIC_DRAW)
-      gl.enableVertexAttribArray(6)
-      gl.vertexAttribPointer(6, 1, gl.FLOAT, false, 4, 0)
-      gl.vertexAttribDivisor(6, 1)
-    } else {
-      gl.disableVertexAttribArray(6)
-      gl.vertexAttrib1f(6, 0)
-    }
-    if (!data.temperatures) {
-      gl.disableVertexAttribArray(4)
-      gl.vertexAttrib1f(4, 0)
-    }
-    if (!data.precipitations) {
-      gl.disableVertexAttribArray(5)
-      gl.vertexAttrib1f(5, 0)
-    }
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
     gl.bindVertexArray(null)
   }
 
   clear() {
     this.cellCount = 0
+    this.lineCount = 0
     this.previewMode = false
   }
   resetView() {
@@ -434,9 +396,12 @@ export class HexSphereRenderer {
     const gl = this.gl
     if (this.program) gl.deleteProgram(this.program)
     if (this.vao) gl.deleteVertexArray(this.vao)
+    if (this.lineVao) gl.deleteVertexArray(this.lineVao)
+    if (this.lineProgram) gl.deleteProgram(this.lineProgram)
     if (this.frameTexture) gl.deleteTexture(this.frameTexture)
     for (const b of [
-      this.cornerBuf,
+      this.indexBuf,
+      this.lineBuf,
       this.instCenterBuf,
       this.instHeightBuf,
       this.instBiomeBuf,
@@ -534,11 +499,15 @@ export class HexSphereRenderer {
     gl.useProgram(this.program)
     gl.bindVertexArray(this.vao)
 
-    const u = (name: string) => gl.getUniformLocation(this.program!, name)
+    const u = (name: string) => {
+      if (!this.uniforms.has(name))
+        this.uniforms.set(name, gl.getUniformLocation(this.program!, name))
+      return this.uniforms.get(name)!
+    }
     gl.uniformMatrix4fv(u('uViewProj'), false, viewProj)
     gl.uniform1f(u('uRadius'), this.radius)
     gl.uniform1f(u('uHeightScale'), this.heightScale)
-    gl.uniform1f(u('uHexRadius'), this.hexRadius)
+    gl.uniform1f(u('uMapMetres'), this.mapMetres)
     gl.uniform1i(u('uPlanarMode'), this.planarMode ? 1 : 0)
     gl.uniform1i(u('uWorldFlatMode'), this.worldFlatMode ? 1 : 0)
     if (this.planarMode) {
@@ -546,7 +515,6 @@ export class HexSphereRenderer {
     } else {
       gl.uniform3f(u('uLightDir'), -0.4, 0.6, 0.7)
     }
-    gl.uniform1f(u('uSeaLevel'), this.seaLevel)
     gl.uniform1i(u('uStyle'), this.style)
     gl.uniform1i(u('uLayer'), this.layer)
 
@@ -556,12 +524,33 @@ export class HexSphereRenderer {
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, this.frameTexture)
       gl.uniform1i(u('uFrameTex'), 0)
-      gl.uniform2f(u('uFrameSize'), this.frameW, this.frameH)
       gl.uniform1f(u('uPreviewMinElev'), this.previewMinElev)
       gl.uniform1f(u('uPreviewMaxElev'), this.previewMaxElev)
     }
 
-    gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 7, this.cellCount)
+    // Shared indices prevent the gaps/overlaps of independent regular hexagons.
+    gl.disable(gl.CULL_FACE)
+    gl.drawElements(gl.TRIANGLES, this.indexCount, gl.UNSIGNED_INT, 0)
+    if (this.lineCount && this.lineProgram && !this.previewMode) {
+      gl.useProgram(this.lineProgram)
+      gl.bindVertexArray(this.lineVao)
+      const lu = (name: string) => {
+        if (!this.lineUniforms.has(name))
+          this.lineUniforms.set(name, gl.getUniformLocation(this.lineProgram!, name))
+        return this.lineUniforms.get(name)!
+      }
+      gl.uniformMatrix4fv(lu('uViewProj'), false, viewProj)
+      gl.uniform1i(lu('uSphere'), this.planarMode ? 0 : 1)
+      gl.uniform1i(lu('uWorldFlatMode'), this.worldFlatMode ? 1 : 0)
+      gl.uniform3fv(lu('uEye'), eye)
+      gl.uniform1f(lu('uRadius'), this.radius)
+      gl.disable(gl.DEPTH_TEST)
+      gl.enable(gl.BLEND)
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+      gl.drawArrays(gl.LINES, 0, this.lineCount)
+      gl.disable(gl.BLEND)
+      gl.enable(gl.DEPTH_TEST)
+    }
     gl.bindVertexArray(null)
   }
 }

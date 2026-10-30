@@ -18,6 +18,17 @@ export interface World {
   params?: Record<string, unknown>
 }
 export type GridDescriptor =
+  | {
+      type: 'plane'
+      center_lat: number
+      center_lon: number
+      width_m: number
+      size: number
+      rows: number
+      radius_m: number
+      version: number
+      reference_lat?: number | null
+    }
   | { type: 'sphere'; frequency: number; radius_m: number; version: number }
   | {
       type: 'patch'
@@ -28,6 +39,10 @@ export type GridDescriptor =
       radius_m: number
       version: number
     }
+export interface Surface {
+  centers: Float32Array
+  indices: Uint32Array
+}
 export interface MapNode {
   id: string
   world_id: string
@@ -54,6 +69,7 @@ export interface ChildRequest {
   center_lon: number
   center_lat: number
   width_m: number
+  cell_size_m?: number
   name?: string
 }
 export function authHeaders(): Record<string, string> {
@@ -67,7 +83,11 @@ export async function authorizedFetch(path: string, init: RequestInit = {}): Pro
   })
   if (!res.ok) {
     const body = await res.json().catch(() => null)
-    throw new Error(body?.error || `请求未完成（${res.status}）`)
+    const error = new Error(body?.error || `请求未完成（${res.status}）`) as Error & {
+      status: number
+    }
+    error.status = res.status
+    throw error
   }
   return res
 }
@@ -83,6 +103,30 @@ async function binary(path: string, signal?: AbortSignal) {
   const bytes = await r.arrayBuffer()
   if (bytes.byteLength % 4) throw new Error('地图数据长度无效')
   return new Float32Array(bytes)
+}
+async function geometryRequest(path: string, signal?: AbortSignal): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await authorizedFetch('/api/v1' + path, { signal })
+    } catch (e) {
+      if ((e as Error & { status?: number }).status !== 429 || attempt >= 3 || signal?.aborted)
+        throw e
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => {
+          clearTimeout(timer)
+          reject(new DOMException('已取消', 'AbortError'))
+        }
+        const timer = setTimeout(
+          () => {
+            signal?.removeEventListener('abort', abort)
+            resolve()
+          },
+          150 * (attempt + 1),
+        )
+        signal?.addEventListener('abort', abort, { once: true })
+      })
+    }
+  }
 }
 export const api = {
   async openSession() {
@@ -130,6 +174,25 @@ export const api = {
   getField: (id: string, ch: string, signal?: AbortSignal) =>
     binary(`/maps/${id}/field/${ch}`, signal),
   getGrid: (id: string, signal?: AbortSignal) => binary(`/maps/${id}/grid`, signal),
+  async getSurface(id: string, signal?: AbortSignal): Promise<Surface> {
+    const r = await geometryRequest(`/maps/${id}/surface`, signal)
+    const bytes = await r.arrayBuffer()
+    if (bytes.byteLength < 12 || bytes.byteLength % 4) throw new Error('地表几何长度无效')
+    const head = new Uint32Array(bytes, 0, 3),
+      count = head[1],
+      len = head[2]
+    if (head[0] !== 1 || len % 3 || bytes.byteLength !== 12 + count * 12 + len * 4)
+      throw new Error('地表几何版本或尺寸无效')
+    const indices = new Uint32Array(bytes, 12 + count * 12, len)
+    if (indices.some((i) => i >= count)) throw new Error('地表顶点编号无效')
+    return { centers: new Float32Array(bytes, 12, count * 3), indices }
+  },
+  async getOverlay(id: string, spacing: number, signal?: AbortSignal) {
+    const r = await geometryRequest(`/maps/${id}/overlay?spacing_m=${spacing}`, signal)
+    const data = await r.arrayBuffer()
+    if (data.byteLength % 24) throw new Error('显示网格长度无效')
+    return { lines: new Float32Array(data), spacing: Number(r.headers.get('x-tf-grid-spacing-m')) }
+  },
   metadata: (id: string, cell?: number) =>
     request<Record<string, unknown>>(
       `/maps/${id}/metadata${cell === undefined ? '' : '?cell=' + cell}`,

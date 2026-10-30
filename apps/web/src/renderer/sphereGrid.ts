@@ -1,14 +1,6 @@
-/**
- * 球面六角格网格的 TS 实现。
- *
- * 为什么前端也要实现一遍：格子中心方向是纯拓扑量，
- * 由细分频率和二十面体朝向完全决定，不需要从后端传输。
- * 前端重建一份可以省下「每格 12 字节 × 590 万格」的传输量。
- *
- * 实现必须与 Rust 版 tf-grid 完全一致，否则数据对不上。
- */
-
+/** Lightweight globe used only while preview frames arrive. Final geometry comes from the server. */
 export interface SphereGrid {
+  indices: Uint32Array
   count: number
   /** 每格中心方向，xyz 交错 */
   centers: Float32Array
@@ -142,6 +134,16 @@ export function buildSphereGrid(freq: number): SphereGrid {
     facePoints.push(ids)
   }
 
+  const triangles: number[] = []
+  for (const ids of facePoints) {
+    const at = (i: number, j: number) => ids[triIndex(freq, i, j)]
+    for (let i = 0; i < freq; i++) {
+      for (let j = 0; j < freq - i; j++) {
+        triangles.push(at(i, j), at(i + 1, j), at(i, j + 1))
+        if (j < freq - i - 1) triangles.push(at(i + 1, j), at(i + 1, j + 1), at(i, j + 1))
+      }
+    }
+  }
   // 五边形：二十面体顶点对应的格
   const pentagons: number[] = []
   for (let v = 0; v < 12; v++) {
@@ -150,6 +152,7 @@ export function buildSphereGrid(freq: number): SphereGrid {
   }
 
   return {
+    indices: new Uint32Array(triangles),
     count: centers.length / 3,
     centers: new Float32Array(centers),
     pentagons,

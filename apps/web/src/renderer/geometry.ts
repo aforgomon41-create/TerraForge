@@ -70,3 +70,33 @@ export function worldMapPoint(p: Vec3): Vec3 {
 export function worldMapDirection(p: Vec3): Vec3 {
   return direction(p[1] * 90, p[0] * 90)
 }
+
+export function flatDirection(
+  lat: number,
+  lon: number,
+  x: number,
+  y: number,
+  radius: number,
+  referenceLat = lat,
+): Vec3 {
+  return direction(
+    lat + ((y / radius) * 180) / Math.PI,
+    lon +
+      ((x / (radius * Math.max(0.05, Math.cos((referenceLat * Math.PI) / 180)))) * 180) / Math.PI,
+  )
+}
+export function flatProject(
+  lat: number,
+  lon: number,
+  dir: Vec3,
+  radius: number,
+  referenceLat = lat,
+): Vec3 {
+  const geo = latLon(dir),
+    dl = ((geo.lon - lon + 540) % 360) - 180
+  return [
+    ((dl * Math.PI) / 180) * radius * Math.max(0.05, Math.cos((referenceLat * Math.PI) / 180)),
+    (((geo.lat - lat) * Math.PI) / 180) * radius,
+    0,
+  ]
+}
