@@ -179,6 +179,30 @@ pub enum WorldShape {
     Plane,
 }
 
+/// Local landform choice; regional/site roots do not run a miniature planet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LandscapeKind {
+    #[default]
+    Hills,
+    Mountains,
+    Plains,
+    Valley,
+    Coast,
+}
+
+impl LandscapeKind {
+    pub fn name_zh(&self) -> &'static str {
+        match self {
+            Self::Hills => "丘陵",
+            Self::Mountains => "山地",
+            Self::Plains => "平原",
+            Self::Valley => "河谷",
+            Self::Coast => "海岸",
+        }
+    }
+}
+
 /// 完整的世界生成参数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -199,6 +223,13 @@ pub struct GenerationParams {
     pub center_lon_deg: f64,
     /// Continuous province scale, independent of plate ownership.
     pub continent_scale: f64,
+    pub continent_count: u32,
+    pub coast_complexity: f64,
+    pub landscape: LandscapeKind,
+    pub base_elevation_m: f64,
+    pub terrain_relief_m: f64,
+    pub regional_temperature_c: f64,
+    pub regional_precipitation_mm: f64,
     pub orogeny_strength: f64,
     pub rift_strength: f64,
     pub shear_strength: f64,
@@ -270,6 +301,13 @@ impl Default for GenerationParams {
             center_lat_deg: 25.,
             center_lon_deg: 0.,
             continent_scale: 1.,
+            continent_count: 4,
+            coast_complexity: 0.35,
+            landscape: LandscapeKind::Hills,
+            base_elevation_m: 500.,
+            terrain_relief_m: 600.,
+            regional_temperature_c: 15.,
+            regional_precipitation_mm: 900.,
             orogeny_strength: 1.,
             rift_strength: 1.,
             shear_strength: 1.,
@@ -294,8 +332,51 @@ impl Default for GenerationParams {
 }
 
 impl GenerationParams {
+    /// Scope defaults are applied before explicit request overrides.
+    pub fn for_level(level: LevelKind) -> Self {
+        let mut p = Self {
+            start_level: level,
+            ..Self::default()
+        };
+        match level {
+            LevelKind::World => {}
+            LevelKind::Continent => {
+                p.world_shape = WorldShape::Plane;
+                p.continent_count = 1;
+                p.land_fraction = 0.65;
+                p.map_width_m = 6_000_000.;
+                p.map_height_m = 4_000_000.;
+                p.display_grid_m = 50_000.;
+            }
+            LevelKind::Region => {
+                p.world_shape = WorldShape::Plane;
+                p.land_fraction = 1.;
+                p.map_width_m = 200_000.;
+                p.map_height_m = 150_000.;
+                p.display_grid_m = 5_000.;
+                p.hotspot_count = 0;
+            }
+            LevelKind::Site => {
+                p.world_shape = WorldShape::Plane;
+                p.land_fraction = 1.;
+                p.map_width_m = 10_000.;
+                p.map_height_m = 7_500.;
+                p.display_grid_m = 250.;
+                p.base_elevation_m = 150.;
+                p.terrain_relief_m = 80.;
+                p.hotspot_count = 0;
+            }
+        }
+        p
+    }
+    pub fn is_local(&self) -> bool {
+        matches!(self.start_level, LevelKind::Region | LevelKind::Site)
+    }
     /// 校验参数是否在合法范围内，返回第一个越界项的描述。
     pub fn validate(&self) -> Result<(), String> {
+        if !(1..=12).contains(&self.continent_count) {
+            return Err("主要大陆数量必须为1～12".into());
+        }
         if !(8..=30).contains(&self.plate_count) {
             return Err(format!("板块数量 {} 超出范围 8-30", self.plate_count));
         }
@@ -342,6 +423,11 @@ impl GenerationParams {
             ("扩张速率", self.spreading_rate, 0.1, 3.),
             ("生态丰度", self.biome_diversity, 0.3, 2.),
             ("大陆尺度", self.continent_scale, 0.3, 3.),
+            ("海岸复杂度", self.coast_complexity, 0., 1.),
+            ("局部基准海拔", self.base_elevation_m, -1000., 8000.),
+            ("局部起伏", self.terrain_relief_m, 0., 6000.),
+            ("局部基准温度", self.regional_temperature_c, -60., 50.),
+            ("局部年均降雨", self.regional_precipitation_mm, 0., 12000.),
             ("造山强度", self.orogeny_strength, 0., 3.),
             ("裂谷强度", self.rift_strength, 0., 3.),
             ("走滑强度", self.shear_strength, 0., 3.),
@@ -364,6 +450,19 @@ impl GenerationParams {
 
     /// 参数的中文摘要，给 AI 和 UI 用。
     pub fn summary_zh(&self) -> String {
+        if self.is_local() {
+            return format!("独立{}，范围 {:.1}×{:.1} km，{}，基准海拔 {:.0} m，起伏强度 {:.0} m，基准年均温 {:.1}℃，年降水 {:.0} mm",self.start_level.name_zh(),self.map_width_m/1000.,self.map_height_m/1000.,self.landscape.name_zh(),self.base_elevation_m,self.terrain_relief_m,self.regional_temperature_c,self.regional_precipitation_mm);
+        }
+        if self.start_level == LevelKind::Continent {
+            return format!(
+                "独立大陆，范围 {:.0}×{:.0} km，陆地目标 {:.0}%，海岸复杂度 {:.2}，构造强度 {:.1}",
+                self.map_width_m / 1000.,
+                self.map_height_m / 1000.,
+                self.land_fraction * 100.,
+                self.coast_complexity,
+                self.tectonic_activity
+            );
+        }
         format!(
             "星球半径 {:.0} km，板块 {} 块，陆地占比 {:.0}%，构造强度 {:.1}，热点 {} 个，精度档位{}",
             self.planet.radius_m / 1000.0,

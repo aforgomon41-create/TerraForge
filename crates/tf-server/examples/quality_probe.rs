@@ -12,34 +12,28 @@ fn main() -> anyhow::Result<()> {
     };
     let mode = std::env::args().nth(2).unwrap_or_else(|| "sphere".into());
     if mode != "sphere" {
-        use tf_core::params::{LevelKind, WorldShape};
-        params.world_shape = WorldShape::Plane;
-        params.start_level = match mode.as_str() {
+        use tf_core::params::{GenerationParams, LevelKind, WorldShape};
+        let level = match mode.as_str() {
             "continent" => LevelKind::Continent,
             "region" => LevelKind::Region,
             "site" => LevelKind::Site,
             _ => LevelKind::World,
         };
-        let width = match params.start_level {
-            LevelKind::Region => 200_000.,
-            LevelKind::Site => 10_000.,
-            _ => 8_000_000.,
+        params = GenerationParams {
+            seed: 42,
+            quality: tf_core::params::SimQuality::Economy,
+            ..GenerationParams::for_level(level)
         };
-        params.map_width_m = width;
-        params.map_height_m = width * 0.65;
+        params.world_shape = WorldShape::Plane;
     }
-    let descriptor = if mode == "sphere" {
-        tf_grid::GridDescriptor::sphere(256, params.planet.radius_m)
-    } else {
-        tf_grid::GridDescriptor::plane(
-            25.,
-            0.,
-            params.map_width_m,
-            512,
-            384,
-            params.planet.radius_m,
-        )
-    };
+    params.seed = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(42);
+    if let Some(count) = std::env::args().nth(4).and_then(|s| s.parse().ok()) {
+        params.continent_count = count;
+    }
+    let descriptor = tf_server::api::root_descriptor(&params, 512).map_err(anyhow::Error::msg)?;
     descriptor.validate().map_err(anyhow::Error::msg)?;
     let grid = descriptor.build();
     let start = std::time::Instant::now();
@@ -75,7 +69,34 @@ fn main() -> anyhow::Result<()> {
         .collect();
     rain.sort_by(f32::total_cmp);
     let percentile = |v: &Vec<f32>, q: f64| v[((v.len() - 1) as f64 * q) as usize];
-    let report = serde_json::json!({"seed":42,"domain":mode,"cells":grid.cell_count(),"seconds":elapsed,"land_fraction":land.len() as f64/grid.cell_count() as f64,"elevation_m":{"p10":percentile(&land,0.1),"p50":percentile(&land,0.5),"p90":percentile(&land,0.9),"p99":percentile(&land,0.99)},"rainfall_mm_year":{"p10":percentile(&rain,0.1),"p50":percentile(&rain,0.5),"p90":percentile(&rain,0.9),"p99":percentile(&rain,0.99)},"boundaries":{"convergent":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Convergent).count(),"divergent":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Divergent).count(),"transform":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Transform).count()}});
+    let mut seen = vec![false; grid.cell_count()];
+    let mut components = Vec::new();
+    for i in 0..grid.cell_count() {
+        if seen[i] || world.fields.elevation[i] <= 0. {
+            continue;
+        }
+        seen[i] = true;
+        let mut queue = vec![i];
+        let mut area = 0.;
+        let mut cursor = 0;
+        while cursor < queue.len() {
+            let j = queue[cursor];
+            cursor += 1;
+            area += grid.area_m2(j);
+            for &k in grid.neighbors(j) {
+                let k = k as usize;
+                if !seen[k] && world.fields.elevation[k] > 0. {
+                    seen[k] = true;
+                    queue.push(k);
+                }
+            }
+        }
+        components.push(area);
+    }
+    components.sort_by(|a, b| b.total_cmp(a));
+    let land_area = components.iter().sum::<f64>();
+    let connected = serde_json::json!({"largest_land_share":components.first().copied().unwrap_or(0.)/land_area.max(1.),"top_three_share":components.iter().take(3).sum::<f64>()/land_area.max(1.),"small_land_components_share":components.iter().filter(|&&area|area<1e11).sum::<f64>()/land_area.max(1.),"landmasses_over_100000_km2":components.iter().filter(|&&area|area>=1e11).count()});
+    let report = serde_json::json!({"seed":params.seed,"connectivity":connected,"domain":mode,"extent_m":grid.extent_m(),"cells":grid.cell_count(),"seconds":elapsed,"land_fraction":land.len() as f64/grid.cell_count() as f64,"elevation_m":{"p10":percentile(&land,0.1),"p50":percentile(&land,0.5),"p90":percentile(&land,0.9),"p99":percentile(&land,0.99)},"rainfall_mm_year":{"p10":percentile(&rain,0.1),"p50":percentile(&rain,0.5),"p90":percentile(&rain,0.9),"p99":percentile(&rain,0.99)},"boundaries":{"convergent":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Convergent).count(),"divergent":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Divergent).count(),"transform":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Transform).count()}});
     let text = serde_json::to_string_pretty(&report)?;
     println!("{text}");
     std::fs::write(format!("{output}/report.json"), text)?;

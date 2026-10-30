@@ -152,7 +152,7 @@ export const api = {
   },
   listWorlds: () => request<World[]>('/worlds'),
   getWorld: (id: string) => request<World>(`/worlds/${id}`),
-  createWorld: (name: string, seed: number, params?: Record<string, unknown>) =>
+  createWorld: (name: string, seed: number | undefined, params?: Record<string, unknown>) =>
     request<World>('/worlds', {
       method: 'POST',
       body: JSON.stringify({ name, seed, params }),

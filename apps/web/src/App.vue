@@ -10,6 +10,7 @@ import { bindMapInput } from '@/renderer/interaction'
 import { decodeBase64 } from '@/api/sse'
 import type { ToolContext } from '@/agent/tools'
 import { flatDirection, flatProject } from '@/renderer/geometry'
+import { parseSeed } from '@/generation/seed'
 import MapTree from '@/components/MapTree.vue'
 import AgentPanel from '@/components/AgentPanel.vue'
 const store = useWorldStore(),
@@ -21,7 +22,7 @@ const tab = ref<'tree' | 'create'>('create'),
   panel = ref<'project' | 'layers' | 'ai' | null>('project'),
   projectOpen = ref(true)
 const name = ref('Aetheria'),
-  seed = ref('42'),
+  seed = ref(''),
   land = ref(29),
   plates = ref(14),
   erosion = ref(1)
@@ -204,8 +205,7 @@ function randomSeed() {
 }
 async function generate() {
   await guard(async () => {
-    const n = Number(seed.value)
-    if (!Number.isSafeInteger(n) || n < 0) throw new Error('种子请填写 0～9007199254740991 的整数')
+    const n = parseSeed(seed.value)
     if (!name.value.trim()) throw new Error('请填写世界名称')
     await store.createWorld(name.value.trim(), n, {
       land_fraction: land.value / 100,
@@ -772,10 +772,18 @@ onBeforeUnmount(() => {
           <label>
             世界种子
             <span class="input-action">
-              <input v-model="seed" inputmode="numeric" pattern="[0-9]+" required />
-              <button type="button" aria-label="随机选择种子" @click="randomSeed">↻</button>
+              <input
+                v-model="seed"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                placeholder="留空，每次自动随机"
+              />
+              <button type="button" aria-label="随机选择种子" @click="randomSeed">随机</button>
             </span>
-            <small>相同种子、参数与版本，可重现同一结果。</small>
+            <small>
+              留空会自动随机；填入固定值可复现地图。
+              <template v-if="store.current">当前工程种子：{{ store.current.seed }}</template>
+            </small>
           </label>
           <label class="range-label">
             目标陆地占比

@@ -462,7 +462,7 @@ pub fn step_tectonics<G: GridOps>(
         });
 }
 
-/// Airy 均衡：把地壳厚度换成高程。
+/// Airy 均衡：相对初始平衡柱的厚度变化产生隆起；无参考柱时使用绝对近似。
 ///
 /// h = (t_c - t_ref) * (1 - rho_crust / rho_mantle)
 ///
@@ -488,7 +488,12 @@ pub fn apply_airy_isostasy<G: GridOps>(
         .enumerate()
         .for_each(|(i, e)| {
             let thick = fields.crust_thickness[i];
-            *e = (thick - t_ref) * coeff;
+            let reference = fields.reference_crust_thickness[i];
+            if reference > 0. {
+                *e += (thick - reference) * coeff;
+            } else {
+                *e = (thick - t_ref) * coeff;
+            }
         });
 
     adjust_sea_level(grid, fields, params.land_fraction);

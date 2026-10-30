@@ -545,3 +545,66 @@ async fn independent_region_plane_child_geometry_and_project_round_trip() {
         .iter()
         .any(|m| m.parent.is_none() && m.kind == "region"));
 }
+
+#[tokio::test]
+async fn automatic_seeds_and_scope_defaults_preserve_explicit_overrides() {
+    let f = Fixture::new(false);
+    let t = f.session().await;
+    let mut random_seeds = Vec::new();
+    for _ in 0..2 {
+        let (s, b) = f
+            .request(
+                "POST",
+                "/api/v1/worlds",
+                Some(&t),
+                Some(json!({"name":"Random region","params":{"start_level":"region"}})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let seed = b["seed"].as_u64().unwrap();
+        assert!(seed < 1_u64 << 53);
+        random_seeds.push(seed);
+        let world = f
+            .state
+            .store
+            .get_world(b["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let p: tf_core::params::GenerationParams =
+            serde_json::from_str(&world.params_json).unwrap();
+        assert_eq!(p.map_width_m, 200000.);
+        assert_eq!(p.land_fraction, 1.);
+        assert_eq!(p.seed, seed);
+    }
+    assert_ne!(random_seeds[0], random_seeds[1]);
+    let (s, b) = f
+        .request(
+            "POST",
+            "/api/v1/worlds",
+            Some(&t),
+            Some(json!({
+                "name": "Fixed site",
+                "seed": 0,
+                "params": {
+                    "start_level": "site",
+                    "map_width_m": 8000.,
+                    "terrain_relief_m": 40.,
+                    "planet": {"radius_m": 6371000.}
+                }
+            })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["seed"], 0);
+    let world = f
+        .state
+        .store
+        .get_world(b["id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let p: tf_core::params::GenerationParams = serde_json::from_str(&world.params_json).unwrap();
+    assert_eq!(p.map_width_m, 8000.);
+    assert_eq!(p.terrain_relief_m, 40.);
+    assert_eq!(p.map_height_m, 7500.);
+    assert_eq!(p.base_elevation_m, 150.);
+}

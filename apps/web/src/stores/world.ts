@@ -67,7 +67,11 @@ export const useWorldStore = defineStore('world', () => {
     if (maps.value.some((m) => m.status === 'done' && !m.grid))
       error.value = '旧地图缺少空间信息，可以在此工程重新生成。'
   }
-  async function createWorld(name: string, seed: number, params?: Record<string, unknown>) {
+  async function createWorld(
+    name: string,
+    seed: number | undefined,
+    params?: Record<string, unknown>,
+  ) {
     const w = await api.createWorld(name, seed, params)
     await refreshWorlds()
     clearMap()

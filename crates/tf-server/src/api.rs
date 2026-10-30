@@ -189,9 +189,9 @@ async fn set_concurrency(
 #[derive(Deserialize)]
 struct CreateWorldBody {
     name: String,
-    seed: u64,
+    seed: Option<u64>,
     #[serde(default)]
-    params: Option<tf_core::params::GenerationParams>,
+    params: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -221,8 +221,36 @@ async fn create_world(
     headers: HeaderMap,
     Json(body): Json<CreateWorldBody>,
 ) -> Result<Json<WorldResponse>, ApiError> {
-    let mut params = body.params.unwrap_or_default();
-    params.seed = body.seed;
+    let supplied = body.params.unwrap_or_else(|| serde_json::json!({}));
+    let level = serde_json::from_value(
+        supplied
+            .get("start_level")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("world")),
+    )
+    .map_err(|_| ApiError::bad_request("起始地图层级无效"))?;
+    let mut merged = serde_json::to_value(tf_core::params::GenerationParams::for_level(level))?;
+    let overrides = supplied
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("参数必须是对象"))?;
+    for (key, value) in overrides {
+        if key == "planet" {
+            let values = value
+                .as_object()
+                .ok_or_else(|| ApiError::bad_request("星球参数必须是对象"))?;
+            for (k, v) in values {
+                merged["planet"][k] = v.clone();
+            }
+        } else {
+            merged[key] = value.clone();
+        }
+    }
+    let mut params: tf_core::params::GenerationParams =
+        serde_json::from_value(merged).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let seed = body
+        .seed
+        .unwrap_or_else(|| (uuid::Uuid::new_v4().as_u128() & ((1_u128 << 53) - 1)) as u64);
+    params.seed = seed;
 
     // 部署形态决定精度档位，客户端不能越权。
     // 网页版锁死 Economy（世界层 f=256，约 65 万格）；
@@ -254,7 +282,7 @@ async fn create_world(
     let rec = WorldRecord {
         id: id.clone(),
         name: body.name.clone(),
-        seed: body.seed,
+        seed,
         params_json: serde_json::to_string(&params)?,
         created_at: now,
         updated_at: now,
@@ -266,7 +294,7 @@ async fn create_world(
     Ok(Json(WorldResponse {
         id,
         name: body.name,
-        seed: body.seed,
+        seed,
         created_at: now,
         share_token: None,
     }))
@@ -320,7 +348,7 @@ async fn delete_world(
 
 // ---------------- 生成 ----------------
 
-pub(crate) fn root_descriptor(
+pub fn root_descriptor(
     params: &tf_core::params::GenerationParams,
     limit: u32,
 ) -> Result<tf_grid::GridDescriptor, String> {

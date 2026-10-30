@@ -16,6 +16,8 @@ pub struct WorldFields {
     pub elevation: Vec<f32>,
     /// 地壳厚度，米。控制均衡浮力和造山。
     pub crust_thickness: Vec<f32>,
+    /// Initial equilibrated column; subsequent thickness change produces uplift.
+    pub reference_crust_thickness: Vec<f32>,
     /// 地壳类型：0 = 洋壳，1 = 陆壳。过渡区用 0-1 之间的小数表示混合。
     pub crust_type: Vec<f32>,
     /// 地壳年龄，百万年。洋壳用热沉降模型转深度。
@@ -40,6 +42,7 @@ impl WorldFields {
         Self {
             elevation: vec![0.0; n],
             crust_thickness: vec![0.0; n],
+            reference_crust_thickness: vec![0.0; n],
             crust_type: vec![0.0; n],
             crust_age: vec![0.0; n],
             plate_id: vec![0; n],

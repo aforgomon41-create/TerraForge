@@ -13,13 +13,6 @@ fn smooth(a: f64, b: f64, x: f64) -> f64 {
 fn fbm(noise: &SimplexNoise, p: DVec3, f: f64, oct: u32) -> f64 {
     noise.fbm(p.x * f, p.y * f, p.z * f, oct, 2.03, 0.52)
 }
-fn field_scale<G: GridOps>(grid: &G, params: &GenerationParams) -> f64 {
-    if grid.field_is_planar() {
-        params.map_width_m.max(3_000_000.) * 0.45
-    } else {
-        grid.radius_m()
-    }
-}
 fn warped(noise: &SimplexNoise, p: DVec3) -> DVec3 {
     p + DVec3::new(
         fbm(noise, p + DVec3::X * 7., 2., 3),
@@ -28,36 +21,164 @@ fn warped(noise: &SimplexNoise, p: DVec3) -> DVec3 {
     ) * 0.22
 }
 
+/// A connected skeleton describes each continental crust province. Noise only roughens its coast.
+struct CrustSegment {
+    a: DVec3,
+    b: DVec3,
+    ra: f64,
+    rb: f64,
+}
+fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<CrustSegment> {
+    use tf_core::{geo::UnitVec3, params::LevelKind, DeterministicRng};
+    let mut rng = DeterministicRng::derive(params.seed, "continental-crust-skeleton-v1");
+    let count = if params.start_level == LevelKind::Continent {
+        1
+    } else {
+        params.continent_count as usize
+    };
+    let planar = grid.field_is_planar();
+    let radius = grid.radius_m();
+    let (width, height) = grid.extent_m().unwrap_or((radius * 2., radius * 2.));
+    let area = if planar {
+        width * height
+    } else {
+        4. * std::f64::consts::PI * radius * radius
+    };
+    let scale = (area * (params.land_fraction + 0.08).clamp(0.15, 0.8) / (count as f64 * 13.))
+        .sqrt()
+        * params.continent_scale.sqrt();
+    let mut anchors: Vec<DVec3> = Vec::new();
+    let mut segments = Vec::new();
+    for group in 0..count {
+        let mut center = DVec3::ZERO;
+        let mut best = -1.;
+        for _ in 0..32 {
+            let candidate = if planar {
+                DVec3::new(
+                    rng.range_f64(-0.34, 0.34) * width,
+                    rng.range_f64(-0.34, 0.34) * height,
+                    0.,
+                )
+            } else {
+                rng.unit_sphere().as_vec() * radius
+            };
+            let clearance = anchors
+                .iter()
+                .map(|a| (candidate - *a).length_squared())
+                .fold(f64::INFINITY, f64::min);
+            if clearance > best {
+                center = candidate;
+                best = clearance;
+            }
+        }
+        if planar && count == 1 {
+            center = DVec3::ZERO;
+        }
+        anchors.push(center);
+        let bearing = rng.range_f64(0., std::f64::consts::TAU);
+        let bend = rng.range_f64(-0.65, 0.65);
+        let mut nodes = Vec::new();
+        for step in -2_i32..=2 {
+            let distance = step as f64 * scale * 1.05;
+            let angle = bearing + bend * step as f64;
+            let p = if planar {
+                center + DVec3::new(angle.sin(), angle.cos(), 0.) * distance
+            } else {
+                UnitVec3::from_vec(center)
+                    .unwrap()
+                    .offset(angle, distance / radius)
+                    .as_vec()
+                    * radius
+            };
+            nodes.push((
+                p,
+                scale * (1.05 - 0.15 * step.unsigned_abs() as f64) * rng.range_f64(0.85, 1.15),
+            ));
+        }
+        for pair in nodes.windows(2) {
+            segments.push(CrustSegment {
+                a: pair[0].0,
+                b: pair[1].0,
+                ra: pair[0].1,
+                rb: pair[1].1,
+            });
+        }
+        // A broad branch forms a peninsula and an adjacent bay, rather than speckled islands.
+        let root = nodes[if group % 2 == 0 { 1 } else { 3 }];
+        let angle = bearing + 1.3;
+        let tip = if planar {
+            root.0 + DVec3::new(angle.sin(), angle.cos(), 0.) * scale * 1.5
+        } else {
+            UnitVec3::from_vec(root.0)
+                .unwrap()
+                .offset(angle, scale * 1.5 / radius)
+                .as_vec()
+                * radius
+        };
+        segments.push(CrustSegment {
+            a: root.0,
+            b: tip,
+            ra: root.1 * 0.85,
+            rb: scale * 0.45,
+        });
+    }
+    segments
+}
 pub fn init_continents<G: GridOps>(grid: &G, fields: &mut WorldFields, params: &GenerationParams) {
     let noise = SimplexNoise::new(params.seed ^ 0xC071_1E17);
-    let scale = field_scale(grid, params);
+    let skeleton = continental_skeleton(grid, params);
+    let radius = grid.radius_m();
     let values: Vec<f64> = (0..grid.cell_count())
         .into_par_iter()
         .map(|i| {
-            let p = warped(&noise, grid.field_position(i) / scale);
-            fbm(&noise, p, 1.7 / params.continent_scale, 5)
-                + 0.18
-                    * fbm(
-                        &noise,
-                        p + DVec3::splat(31.),
-                        4. / params.continent_scale,
-                        3,
-                    )
+            let p = grid.field_position(i);
+            let mut distance = f64::INFINITY;
+            for segment in &skeleton {
+                let ab = segment.b - segment.a;
+                let t = ((p - segment.a).dot(ab) / ab.length_squared().max(1.)).clamp(0., 1.);
+                let q = segment.a + ab * t;
+                let d = if grid.field_is_planar() {
+                    (p - q).length()
+                } else {
+                    (p.normalize().dot(q.normalize())).clamp(-1., 1.).acos() * radius
+                } - segment.ra * (1. - t)
+                    - segment.rb * t;
+                // A smooth union rounds junctions; it never cuts the connecting skeleton.
+                let h = (1. - (distance - d).abs() / 120_000.).max(0.);
+                distance = distance.min(d) - h * h * 30_000.;
+            }
+            let coast = (fbm(&noise, p / 800_000., 1., 3) * 300_000.
+                + fbm(&noise, p / 180_000., 1., 2) * 70_000.)
+                * params.coast_complexity;
+            -distance + coast
         })
         .collect();
     let mut sorted = values.clone();
     sorted.sort_unstable_by(f64::total_cmp);
-    let coverage = (params.land_fraction * 1.1 + 0.15).clamp(0.05, 0.98);
-    let threshold =
-        sorted[(((1. - coverage) * sorted.len() as f64) as usize).min(sorted.len() - 1)];
-    let transition = 0.09;
+    let threshold = sorted
+        [(((1. - params.land_fraction) * sorted.len() as f64) as usize).min(sorted.len() - 1)];
+    let transition =
+        1_200_000_f64.min(grid.extent_m().map_or(1_200_000., |(w, h)| w.min(h) * 0.18));
     for i in 0..grid.cell_count() {
-        let p = grid.field_position(i) / scale;
-        let continental = smooth(threshold - transition, threshold + transition, values[i]);
+        let inland = values[i] - threshold;
+        let p = grid.field_position(i);
+        let continental = smooth(-0.466 * transition, 0.534 * transition, inland);
+        let basement = fbm(&noise, p / 1_200_000. + DVec3::splat(53.), 1., 3)
+            * 1800.
+            * smooth(0., transition * 0.6, inland);
         fields.crust_type[i] = continental as f32;
-        let basement = fbm(&noise, p + DVec3::splat(53.), 3.5, 4) * 5000.
-            + fbm(&noise, p + DVec3::splat(73.), 11., 3) * 1800.;
         fields.crust_thickness[i] = (7000. + continental * (29000. + basement)) as f32;
+        fields.reference_crust_thickness[i] = fields.crust_thickness[i];
+        // Stable lowland/shelf background is the reference column, not a 2 km continental plateau.
+        let foundation = if inland >= 0. {
+            450. * (1. - (-inland / 600_000.).exp())
+        } else {
+            2000. * ((inland / 400_000.).exp() - 1.)
+        };
+        fields.elevation[i] = (foundation
+            + fbm(&noise, p / 1_200_000. + DVec3::splat(71.), 1., 3)
+                * 180.
+                * smooth(0., 400_000., inland)) as f32;
     }
 }
 
@@ -286,6 +407,81 @@ mod tests {
         let left = fault_profile(BoundarySubtype::Transform, 10000., -10000., 0.5, 10000.);
         let right = fault_profile(BoundarySubtype::Transform, 10000., 10000., 0.5, 10000.);
         assert!(left < -100. && right > 100.);
+    }
+    fn landmass_shares<G: GridOps>(g: &G, heights: &[f32]) -> Vec<f64> {
+        let mut seen = vec![false; g.cell_count()];
+        let mut areas = Vec::new();
+        for i in 0..g.cell_count() {
+            if seen[i] || heights[i] <= 0. {
+                continue;
+            }
+            seen[i] = true;
+            let mut queue = vec![i];
+            let mut cursor = 0;
+            let mut area = 0.;
+            while cursor < queue.len() {
+                let j = queue[cursor];
+                cursor += 1;
+                area += g.area_m2(j);
+                for &k in g.neighbors(j) {
+                    let k = k as usize;
+                    if !seen[k] && heights[k] > 0. {
+                        seen[k] = true;
+                        queue.push(k);
+                    }
+                }
+            }
+            areas.push(area);
+        }
+        areas.sort_by(|a, b| b.total_cmp(a));
+        let total = areas.iter().sum::<f64>();
+        for a in &mut areas {
+            *a /= total;
+        }
+        areas
+    }
+    #[test]
+    fn continental_core_control_changes_large_scale_structure() {
+        let g = tf_grid::SphereHexGrid::build(64, 6371000., (DVec3::Z, 0.));
+        let mut p = GenerationParams {
+            seed: 42,
+            continent_count: 1,
+            ..Default::default()
+        };
+        let mut a = WorldFields::with_capacity(g.cell_count());
+        init_continents(&g, &mut a, &p);
+        let one = landmass_shares(&g, &a.elevation);
+        p.continent_count = 8;
+        let mut b = WorldFields::with_capacity(g.cell_count());
+        init_continents(&g, &mut b, &p);
+        let several = landmass_shares(&g, &b.elevation);
+        assert!(
+            one[0] > 0.85 && several[0] < one[0] * 0.8,
+            "one {one:?}, several {several:?}"
+        );
+    }
+    #[test]
+    fn major_continents_survive_a_change_in_sampling_density() {
+        for seed in [0, 42] {
+            let p = GenerationParams {
+                seed,
+                ..Default::default()
+            };
+            let mut shares = Vec::new();
+            for frequency in [48, 96] {
+                let g = tf_grid::SphereHexGrid::build(frequency, 6371000., (DVec3::Z, 0.));
+                let mut f = WorldFields::with_capacity(g.cell_count());
+                init_continents(&g, &mut f, &p);
+                let parts = landmass_shares(&g, &f.elevation);
+                let top = parts.iter().take(3).sum::<f64>();
+                assert!(top > 0.85, "seed {seed}, f{frequency}: {parts:?}");
+                shares.push(parts[0]);
+            }
+            assert!(
+                (shares[0] - shares[1]).abs() < 0.08,
+                "seed {seed}: {shares:?}"
+            );
+        }
     }
     #[test]
     fn crust_varies_inside_a_plate_without_a_plate_height_step() {

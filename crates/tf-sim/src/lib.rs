@@ -20,6 +20,7 @@ pub mod fields;
 pub mod landforms;
 pub mod pipeline;
 pub mod plates;
+pub mod scopes;
 
 pub use fields::{BoundaryCell, BoundaryKind, BoundarySubtype, Plate, WorldFields};
 pub use pipeline::{

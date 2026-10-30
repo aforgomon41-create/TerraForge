@@ -75,80 +75,94 @@ pub fn generate_cancellable<G: GridOps>(
     let mut timings = Vec::new();
     let mut cumulative = 0.0;
 
-    // ---- 阶段 1：板块构造 ----
-    let t = Instant::now();
-    on_progress(Stage::Tectonics, cumulative);
-    let (mut tectonic, plate_id) = build_plates(grid, params, &mut rng);
-    init_crust(grid, &plate_id, &tectonic, &mut fields, &mut rng, params);
-    for plate in &mut tectonic.plates {
-        let mut total = 0.;
-        let mut continental = 0.;
-        for (i, &id) in plate_id.iter().enumerate() {
-            if id == plate.id {
-                total += 1.;
-                continental += fields.crust_type[i] as f64;
+    let local = params.is_local();
+    let tectonic = if local {
+        let start = Instant::now();
+        on_progress(Stage::Landforms, 0.);
+        let context = crate::scopes::local_terrain(grid, &mut fields, params);
+        cumulative = Stage::Tectonics.weight() + Stage::Landforms.weight();
+        timings.push((Stage::Landforms, start.elapsed().as_millis()));
+        on_frame(Stage::Landforms, &fields);
+        on_progress(Stage::Landforms, cumulative);
+        context
+    } else {
+        // ---- 阶段 1：板块构造 ----
+        let t = Instant::now();
+        on_progress(Stage::Tectonics, cumulative);
+        let (mut tectonic, plate_id) = build_plates(grid, params, &mut rng);
+        init_crust(grid, &plate_id, &tectonic, &mut fields, &mut rng, params);
+        for plate in &mut tectonic.plates {
+            let mut total = 0.;
+            let mut continental = 0.;
+            for (i, &id) in plate_id.iter().enumerate() {
+                if id == plate.id {
+                    total += 1.;
+                    continental += fields.crust_type[i] as f64;
+                }
             }
+            plate.oceanic = continental < total * 0.5;
         }
-        plate.oceanic = continental < total * 0.5;
-    }
 
-    // 板块构造演化：跑若干个百万年的步长，让地壳厚度在边界处增厚/减薄。
-    // 步数由精度档位决定。
-    let tectonic_steps = (8.0 * params.quality.iteration_scale()).round() as u32;
-    for tick in 0..tectonic_steps {
+        // 板块构造演化：跑若干个百万年的步长，让地壳厚度在边界处增厚/减薄。
+        // 步数由精度档位决定。
+        let tectonic_steps = (8.0 * params.quality.iteration_scale()).round() as u32;
+        for tick in 0..tectonic_steps {
+            if cancel() {
+                return None;
+            }
+            step_tectonics(
+                grid,
+                &tectonic,
+                &mut fields,
+                params,
+                2.0 / tectonic_steps.max(1) as f64,
+            );
+            on_progress(
+                Stage::Tectonics,
+                Stage::Tectonics.weight() * (tick + 1) as f64 / tectonic_steps.max(1) as f64,
+            );
+        }
+
+        // 相对初始平衡地壳的厚度变化产生隆起，保留大陆原有的低地基面。
+        apply_airy_isostasy(grid, &mut fields, params);
+
+        let boundaries = find_boundaries(grid, &plate_id, &tectonic, &fields);
+        cumulative += Stage::Tectonics.weight();
+        timings.push((Stage::Tectonics, t.elapsed().as_millis()));
+        on_frame(Stage::Tectonics, &fields);
+        on_progress(Stage::Tectonics, cumulative);
+
+        // ---- 阶段 2：构造地貌 ----
+        let t = Instant::now();
+        on_progress(Stage::Landforms, cumulative);
+        let lf = LandformParams::default();
+        // Apply thermal ocean subsidence before adding ridges, trenches and arcs.
         if cancel() {
             return None;
         }
-        step_tectonics(
+        apply_seafloor_age(
             grid,
-            &tectonic,
             &mut fields,
-            params,
-            2.0 / tectonic_steps.max(1) as f64,
+            &tectonic,
+            &boundaries,
+            params.spreading_rate,
         );
-        on_progress(
-            Stage::Tectonics,
-            Stage::Tectonics.weight() * (tick + 1) as f64 / tectonic_steps.max(1) as f64,
+        crate::terrain::apply_relief(grid, &mut fields, &boundaries, params);
+        let hotspots = generate_hotspots(
+            params.hotspot_count,
+            &mut DeterministicRng::derive(params.seed, "hotspots"),
         );
-    }
+        apply_hotspots(grid, &mut fields, &hotspots, &lf);
 
-    // 关键一步：Airy 均衡把地壳厚度变成高程。
-    // 不做这一步，高程场就是空的，整个地形都不存在。
-    apply_airy_isostasy(grid, &mut fields, params);
+        crate::plates::adjust_sea_level(grid, &mut fields, params.land_fraction);
+        cumulative += Stage::Landforms.weight();
+        timings.push((Stage::Landforms, t.elapsed().as_millis()));
+        on_frame(Stage::Landforms, &fields);
+        on_progress(Stage::Landforms, cumulative);
 
-    let boundaries = find_boundaries(grid, &plate_id, &tectonic, &fields);
-    cumulative += Stage::Tectonics.weight();
-    timings.push((Stage::Tectonics, t.elapsed().as_millis()));
-    on_frame(Stage::Tectonics, &fields);
-    on_progress(Stage::Tectonics, cumulative);
-
-    // ---- 阶段 2：构造地貌 ----
-    let t = Instant::now();
-    on_progress(Stage::Landforms, cumulative);
-    let lf = LandformParams::default();
-    // Apply thermal ocean subsidence before adding ridges, trenches and arcs.
-    if cancel() {
-        return None;
-    }
-    apply_seafloor_age(
-        grid,
-        &mut fields,
-        &tectonic,
-        &boundaries,
-        params.spreading_rate,
-    );
-    crate::terrain::apply_relief(grid, &mut fields, &boundaries, params);
-    let hotspots = generate_hotspots(
-        params.hotspot_count,
-        &mut DeterministicRng::derive(params.seed, "hotspots"),
-    );
-    apply_hotspots(grid, &mut fields, &hotspots, &lf);
-
-    crate::plates::adjust_sea_level(grid, &mut fields, params.land_fraction);
-    cumulative += Stage::Landforms.weight();
-    timings.push((Stage::Landforms, t.elapsed().as_millis()));
-    on_frame(Stage::Landforms, &fields);
-    on_progress(Stage::Landforms, cumulative);
+        tectonic
+    };
+    let boundaries = find_boundaries(grid, &fields.plate_id, &tectonic, &fields);
 
     // ---- 阶段 3：侵蚀水文 ----
     let t = Instant::now();
@@ -185,7 +199,11 @@ pub fn generate_cancellable<G: GridOps>(
     clim.wind_speed_m_s = params.wind_speed_m_s;
     clim.orographic_strength = params.orographic_strength;
     clim.moisture_recycling = params.moisture_recycling;
-    if !run_climate_cancellable(grid, &mut fields, &params.planet, &clim, cancel) {
+    if !(if local {
+        crate::scopes::local_climate(grid, &mut fields, params, &clim, cancel)
+    } else {
+        run_climate_cancellable(grid, &mut fields, &params.planet, &clim, cancel)
+    }) {
         return None;
     }
     if params.erosion_strength > 0. {
@@ -196,7 +214,11 @@ pub fn generate_cancellable<G: GridOps>(
         };
         erosion = crate::erosion::run_erosion_cancellable(grid, &mut fields, &feedback, cancel)?;
         compute_distance_to_sea(grid, &mut fields);
-        if !run_climate_cancellable(grid, &mut fields, &params.planet, &clim, cancel) {
+        if !(if local {
+            crate::scopes::local_climate(grid, &mut fields, params, &clim, cancel)
+        } else {
+            run_climate_cancellable(grid, &mut fields, &params.planet, &clim, cancel)
+        }) {
             return None;
         }
     }
@@ -290,9 +312,41 @@ mod regression {
             land.sort_by(f32::total_cmp);
             assert!(!land.is_empty());
             assert!(
-                land[land.len() / 2] < 3000.,
+                land[land.len() / 2] < 1800.,
                 "seed {seed}: median {}",
                 land[land.len() / 2]
+            );
+            let mut seen = vec![false; grid.cell_count()];
+            let mut areas = Vec::new();
+            for i in 0..grid.cell_count() {
+                if seen[i] || f.elevation[i] <= 0. {
+                    continue;
+                }
+                seen[i] = true;
+                let mut queue = vec![i];
+                let mut cursor = 0;
+                let mut area = 0.;
+                while cursor < queue.len() {
+                    let j = queue[cursor];
+                    cursor += 1;
+                    area += grid.area_m2(j);
+                    for &k in grid.neighbors(j) {
+                        let k = k as usize;
+                        if !seen[k] && f.elevation[k] > 0. {
+                            seen[k] = true;
+                            queue.push(k);
+                        }
+                    }
+                }
+                areas.push(area);
+            }
+            areas.sort_by(|a, b| b.total_cmp(a));
+            let total = areas.iter().sum::<f64>();
+            let top = areas.iter().take(3).sum::<f64>() / total;
+            let largest = areas[0] / total;
+            assert!(
+                top > 0.70 && largest > 0.20 && largest < 0.85,
+                "seed {seed}: largest {largest}, top3 {top}"
             );
             let second = generate(&grid, &params, &mut |_, _| {});
             assert_eq!(f.elevation, second.fields.elevation);
