@@ -378,7 +378,9 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
         if let Some(j) = atmospheric.cell_at(fine.center_dir(i)) {
             let area = fine.area_m2(i);
             areas[j] += area;
-            heights[j] += fields.elevation[i] as f64 * area;
+            // Air flows over the sea surface, not over bathymetry. Clamp before
+            // restriction so deep water cannot cancel nearby land elevations.
+            heights[j] += fields.elevation[i].max(0.) as f64 * area;
             temperatures[j] += fields.temperature[i] as f64 * area;
             oceans[j] += if fields.elevation[i] <= 0. { area } else { 0. };
         }
@@ -403,7 +405,7 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
                 })
                 .unwrap_or(0)
         });
-        heights[i] = fields.elevation[nearest] as f64;
+        heights[i] = fields.elevation[nearest].max(0.) as f64;
         temperatures[i] = fields.temperature[nearest] as f64;
         oceans[i] = if fields.elevation[nearest] <= 0. {
             1.
@@ -615,6 +617,60 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rainfall_and_air_temperature_do_not_follow_underwater_relief() {
+        let g = FlatGrid::new(48, 20, 1_500_000., 35., 0., 6_371_000.);
+        let mut shallow = WorldFields::with_capacity(g.cell_count());
+        let mut deep = shallow.clone();
+        for i in 0..g.cell_count() {
+            let (x, y) = g.xy(i);
+            let coast = -250_000. + 100_000. * (y / 90_000.).sin();
+            if x < coast {
+                shallow.elevation[i] = -10.;
+                deep.elevation[i] = (-500. - 6_000. * (x / 130_000.).sin().powi(2)) as f32;
+            } else {
+                let land = (100. + 1_800. * (-0.5 * (x / 150_000.).powi(2)).exp()) as f32;
+                shallow.elevation[i] = land;
+                deep.elevation[i] = land;
+            }
+        }
+        for fields in [&mut shallow, &mut deep] {
+            assert!(solve(
+                &g,
+                fields,
+                &PlanetParams::default(),
+                &ClimateParams::default(),
+                &|| false,
+            ));
+        }
+        // There is no bathymetry-dependent ocean circulation in this model:
+        // identical land and sea surfaces must produce identical air climate.
+        for (name, a, b) in [
+            ("rain", &shallow.precipitation, &deep.precipitation),
+            ("temperature", &shallow.temperature, &deep.temperature),
+            (
+                "PET",
+                &shallow.potential_evaporation,
+                &deep.potential_evaporation,
+            ),
+        ] {
+            let delta = a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0_f32, f32::max);
+            assert!(delta < 1e-5, "underwater relief changed {name} by {delta}");
+        }
+        let a = shallow.climate.as_ref().unwrap();
+        let b = deep.climate.as_ref().unwrap();
+        assert_eq!(a.temperature_c, b.temperature_c);
+        assert_eq!(a.precipitation_mm, b.precipitation_mm);
+        assert_eq!(a.pet_mm, b.pet_mm);
+        assert_eq!(
+            serde_json::to_value(&a.water).unwrap(),
+            serde_json::to_value(&b.water).unwrap()
+        );
+    }
     #[test]
     fn uniform_diagonal_flow_has_no_boundary_or_corner_source() {
         let g = FlatGrid::new(24, 12, 240000., 30., 0., 6371000.);

@@ -443,6 +443,60 @@ impl ClimateAtlas {
 mod tests {
     use super::*;
     #[test]
+    fn homogeneous_ocean_agrees_with_complete_climlab_ebm() {
+        // This oracle is actual climlab.EBM_seasonal output, not values produced
+        // by this solver. A warm zero-tilt case isolates transport and radiation.
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../third_party/climlab/ebm-reference.json"
+        ))
+        .unwrap();
+        let latitudes: Vec<f64> = reference["reference_latitude_deg"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        let temperatures: Vec<f64> = reference["reference_temperature_c"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        let g = MapGrid::Sphere(SphereHexGrid::build(12, 6_371_000., (DVec3::Z, 0.)));
+        let n = g.cell_count();
+        let mut planet = PlanetParams::default();
+        planet.axial_tilt_deg = 0.;
+        let a = energy(&g, &vec![0.; n], &vec![1.; n], &planet, 2., None, &|| false).unwrap();
+        assert!(a.energy.annual_cycle_converged);
+        assert!(a.energy.residual_w_m2 < 0.01);
+        let mut squared_error = 0.;
+        let mut maximum_error = 0_f64;
+        let mut total_area = 0.;
+        for i in 0..n {
+            let latitude = g.latitude_deg(i);
+            let j = latitudes
+                .partition_point(|x| *x < latitude)
+                .clamp(1, latitudes.len() - 1);
+            let t =
+                ((latitude - latitudes[j - 1]) / (latitudes[j] - latitudes[j - 1])).clamp(0., 1.);
+            let expected = temperatures[j - 1] * (1. - t) + temperatures[j] * t;
+            let actual = a.temperature_c.iter().map(|m| m[i] as f64).sum::<f64>() / 12.;
+            assert!(
+                actual > 0.,
+                "ice feedback must be excluded from the comparison"
+            );
+            let error = actual - expected;
+            squared_error += g.area_m2(i) * error.powi(2);
+            total_area += g.area_m2(i);
+            maximum_error = maximum_error.max(error.abs());
+        }
+        let rms = (squared_error / total_area).sqrt();
+        assert!(
+            rms < 0.5 && maximum_error < 1.2,
+            "RMS {rms}, max {maximum_error}"
+        );
+    }
+    #[test]
     fn seasonal_thermal_storage_and_energy_budget_have_physical_limits() {
         let g = MapGrid::Sphere(SphereHexGrid::build(8, 6371000., (DVec3::Z, 0.)));
         let n = g.cell_count();
