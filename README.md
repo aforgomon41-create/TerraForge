@@ -4,9 +4,9 @@
 
 [在线体验](https://aforgomon.win/map/) · [审计报告](docs/audit-2026-10-29.md) · [改进与验证记录](docs/implementation-status.md) · [前端设计](docs/frontend-design.md)
 
-## 正在开发的 0.3 分支
+## 正在开发的 0.4 分支
 
-`codex/generation-fields` 已加入连贯的大陆地壳、连续断层场、水汽输运、共享顶点的地图表面和独立显示格网。种子留空可自动随机并保存，API 可以直接创建球形或平面世界，以及无父图的大陆、区域、地点；独立区域/地点使用局部地貌与气候设置。新创建面板仍等待布局审阅，新增参数入口尚未正式接入。此分支未替换线上 0.2，也未制作新安装包。[进度、实测与限制](docs/generation-v03-progress.md)。
+`codex/generation-fields` 已加入地壳随板块运动、宽域大陆碰撞、火山事件历史、逐月气候与独立板块诊断图层，并实际移植、比对 climlab／Landlab 的部分科学内核。种子留空可自动随机并保存；API 可直接创建球形或平面世界，以及无父图的大陆、区域、地点。新创建面板仍等待布局审阅，完整参数入口尚未正式接入。此分支未替换线上 0.2，也未制作新安装包。[当前实现、验证与局限](docs/scientific-model-implementation.md) · [科学依据](docs/scientific-model-review-2026-10-30.md)。
 
 ## 已发布 0.2 的能力
 

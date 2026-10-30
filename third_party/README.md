@@ -1,0 +1,16 @@
+# Scientific kernels used by TerraForge
+
+TerraForge's native fast model adapts small, identified kernels from these MIT projects. It does not embed either complete Python framework or claim their complete models have been run in the product.
+
+| Project | Pinned source | Adapted components |
+| --- | --- | --- |
+| climlab | `climlab/upstream.json` | Circular-orbit daily insolation; water-column heat capacity; A+B*T outgoing longwave loss; seasonal EBM architecture |
+| Landlab | `landlab/upstream.json` | `get_flexure_parameter` and the 1-D `subside_point_load` Green function |
+
+Full upstream MIT notices are in each directory's LICENSE. Native adaptations are in `crates/tf-sim/src/scientific.rs`; the two-dimensional implicit heat transport and the kinematic material evolution are TerraForge implementations. The normal product build requires no Python or Fortran.
+
+`scientific-reference.json` was produced by actually executing climlab 0.9.2 and the pinned Landlab source in an isolated Python environment on 2026-10-30. It covers 28 circular-orbit insolation cases, 50 m water-column heat capacity, flexure length and three line-load deflections. Rust tests compare against these values. Reproduce with `scripts/science_reference.py`; optional validation dependencies are documented by that script.
+
+GPlates is a methodological reference for rigid spherical Euler rotations, not a bundled or copied dependency. Cortial et al. (2019), https://doi.org/10.1111/cgf.13614, is a methodological reference for procedural crust history, not an assertion that the paper's engine is included.
+
+Limits: the EBM is a reduced surface energy model, not a 3-D atmospheric/oceanic GCM. Monthly PET uses the empirical Thornthwaite method; it is a diagnostic of vegetation water demand, not a claim of exact latent-energy closure. Continental resistance, crustal redistribution and volcanic event lifetimes are documented kinematic parameterizations requiring calibration. Neither complete ExoPlaSim nor complete Landlab is shipped.

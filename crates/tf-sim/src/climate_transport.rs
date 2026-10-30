@@ -34,7 +34,7 @@ fn wind<G: GridOps>(
     i: usize,
     season: f64,
     planet: &PlanetParams,
-    land: f64,
+    _land: f64,
     monsoon: bool,
 ) -> (DVec3, f64, f64) {
     let latitude = g.latitude_deg(i);
@@ -48,12 +48,8 @@ fn wind<G: GridOps>(
     let a = relative.abs();
     let u = -1. + 2. * smooth(hadley - 10., hadley + 8., a) - 2. * smooth(62., 78., a);
     let hemisphere = (relative / 12.).tanh();
-    let mut v = -hemisphere * 0.4 * (-0.5 * ((a - hadley * 0.5) / (hadley * 0.65)).powi(2)).exp()
+    let v = -hemisphere * 0.4 * (-0.5 * ((a - hadley * 0.5) / (hadley * 0.65)).powi(2)).exp()
         + hemisphere * 0.4 * (-0.5 * ((a - (hadley + 18.)) / 13.).powi(2)).exp();
-    // Seasonal land heating perturbs the wind; oceans have greater thermal inertia.
-    if monsoon {
-        v += season * land * 0.5 * (planet.axial_tilt_deg / 23.44).min(2.);
-    }
     let length = u.hypot(v).max(0.2);
     let (east, north) = g.center_dir(i).tangent_frame();
     let vector = if g.extent_m().is_some() {
@@ -62,6 +58,46 @@ fn wind<G: GridOps>(
         (east * u + north * v) / length
     };
     (vector, u / length, v / length)
+}
+
+/// Steady pressure-gradient / Coriolis / drag anomaly from the actual monthly
+/// land-sea thermal contrast. The background wind belts remain a parameterization.
+fn thermal_wind<G: GridOps>(
+    g: &G,
+    i: usize,
+    base: (DVec3, f64, f64),
+    temperature: &[f32],
+    heights: &[f64],
+    planet: &PlanetParams,
+    speed: f64,
+) -> (DVec3, f64, f64) {
+    let (east, north) = if g.field_is_planar() {
+        (DVec3::X, DVec3::Y)
+    } else {
+        g.center_dir(i).tangent_frame()
+    };
+    let mut gradient = DVec3::ZERO;
+    for &j in g.neighbors(i) {
+        let j = j as usize;
+        let delta = g.field_position(j) - g.field_position(i);
+        let distance = g.distance_m(i, j).max(1.);
+        let dt = temperature[j] as f64 + heights[j].max(0.) * 0.0065
+            - temperature[i] as f64
+            - heights[i].max(0.) * 0.0065;
+        gradient += delta.normalize_or_zero() * dt / distance * 2. / g.neighbors(i).len() as f64;
+    }
+    let ax = 287. * 0.10 * gradient.dot(east);
+    let ay = 287. * 0.10 * gradient.dot(north);
+    let coriolis = planet.coriolis(g.latitude_deg(i));
+    let drag = 1. / (DAY * 1.2);
+    let den = drag * drag + coriolis * coriolis;
+    let mut anomaly =
+        east * ((drag * ax + coriolis * ay) / den) + north * ((drag * ay - coriolis * ax) / den);
+    if anomaly.length() > speed * 0.7 {
+        anomaly *= speed * 0.7 / anomaly.length();
+    }
+    let v = (base.0 * speed + anomaly).normalize_or_zero();
+    (v, v.dot(east), v.dot(north))
 }
 
 fn transfer_mesh<G: GridOps>(
@@ -139,7 +175,7 @@ fn water_step(
     dt: f64,
     params: &ClimateParams,
 ) -> WaterFlux {
-    let potential = 3.2 * (capacity / 30.).sqrt() * dt / DAY;
+    let potential = 3.2 * (capacity / 30.).sqrt() * dt / DAY * params.precipitation_scale;
     let evap_ocean = (potential * ocean).min((capacity * 0.95 - *v).max(0.));
     let tension = (*soil / 120.).clamp(0., 1.);
     let evap_land = (potential * params.moisture_recycling * (1. - ocean) * tension)
@@ -326,7 +362,7 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
     } else {
         MapGrid::Sphere(SphereHexGrid::build(
             ((planet.radius_m / 6_371_000. * sphere_frequency as f64).round() as u32)
-                .clamp(8, 96)
+                .clamp(8, 56)
                 .min(((fine.cell_count() as f64 / 10.).sqrt().floor() as u32).max(4)),
             planet.radius_m,
             (DVec3::Z, 0.),
@@ -385,112 +421,194 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
         .map(|(i, j)| atmospheric.distance_m(i, j))
         .fold(f64::INFINITY, f64::min);
     let dt = (min_spacing / params.wind_speed_m_s * 0.32).clamp(1., 21600.);
-    let warmup = (40. * DAY / dt).ceil() as usize;
-    let sample = (25. * DAY / dt).ceil() as usize;
-    let mut annual = vec![0.; n];
+    let Some(mut atlas) = crate::seasonal::energy(
+        &atmospheric,
+        &heights,
+        &oceans,
+        planet,
+        params.greenhouse,
+        if params.prescribed_temperature {
+            Some(&temperatures)
+        } else {
+            None
+        },
+        cancel,
+    ) else {
+        return false;
+    };
+    let sample = (YEAR / 12. / dt).ceil() as usize;
     let mut soil = vec![30_f64; n];
     let mut vapor = vec![0.; n];
     let mut cloud = vec![0.; n];
-    let seasons = 6;
-    for season_index in 0..seasons {
-        let season = (std::f64::consts::TAU * season_index as f64 / seasons as f64).sin();
-        if cancel() {
-            return false;
+    let water_total = |v: &[f64], c: &[f64], s: &[f64]| {
+        (0..n)
+            .map(|i| (v[i] + c[i] + s[i]) * atmospheric.area_m2(i) / 1000.)
+            .sum::<f64>()
+    };
+    let mut storage_start = 0.;
+    for cycle in 0..2 {
+        if cycle == 1 {
+            storage_start = water_total(&vapor, &cloud, &soil);
         }
-        let winds: Vec<_> = (0..n)
-            .map(|i| {
-                wind(
-                    &atmospheric,
-                    i,
-                    season,
-                    planet,
-                    1. - oceans[i],
-                    params.monsoon,
-                )
-            })
-            .collect();
-        let transport = transfer_mesh(&atmospheric, &winds, params.wind_speed_m_s, dt);
-        let capacity: Vec<_> = (0..n)
-            .map(|i| {
-                let seasonal = season
-                    * 15.
-                    * atmospheric.latitude_deg(i).to_radians().sin()
-                    * (1. - oceans[i] * 0.85)
-                    * (planet.axial_tilt_deg / 23.44);
-                (30. * (0.055 * (temperatures[i] + seasonal - 20.)).exp()
-                    * planet.atmosphere_density.sqrt())
-                .clamp(0.05, 150.)
-            })
-            .collect();
-        if season_index == 0 {
+        for month in 0..12 {
+            let season = crate::seasonal::solar_longitude(month).sin();
+            if cancel() {
+                return false;
+            }
+            let winds: Vec<_> = (0..n)
+                .map(|i| {
+                    let base = wind(
+                        &atmospheric,
+                        i,
+                        season,
+                        planet,
+                        1. - oceans[i],
+                        params.monsoon,
+                    );
+                    thermal_wind(
+                        &atmospheric,
+                        i,
+                        base,
+                        &atlas.temperature_c[month],
+                        &heights,
+                        planet,
+                        params.wind_speed_m_s,
+                    )
+                })
+                .collect();
+            let transport = transfer_mesh(&atmospheric, &winds, params.wind_speed_m_s, dt);
+            let capacity: Vec<_> = (0..n)
+                .map(|i| {
+                    (30. * (0.055 * (atlas.temperature_c[month][i] as f64 - 20.)).exp()
+                        * planet.atmosphere_density.sqrt())
+                    .clamp(0.05, 150.)
+                })
+                .collect();
+            if cycle == 0 && month == 0 {
+                for i in 0..n {
+                    vapor[i] = capacity[i] * 0.7;
+                }
+            }
+            let boundary: Vec<_> = capacity.iter().map(|&x| x * 0.7).collect();
+            let dry = vec![0.; n];
+            let mut next_v = vec![0.; n];
+            let mut next_c = vec![0.; n];
+            let mut rise = vec![0.; n];
+            let mut convection = vec![0.; n];
             for i in 0..n {
-                vapor[i] = capacity[i] * 0.7;
+                let p = atmospheric.field_position(i);
+                let mut gradient = 0.;
+                let mut weight = 0.;
+                for &j in atmospheric.neighbors(i) {
+                    let j = j as usize;
+                    let delta = atmospheric.field_position(j) - p;
+                    let upstream = (-winds[i].0.dot(delta.normalize_or_zero())).max(0.);
+                    gradient +=
+                        (heights[i] - heights[j]) / atmospheric.distance_m(i, j).max(1.) * upstream;
+                    weight += upstream;
+                }
+                rise[i] = gradient / weight.max(1e-20) * params.wind_speed_m_s * dt;
+                let latitude = atmospheric.latitude_deg(i)
+                    - if params.monsoon {
+                        season * planet.axial_tilt_deg * 0.45
+                    } else {
+                        0.
+                    };
+                let itcz = (-0.5 * (latitude / 12.).powi(2)).exp();
+                let storms = (-0.5 * ((latitude.abs() - 52.) / 13.).powi(2)).exp();
+                let tau = DAY * (14. - 10. * itcz - 7. * storms).max(2.5);
+                convection[i] = 1. - (-dt / tau).exp();
             }
-        }
-        let boundary: Vec<_> = capacity.iter().map(|&x| x * 0.7).collect();
-        let dry = vec![0.; n];
-        let mut next_v = vec![0.; n];
-        let mut next_c = vec![0.; n];
-        let mut rise = vec![0.; n];
-        let mut convection = vec![0.; n];
-        for i in 0..n {
-            let p = atmospheric.field_position(i);
-            let mut gradient = 0.;
-            let mut weight = 0.;
-            for &j in atmospheric.neighbors(i) {
-                let j = j as usize;
-                let delta = atmospheric.field_position(j) - p;
-                let upstream = (-winds[i].0.dot(delta.normalize_or_zero())).max(0.);
-                gradient +=
-                    (heights[i] - heights[j]) / atmospheric.distance_m(i, j).max(1.) * upstream;
-                weight += upstream;
-            }
-            rise[i] = gradient / weight.max(1e-20) * params.wind_speed_m_s * dt;
-            let latitude = atmospheric.latitude_deg(i)
-                - if params.monsoon {
-                    season * planet.axial_tilt_deg * 0.45
+            let rain_fraction = 1. - (-dt / 10800.).exp();
+            for step in 0..sample {
+                if step % 16 == 0 && cancel() {
+                    return false;
+                }
+                let before = if cycle == 1 {
+                    water_total(&vapor, &cloud, &soil)
                 } else {
                     0.
                 };
-            let itcz = (-0.5 * (latitude / 12.).powi(2)).exp();
-            let storms = (-0.5 * ((latitude.abs() - 52.) / 13.).powi(2)).exp();
-            let tau = DAY * (14. - 10. * itcz - 7. * storms).max(2.5);
-            convection[i] = 1. - (-dt / tau).exp();
-        }
-        let rain_fraction = 1. - (-dt / 10800.).exp();
-        for step in 0..warmup + sample {
-            if step % 16 == 0 && cancel() {
-                return false;
-            }
-            advect(&vapor, &mut next_v, &transport, &boundary);
-            advect(&cloud, &mut next_c, &transport, &dry);
-            for i in 0..n {
-                let flux = water_step(
-                    &mut next_v[i],
-                    &mut next_c[i],
-                    &mut soil[i],
-                    capacity[i],
-                    oceans[i],
-                    rise[i],
-                    convection[i],
-                    rain_fraction,
-                    dt,
-                    params,
-                );
-                if step >= warmup {
-                    annual[i] += flux.rain / (sample as f64 * dt) * YEAR / seasons as f64;
+                advect(&vapor, &mut next_v, &transport, &boundary);
+                advect(&cloud, &mut next_c, &transport, &dry);
+                if cycle == 1 {
+                    atlas.water.boundary_inflow_m3 += water_total(&next_v, &next_c, &soil) - before;
                 }
-                let _ = (flux.evaporation, flux.runoff); // Explicit external water exchanges; tested below.
+                for i in 0..n {
+                    let flux = water_step(
+                        &mut next_v[i],
+                        &mut next_c[i],
+                        &mut soil[i],
+                        capacity[i],
+                        oceans[i],
+                        rise[i],
+                        convection[i],
+                        rain_fraction,
+                        dt,
+                        params,
+                    );
+                    if cycle == 1 {
+                        let factor = (YEAR / 12.) / (sample as f64 * dt);
+                        atlas.precipitation_mm[month][i] += (flux.rain * factor) as f32;
+                        let a = atmospheric.area_m2(i) / 1000.;
+                        atlas.water.evaporation_m3 += flux.evaporation * a;
+                        atlas.water.runoff_to_ocean_m3 += flux.runoff * a;
+                        atlas.water.precipitation_m3 += flux.rain * a;
+                    }
+                }
+                std::mem::swap(&mut vapor, &mut next_v);
+                std::mem::swap(&mut cloud, &mut next_c);
             }
-            std::mem::swap(&mut vapor, &mut next_v);
-            std::mem::swap(&mut cloud, &mut next_c);
+        }
+    }
+    atlas.water.storage_change_m3 = water_total(&vapor, &cloud, &soil) - storage_start;
+    atlas.water.residual_m3 = (atlas.water.evaporation_m3 + atlas.water.boundary_inflow_m3
+        - atlas.water.runoff_to_ocean_m3
+        - atlas.water.storage_change_m3)
+        .abs();
+    let annual: Vec<_> = (0..n)
+        .map(|i| atlas.precipitation_mm.iter().map(|v| v[i] as f64).sum())
+        .collect();
+    let annual_temperature: Vec<_> = (0..n)
+        .map(|i| atlas.temperature_c.iter().map(|v| v[i] as f64).sum::<f64>() / 12.)
+        .collect();
+    for i in 0..n {
+        let t = std::array::from_fn(|m| atlas.temperature_c[m][i]);
+        let pet = crate::scientific::monthly_pet(
+            &t,
+            atmospheric.latitude_deg(i).to_radians(),
+            planet.axial_tilt_deg.to_radians(),
+        );
+        for m in 0..12 {
+            atlas.pet_mm[m][i] = pet[m];
         }
     }
     let rainfall = RainInterpolator::new(&atmospheric, &annual);
+    let temperature = RainInterpolator::new(&atmospheric, &annual_temperature);
+    let lapse_heights: Vec<_> = heights.iter().map(|h| h.max(0.)).collect();
+    let background_height = RainInterpolator::new(&atmospheric, &lapse_heights);
     for i in 0..fine.cell_count() {
-        fields.precipitation[i] =
-            (rainfall.sample(fine.center_dir(i)) * params.precipitation_scale).max(0.) as f32;
+        if i % 2048 == 0 && cancel() {
+            return false;
+        }
+        fields.precipitation[i] = rainfall.sample(fine.center_dir(i)).max(0.) as f32;
+        if !params.prescribed_temperature {
+            // Restore fine-scale lapse information removed by atmospheric averaging.
+            fields.temperature[i] = (temperature.sample(fine.center_dir(i))
+                - (fields.elevation[i].max(0.) as f64
+                    - background_height.sample(fine.center_dir(i)))
+                    * 0.0065) as f32;
+        }
+        let (_, _, pet) = atlas.sample(
+            &atmospheric,
+            fine.center_dir(i),
+            fields.temperature[i],
+            fields.precipitation[i],
+        );
+        fields.potential_evaporation[i] = pet.iter().sum();
+        fields.aridity[i] = fields.precipitation[i] / fields.potential_evaporation[i].max(1.);
     }
+    fields.climate = Some(atlas);
     !cancel()
 }
 

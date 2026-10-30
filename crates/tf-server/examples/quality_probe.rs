@@ -37,8 +37,16 @@ fn main() -> anyhow::Result<()> {
     descriptor.validate().map_err(anyhow::Error::msg)?;
     let grid = descriptor.build();
     let start = std::time::Instant::now();
+    let mut last = (String::new(), u32::MAX);
     let world = tf_sim::generate(&grid, &params, &mut |stage, progress| {
-        eprintln!("{} {:.0}%", stage.name_zh(), progress * 100.)
+        let now = (
+            stage.name_zh().to_string(),
+            (progress * 100.).round() as u32,
+        );
+        if now != last {
+            eprintln!("{} {}%", now.0, now.1);
+            last = now;
+        }
     });
     let elapsed = start.elapsed().as_secs_f64();
     let biome: Vec<f32> = world.ecology.biome.iter().map(|&b| b as f32).collect();
@@ -97,6 +105,29 @@ fn main() -> anyhow::Result<()> {
     let land_area = components.iter().sum::<f64>();
     let connected = serde_json::json!({"largest_land_share":components.first().copied().unwrap_or(0.)/land_area.max(1.),"top_three_share":components.iter().take(3).sum::<f64>()/land_area.max(1.),"small_land_components_share":components.iter().filter(|&&area|area<1e11).sum::<f64>()/land_area.max(1.),"landmasses_over_100000_km2":components.iter().filter(|&&area|area>=1e11).count()});
     let report = serde_json::json!({"seed":params.seed,"connectivity":connected,"domain":mode,"extent_m":grid.extent_m(),"cells":grid.cell_count(),"seconds":elapsed,"land_fraction":land.len() as f64/grid.cell_count() as f64,"elevation_m":{"p10":percentile(&land,0.1),"p50":percentile(&land,0.5),"p90":percentile(&land,0.9),"p99":percentile(&land,0.99)},"rainfall_mm_year":{"p10":percentile(&rain,0.1),"p50":percentile(&rain,0.5),"p90":percentile(&rain,0.9),"p99":percentile(&rain,0.99)},"boundaries":{"convergent":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Convergent).count(),"divergent":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Divergent).count(),"transform":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Transform).count()}});
+    let mut report = report;
+    let mut biomes = vec![0usize; 13];
+    for (i, &b) in world.ecology.biome.iter().enumerate() {
+        if world.fields.elevation[i] > 0. {
+            biomes[b as usize] += 1;
+        }
+    }
+    report["biome_land_shares"] = serde_json::json!(biomes
+        .iter()
+        .map(|n| *n as f64 / land.len().max(1) as f64)
+        .collect::<Vec<_>>());
+    let mut history = serde_json::to_value(&world.tectonic.history)?;
+    let events = history["volcanoes"].as_array().map_or(0, Vec::len);
+    history.as_object_mut().unwrap().remove("volcanoes");
+    history["volcanic_events"] = serde_json::json!(events);
+    report["tectonics"] = history;
+    if let Some(atlas) = &world.fields.climate {
+        atlas.validate().map_err(anyhow::Error::msg)?;
+        // Exercise the production serializer, not only the in-memory solver.
+        let encoded = tf_server::climatology::encode(atlas)?;
+        let decoded = tf_server::climatology::decode(&encoded)?;
+        report["climate"] = serde_json::json!({"model":decoded.model,"cells":decoded.grid.cell_count(),"energy":decoded.energy,"water":decoded.water});
+    }
     let text = serde_json::to_string_pretty(&report)?;
     println!("{text}");
     std::fs::write(format!("{output}/report.json"), text)?;

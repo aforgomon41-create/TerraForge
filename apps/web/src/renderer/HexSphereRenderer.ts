@@ -16,6 +16,7 @@ export interface CellData {
   /** 每格降水（毫米/年）。可选。 */
   precipitations?: Float32Array
   flows?: Float32Array
+  plateIds?: Float32Array
   indices: Uint32Array
   count: number
 }
@@ -40,6 +41,8 @@ export class HexSphereRenderer {
   private lineVao: WebGLVertexArrayObject | null = null
   private lineBuf: WebGLBuffer | null = null
   private lineCount = 0
+  private diagnostics: { vao: WebGLVertexArrayObject; buffer: WebGLBuffer; count: number }[] = []
+  private instPlateBuf: WebGLBuffer | null = null
   public mapMetres = 6371000
   private instCenterBuf: WebGLBuffer | null = null
   private instHeightBuf: WebGLBuffer | null = null
@@ -287,6 +290,7 @@ export class HexSphereRenderer {
     this.instTempBuf = upload(4, channel(data.temperatures), 1, this.instTempBuf)
     this.instPrecipBuf = upload(5, channel(data.precipitations), 1, this.instPrecipBuf)
     this.instFlowBuf = upload(6, channel(data.flows), 1, this.instFlowBuf)
+    this.instPlateBuf = upload(3, channel(data.plateIds), 1, this.instPlateBuf)
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuf)
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
     gl.bindVertexArray(null)
@@ -304,9 +308,30 @@ export class HexSphereRenderer {
     gl.bindVertexArray(null)
   }
 
+  setDiagnostics(groups: Float32Array[]) {
+    const gl = this.gl
+    for (const group of this.diagnostics) {
+      gl.deleteVertexArray(group.vao)
+      gl.deleteBuffer(group.buffer)
+    }
+    this.diagnostics = groups.map((source) => {
+      const values = this.worldFlatMode ? atlasLines(source) : source
+      const vao = gl.createVertexArray()!,
+        buffer = gl.createBuffer()!
+      gl.bindVertexArray(vao)
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+      gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW)
+      gl.enableVertexAttribArray(0)
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
+      return { vao, buffer, count: values.length / 3 }
+    })
+    gl.bindVertexArray(null)
+  }
+
   clear() {
     this.cellCount = 0
     this.lineCount = 0
+    this.setDiagnostics([])
     this.previewMode = false
   }
   resetView() {
@@ -392,6 +417,7 @@ export class HexSphereRenderer {
   }
 
   dispose() {
+    this.setDiagnostics([])
     this.stop()
     const gl = this.gl
     if (this.program) gl.deleteProgram(this.program)
@@ -408,6 +434,7 @@ export class HexSphereRenderer {
       this.instTempBuf,
       this.instPrecipBuf,
       this.instFlowBuf,
+      this.instPlateBuf,
     ]) {
       if (b) gl.deleteBuffer(b)
     }
@@ -531,7 +558,7 @@ export class HexSphereRenderer {
     // Shared indices prevent the gaps/overlaps of independent regular hexagons.
     gl.disable(gl.CULL_FACE)
     gl.drawElements(gl.TRIANGLES, this.indexCount, gl.UNSIGNED_INT, 0)
-    if (this.lineCount && this.lineProgram && !this.previewMode) {
+    if ((this.lineCount || this.diagnostics.length) && this.lineProgram && !this.previewMode) {
       gl.useProgram(this.lineProgram)
       gl.bindVertexArray(this.lineVao)
       const lu = (name: string) => {
@@ -547,7 +574,22 @@ export class HexSphereRenderer {
       gl.disable(gl.DEPTH_TEST)
       gl.enable(gl.BLEND)
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
-      gl.drawArrays(gl.LINES, 0, this.lineCount)
+      if (this.layer !== 6) {
+        gl.uniform4f(lu('uColor'), 0.27, 0.36, 0.29, 0.22)
+        gl.drawArrays(gl.LINES, 0, this.lineCount)
+      } else {
+        const colors = [
+          [0.65, 0.22, 0.16, 1],
+          [0.1, 0.44, 0.55, 1],
+          [0.55, 0.4, 0.65, 1],
+          [0.15, 0.23, 0.2, 1],
+        ]
+        this.diagnostics.forEach((group, index) => {
+          gl.bindVertexArray(group.vao)
+          gl.uniform4fv(lu('uColor'), colors[index] || colors[3])
+          gl.drawArrays(gl.LINES, 0, group.count)
+        })
+      }
       gl.disable(gl.BLEND)
       gl.enable(gl.DEPTH_TEST)
     }

@@ -225,6 +225,10 @@ pub struct GenerationParams {
     pub continent_scale: f64,
     pub continent_count: u32,
     pub coast_complexity: f64,
+    /// Duration of the kinematic reconstruction, in million years.
+    pub tectonic_age_myr: f64,
+    /// Fraction of initial plate seeds reserved for smaller boundary plates.
+    pub minor_plate_fraction: f64,
     pub landscape: LandscapeKind,
     pub base_elevation_m: f64,
     pub terrain_relief_m: f64,
@@ -303,6 +307,8 @@ impl Default for GenerationParams {
             continent_scale: 1.,
             continent_count: 4,
             coast_complexity: 0.35,
+            tectonic_age_myr: 80.,
+            minor_plate_fraction: 0.55,
             landscape: LandscapeKind::Hills,
             base_elevation_m: 500.,
             terrain_relief_m: 600.,
@@ -424,6 +430,8 @@ impl GenerationParams {
             ("生态丰度", self.biome_diversity, 0.3, 2.),
             ("大陆尺度", self.continent_scale, 0.3, 3.),
             ("海岸复杂度", self.coast_complexity, 0., 1.),
+            ("构造演化时间", self.tectonic_age_myr, 0., 250.),
+            ("小板块比例", self.minor_plate_fraction, 0.2, 0.8),
             ("局部基准海拔", self.base_elevation_m, -1000., 8000.),
             ("局部起伏", self.terrain_relief_m, 0., 6000.),
             ("局部基准温度", self.regional_temperature_c, -60., 50.),
@@ -443,6 +451,23 @@ impl GenerationParams {
         ] {
             if !value.is_finite() || !(min..=max).contains(&value) {
                 return Err(format!("{name} 超出范围 {min}～{max}"));
+            }
+        }
+        if !self.is_local() && self.world_shape == WorldShape::Plane && self.tectonic_age_myr > 0. {
+            if self.map_width_m.min(self.map_height_m) < 500_000. {
+                return Err("板块演化需要至少 500 km 的范围；较小地图请选择区域或地点".into());
+            }
+            let cols = (self.map_width_m / 80000.).round().clamp(16., 160.);
+            let spacing = self.map_width_m / cols;
+            let steps = self.tectonic_age_myr
+                * 3.
+                * 75000.
+                * self.tectonic_activity
+                * self.spreading_rate.max(1.)
+                / spacing
+                / 0.32;
+            if steps > 3500. {
+                return Err("范围与演化时长需要过多构造步骤；请扩大范围或缩短演化时间".into());
             }
         }
         Ok(())
@@ -497,6 +522,22 @@ mod tests {
         let mut p = GenerationParams::default();
         p.planet.radius_m = 1.0;
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn tectonic_runtime_budget_rejects_tiny_or_excessively_long_plane_runs() {
+        let mut p = GenerationParams::for_level(LevelKind::Continent);
+        p.map_width_m = 4.;
+        p.map_height_m = 4.;
+        assert!(p.validate().is_err());
+        p.map_width_m = 500000.;
+        p.map_height_m = 500000.;
+        p.tectonic_age_myr = 250.;
+        p.tectonic_activity = 2.;
+        assert!(p.validate().is_err());
+        assert!(GenerationParams::for_level(LevelKind::Site)
+            .validate()
+            .is_ok());
     }
 
     #[test]

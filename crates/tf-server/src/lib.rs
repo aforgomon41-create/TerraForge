@@ -2,6 +2,7 @@
 pub mod api;
 pub mod auth;
 pub mod child_gen;
+pub mod climatology;
 pub mod config;
 pub mod generate;
 pub mod jobs;
@@ -9,6 +10,7 @@ mod project;
 pub mod render;
 pub mod store;
 mod surface;
+pub mod tectonics;
 
 use api::AppState;
 use axum::Router;

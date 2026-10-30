@@ -58,6 +58,8 @@ pub fn local_terrain<G: GridOps>(
         centers: vec![],
         partition_scale: size,
         partition_seed: params.seed,
+        partition_weights: vec![],
+        history: Default::default(),
     }
 }
 pub fn local_climate<G: GridOps>(
@@ -72,7 +74,9 @@ pub fn local_climate<G: GridOps>(
             - (fields.elevation[i] as f64 - params.base_elevation_m) * 0.0065)
             .clamp(-100., 90.) as f32;
     }
-    if !crate::climate_transport::solve(grid, fields, &params.planet, climate, cancel) {
+    let mut local = climate.clone();
+    local.prescribed_temperature = true;
+    if !crate::climate_transport::solve(grid, fields, &params.planet, &local, cancel) {
         return false;
     }
     let area = (0..grid.cell_count()).map(|i| grid.area_m2(i)).sum::<f64>();
@@ -87,6 +91,22 @@ pub fn local_climate<G: GridOps>(
         } else {
             params.regional_precipitation_mm as f32
         };
+    }
+    let scale = if mean > 1e-8 {
+        params.regional_precipitation_mm / mean
+    } else {
+        0.
+    };
+    if let Some(atlas) = &mut fields.climate {
+        for month in &mut atlas.precipitation_mm {
+            for p in month {
+                *p = (*p as f64 * scale) as f32;
+            }
+        }
+        atlas.water.prescribed_output_scale = Some(scale);
+    }
+    for i in 0..fields.len() {
+        fields.aridity[i] = fields.precipitation[i] / fields.potential_evaporation[i].max(1.);
     }
     !cancel()
 }

@@ -16,11 +16,14 @@ pub mod climate;
 pub mod downscale;
 pub mod ecology;
 pub mod erosion;
+pub mod evolution;
 pub mod fields;
 pub mod landforms;
 pub mod pipeline;
 pub mod plates;
+pub mod scientific;
 pub mod scopes;
+pub mod seasonal;
 
 pub use fields::{BoundaryCell, BoundaryKind, BoundarySubtype, Plate, WorldFields};
 pub use pipeline::{

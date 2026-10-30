@@ -28,7 +28,7 @@ pub struct ConvectionCell {
 }
 
 /// 板块构造的中间结果。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TectonicState {
     pub plates: Vec<Plate>,
     pub convection: Vec<ConvectionCell>,
@@ -36,6 +36,8 @@ pub struct TectonicState {
     pub centers: Vec<DVec3>,
     pub partition_scale: f64,
     pub partition_seed: u64,
+    pub partition_weights: Vec<f64>,
+    pub history: crate::evolution::History,
 }
 
 /// 生成对流胞。
@@ -96,11 +98,43 @@ pub fn build_plates<G: GridOps>(
     let n = grid.cell_count();
     let plate_count = params.plate_count as usize;
 
-    let seeds: Vec<UnitVec3> = tf_core::geo::fibonacci_sphere(plate_count)
-        .into_iter()
-        .map(|c| {
-            let bearing = rng.range_f64(0.0, std::f64::consts::TAU);
-            c.offset(bearing, rng.range_f64(0.0, 0.25))
+    let major_count = ((plate_count as f64 * (1. - params.minor_plate_fraction)).round() as usize)
+        .clamp(3, plate_count);
+    let mut seeds: Vec<UnitVec3> = Vec::with_capacity(plate_count);
+    for k in 0..plate_count {
+        let center = if k < major_count {
+            let candidates: Vec<_> = (0..24).map(|_| rng.unit_sphere()).collect();
+            *candidates
+                .iter()
+                .max_by(|a, b| {
+                    let clearance = |p: &UnitVec3| {
+                        seeds
+                            .iter()
+                            .map(|q| p.angle_to(q))
+                            .fold(f64::INFINITY, f64::min)
+                    };
+                    clearance(a).total_cmp(&clearance(b))
+                })
+                .unwrap()
+        } else {
+            let a = (k - major_count) % major_count;
+            let b = (a + 1 + rng.below((major_count - 1) as u32) as usize) % major_count;
+            UnitVec3::from_vec(seeds[a].as_vec() + seeds[b].as_vec())
+                .unwrap_or(seeds[a])
+                .offset(
+                    rng.range_f64(0., std::f64::consts::TAU),
+                    rng.range_f64(0.03, 0.20),
+                )
+        };
+        seeds.push(center);
+    }
+    let partition_weights: Vec<f64> = (0..plate_count)
+        .map(|i| {
+            if i < major_count {
+                rng.range_f64(0.8, 1.3)
+            } else {
+                rng.range_f64(0.18, 0.42)
+            }
         })
         .collect();
 
@@ -111,16 +145,40 @@ pub fn build_plates<G: GridOps>(
         None
     }
     .map(|(w, h)| {
-        let span = w.max(h).max(3_000_000.);
-        (0..plate_count)
-            .map(|_| {
-                DVec3::new(
-                    rng.range_f64(-0.7, 0.7) * span,
-                    rng.range_f64(-0.7, 0.7) * span,
-                    0.,
-                )
-            })
-            .collect::<Vec<_>>()
+        let mut positions: Vec<DVec3> = Vec::new();
+        for k in 0..plate_count {
+            let point = if k < major_count {
+                (0..24)
+                    .map(|_| {
+                        DVec3::new(
+                            rng.range_f64(-0.46, 0.46) * w,
+                            rng.range_f64(-0.46, 0.46) * h,
+                            0.,
+                        )
+                    })
+                    .max_by(|a, b| {
+                        let clearance = |p: DVec3| {
+                            positions
+                                .iter()
+                                .map(|q| (p - *q).length_squared())
+                                .fold(f64::INFINITY, f64::min)
+                        };
+                        clearance(*a).total_cmp(&clearance(*b))
+                    })
+                    .unwrap()
+            } else {
+                let a = (k - major_count) % major_count;
+                let b = (a + 1 + rng.below((major_count - 1) as u32) as usize) % major_count;
+                (positions[a] + positions[b]) * 0.5
+                    + DVec3::new(
+                        rng.range_f64(-0.06, 0.06) * w,
+                        rng.range_f64(-0.06, 0.06) * h,
+                        0.,
+                    )
+            };
+            positions.push(point);
+        }
+        positions
     });
     let planar_velocities = planar_seeds.as_ref().map(|_| {
         (0..plate_count)
@@ -145,7 +203,7 @@ pub fn build_plates<G: GridOps>(
             if let Some(seeds) = &planar_seeds {
                 let p = grid.field_position(i);
                 let (w, h) = grid.extent_m().unwrap();
-                let scale = w.max(h).max(3_000_000.);
+                let scale = w.max(h);
                 let warp = DVec3::new(
                     warp_noise.sample(p.x / scale * 4., p.y / scale * 4., 17.),
                     warp_noise.sample(p.x / scale * 4., p.y / scale * 4., 37.),
@@ -155,10 +213,12 @@ pub fn build_plates<G: GridOps>(
                 return seeds
                     .iter()
                     .enumerate()
-                    .min_by(|(_, a), (_, b)| {
-                        (p + warp - **a)
-                            .length_squared()
-                            .total_cmp(&(p + warp - **b).length_squared())
+                    .min_by(|(ai, a), (bi, b)| {
+                        ((p + warp - **a).length_squared() / partition_weights[*ai].powi(2))
+                            .total_cmp(
+                                &((p + warp - **b).length_squared()
+                                    / partition_weights[*bi].powi(2)),
+                            )
                     })
                     .unwrap()
                     .0 as u16;
@@ -170,7 +230,7 @@ pub fn build_plates<G: GridOps>(
             let mut best = 0usize;
             let mut best_score = f64::NEG_INFINITY;
             for (k, s) in seeds.iter().enumerate() {
-                let mut score = cv.dot(s.as_vec());
+                let mut score = (cv.dot(s.as_vec()) - 1.) / partition_weights[k].powi(2);
                 // 对每个种子用不同相位的噪声，扰动它的「势力范围」
                 let phase = k as f64 * 1.7;
                 score += warp * ((cv.x + phase).sin() + (cv.y - phase).cos()) * 0.5;
@@ -223,7 +283,7 @@ pub fn build_plates<G: GridOps>(
                 // 5 cm/year = 50 km/Myr; omega = v/R is about 0.0078 rad/Myr.
                 omega: (if oceanic { 1.2 } else { 0.7 })
                     * params.tectonic_activity
-                    * (0.4 + strength)
+                    * (0.4 + strength).clamp(0.5, 1.6)
                     * 7.8e-3,
                 oceanic,
             }
@@ -243,6 +303,8 @@ pub fn build_plates<G: GridOps>(
             centers,
             partition_scale,
             partition_seed: params.seed ^ 0xB0A7D,
+            partition_weights,
+            history: Default::default(),
         },
         plate_id,
     )
@@ -278,48 +340,45 @@ fn plate_velocity(plate: &Plate, p: DVec3) -> DVec3 {
 
 fn partition_normal<G: GridOps>(
     grid: &G,
-    state: &TectonicState,
-    noise: &tf_core::noise::SimplexNoise,
+    ids: &[u16],
     i: usize,
     j: usize,
     a: usize,
     b: usize,
 ) -> DVec3 {
-    let planar = state.planar_velocities.is_some();
     let midpoint = (grid.field_position(i) + grid.field_position(j)) * 0.5;
-    let (east, north) = if planar {
-        (DVec3::X, DVec3::Y)
-    } else {
-        UnitVec3::from_normalized(midpoint.normalize()).tangent_frame()
-    };
-    let score = |point: DVec3, k: usize| {
-        if planar {
-            let scale = state.partition_scale;
-            let warp = DVec3::new(
-                noise.sample(point.x / scale * 4., point.y / scale * 4., 17.),
-                noise.sample(point.x / scale * 4., point.y / scale * 4., 37.),
-                0.,
-            ) * scale
-                * 0.08;
-            -(point + warp - state.centers[k]).length_squared() / (scale * scale)
-        } else {
-            let p = point.normalize();
-            let phase = k as f64 * 1.7;
-            let warp = noise.fbm(p.x * 3.5, p.y * 3.5, p.z * 3.5, 3, 2., 0.5) * 0.18;
-            p.dot(state.centers[k].normalize())
-                + warp * ((p.x + phase).sin() + (p.y - phase).cos()) * 0.5
+    let scale = grid.distance_m(i, j).max(1.);
+    let mut cells = vec![i, j];
+    for root in [i, j] {
+        for &nb in grid.neighbors(root) {
+            cells.push(nb as usize);
+            cells.extend(grid.neighbors(nb as usize).iter().map(|&x| x as usize));
         }
-    };
-    let difference = |p| score(p, b) - score(p, a);
-    let epsilon = 100.;
-    let ex = difference(midpoint + east * epsilon) - difference(midpoint - east * epsilon);
-    let ny = difference(midpoint + north * epsilon) - difference(midpoint - north * epsilon);
-    let gradient = east * ex + north * ny;
-    if gradient.length_squared() > 1e-24 {
-        gradient.normalize()
-    } else {
-        (grid.field_position(j) - grid.field_position(i)).normalize()
     }
+    cells.sort_unstable();
+    cells.dedup();
+    let mut pa = DVec3::ZERO;
+    let mut pb = DVec3::ZERO;
+    let mut wa = 0.;
+    let mut wb = 0.;
+    for cell in cells {
+        let p = grid.field_position(cell);
+        let w = 1. / ((p - midpoint).length_squared() + scale * scale);
+        if ids[cell] as usize == a {
+            pa += p * w;
+            wa += w;
+        }
+        if ids[cell] as usize == b {
+            pb += p * w;
+            wb += w;
+        }
+    }
+    let mut normal = pb / wb.max(1e-30) - pa / wa.max(1e-30);
+    if !grid.field_is_planar() {
+        let radial = midpoint.normalize();
+        normal -= radial * normal.dot(radial);
+    }
+    normal.normalize_or_zero()
 }
 
 /// 识别板块边界并分类。
@@ -330,7 +389,6 @@ pub fn find_boundaries<G: GridOps>(
     fields: &WorldFields,
 ) -> Vec<BoundaryCell> {
     let mut result = Vec::new();
-    let warp_noise = tf_core::noise::SimplexNoise::new(state.partition_seed);
     for i in 0..grid.cell_count() {
         for &nb in grid.neighbors(i) {
             let j = nb as usize;
@@ -345,8 +403,7 @@ pub fn find_boundaries<G: GridOps>(
             let (p, q) = (grid.center_dir(i).as_vec(), grid.center_dir(j).as_vec());
             let normal = partition_normal(
                 grid,
-                state,
-                &warp_noise,
+                plate_id,
                 i,
                 j,
                 plate_id[i] as usize,
@@ -577,6 +634,27 @@ pub fn apply_seafloor_age<G: GridOps>(
 mod continuity_tests {
     use super::*;
     #[test]
+    fn initial_partition_has_major_and_minor_plate_area_scales() {
+        let g = tf_grid::SphereHexGrid::build(32, 6371000., (DVec3::Z, 0.));
+        let p = GenerationParams::default();
+        let (_, ids) = build_plates(&g, &p, &mut DeterministicRng::derive(p.seed, "tectonics"));
+        let mut areas = vec![0.; p.plate_count as usize];
+        for (i, id) in ids.iter().enumerate() {
+            areas[*id as usize] += g.area_m2(i);
+        }
+        let majors = ((p.plate_count as f64 * (1. - p.minor_plate_fraction)).round() as usize)
+            .clamp(3, p.plate_count as usize);
+        let mut large = areas[..majors].to_vec();
+        let mut small = areas[majors..].to_vec();
+        large.sort_by(f64::total_cmp);
+        small.sort_by(f64::total_cmp);
+        assert!(
+            large[large.len() / 2] > small[small.len() / 2] * 4.,
+            "areas {areas:?}"
+        );
+        assert!(small.iter().filter(|&&a| a > 0.).count() >= small.len() / 2);
+    }
+    #[test]
     fn shortening_response_is_continuous_through_mixed_crust() {
         let g = tf_grid::FlatGrid::new(32, 24, 3_200_000., 30., 0., 6371000.);
         let params = GenerationParams {
@@ -619,6 +697,7 @@ mod continuity_tests {
             centers: vec![],
             partition_scale: 1.,
             partition_seed: 0,
+            ..Default::default()
         };
         apply_seafloor_age(&g, &mut f, &state, &[], 1.);
         assert!((f.elevation[0] - f.elevation[1]).abs() < 5.);

@@ -1,5 +1,7 @@
-//! Annual-mean climate approximation. All rainfall values are millimetres/year.
+//! Seasonal reference-column energy balance and conservative atmospheric water transport.
+//! Fine-map temperature and rainfall remain annual aggregates for compatibility.
 use crate::fields::WorldFields;
+#[cfg(test)]
 use rayon::prelude::*;
 use tf_core::params::PlanetParams;
 use tf_grid::GridOps;
@@ -12,6 +14,8 @@ pub struct ClimateParams {
     pub wind_speed_m_s: f64,
     pub orographic_strength: f64,
     pub moisture_recycling: f64,
+    /// Standalone local maps prescribe their mean climate instead of predicting it.
+    pub prescribed_temperature: bool,
 }
 impl Default for ClimateParams {
     fn default() -> Self {
@@ -22,6 +26,7 @@ impl Default for ClimateParams {
             wind_speed_m_s: 10.,
             orographic_strength: 1.,
             moisture_recycling: 0.35,
+            prescribed_temperature: false,
         }
     }
 }
@@ -43,14 +48,10 @@ pub fn run_climate_cancellable<G: GridOps>(
     if cancel() {
         return false;
     }
-    compute_temperature(grid, fields, planet, params);
-    apply_ocean_currents(grid, fields);
-    if cancel() {
-        return false;
-    }
     compute_precipitation(grid, fields, planet, params, cancel)
 }
 // Daily mean insolation, averaged over equally spaced orbital seasons.
+#[cfg(test)]
 fn annual_insolation(latitude: f64, tilt: f64) -> f64 {
     (0..24)
         .map(|season| {
@@ -65,6 +66,7 @@ fn annual_insolation(latitude: f64, tilt: f64) -> f64 {
         .sum::<f64>()
         / 24.
 }
+#[cfg(test)]
 fn compute_temperature<G: GridOps>(
     grid: &G,
     fields: &mut WorldFields,
@@ -100,20 +102,6 @@ fn compute_precipitation<G: GridOps>(
 ) -> bool {
     crate::climate_transport::solve(grid, fields, planet, params, cancel)
 }
-fn apply_ocean_currents<G: GridOps>(grid: &G, fields: &mut WorldFields) {
-    // Symmetric equator-to-midlatitude transport; kept in the final temperature.
-    fields
-        .temperature
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(i, t)| {
-            if fields.elevation[i] > 0. {
-                return;
-            }
-            let x = (grid.latitude_deg(i).abs() / 90.) as f32;
-            *t += (1. - ((x - 0.5) / 0.35).abs()).max(0.) * 4. - (1. - x) * 1.2;
-        });
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,24 +127,33 @@ mod tests {
         assert!((max - min) / min < 0.05, "{min}..{max}");
     }
     #[test]
-    fn ocean_current_correction_is_retained() {
+    fn physical_energy_balance_replaces_the_old_latitude_temperature_offset() {
         let g = PatchGrid::new(&SphericalPatch::new(45., 0., 1000., 4));
-        let mut f = WorldFields::with_capacity(16);
-        f.elevation.fill(-1000.);
-        compute_temperature(
-            &g,
-            &mut f,
-            &PlanetParams::default(),
-            &ClimateParams::default(),
-        );
-        let baseline = f.temperature[5];
+        let mut a = WorldFields::with_capacity(16);
+        a.elevation.fill(-1000.);
+        a.temperature.fill(-80.);
+        let mut b = a.clone();
+        b.temperature.fill(80.);
         run_climate(
             &g,
-            &mut f,
+            &mut a,
             &PlanetParams::default(),
             &ClimateParams::default(),
         );
-        assert!(f.temperature[5] > baseline + 3.);
+        run_climate(
+            &g,
+            &mut b,
+            &PlanetParams::default(),
+            &ClimateParams::default(),
+        );
+        assert!(a
+            .temperature
+            .iter()
+            .zip(&b.temperature)
+            .all(|(x, y)| (x - y).abs() < 0.001));
+        let atlas = a.climate.as_ref().unwrap();
+        atlas.validate().unwrap();
+        assert!(atlas.energy.residual_w_m2 < 0.01);
     }
     #[test]
     fn annual_insolation_respects_tilt() {
@@ -184,7 +181,6 @@ mod tests {
             ..Default::default()
         };
         compute_temperature(&g, &mut f, &PlanetParams::default(), &params);
-        apply_ocean_currents(&g, &mut f);
         crate::climate_transport::solve_at_resolution(
             &g,
             &mut f,
@@ -218,10 +214,14 @@ mod tests {
         let a = mountain_cross_section(192, 75_000.);
         let b = mountain_cross_section(192, 37_500.);
         let c = mountain_cross_section(192, 18_750.);
-        let ab = (a.0 / a.1 / (b.0 / b.1) - 1.).abs();
-        let bc = (b.0 / b.1 / (c.0 / c.1) - 1.).abs();
+        // Symmetric relative error treats both numerical resolutions equally.
+        let drift = |x: f64, y: f64| 2. * (x - y).abs() / (x.abs() + y.abs());
+        let ab = drift(a.0 / a.1, b.0 / b.1);
+        let bc = drift(b.0 / b.1, c.0 / c.1);
         assert!(
-            bc < ab && bc < 0.15,
+            // The seasonal/thermal-wind solver must reduce this sensitive
+            // rain-shadow ratio error by at least half per refinement.
+            bc < ab * 0.5 && bc < 0.20,
             "coarse {a:?}, medium {b:?}, fine {c:?}; drift {ab} -> {bc}"
         );
         assert!(

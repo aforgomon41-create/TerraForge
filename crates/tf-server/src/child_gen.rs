@@ -89,6 +89,7 @@ pub fn run_child_generation(
     tf_sim::downscale::blend_with_parent(&patch, &mut fields.elevation, &sample, &weights, true);
     fields.temperature = sample.temperature.clone();
     fields.precipitation = sample.precipitation.clone();
+    fields.climate = crate::climatology::for_map(store, &parent)?;
     let progress = |stage: &str, p: f64| {
         let _ = store.update_progress(job_id, stage, p);
         let _ = tx.send(JobEvent::Progress {
@@ -124,6 +125,31 @@ pub fn run_child_generation(
     }
     tf_sim::erosion::refresh_hydrology(&patch, &mut fields);
     tf_sim::erosion::compute_distance_to_sea(&patch, &mut fields);
+    if let Some(atlas) = &fields.climate {
+        let climate_grid = atlas.grid.build();
+        for i in 0..patch.cell_count() {
+            let (_, _, pet) = atlas.sample(
+                &climate_grid,
+                patch.center_dir(i),
+                fields.temperature[i],
+                fields.precipitation[i],
+            );
+            fields.potential_evaporation[i] = pet.iter().sum();
+            fields.aridity[i] = fields.precipitation[i] / fields.potential_evaporation[i].max(1.);
+        }
+    } else {
+        // Annual-only legacy roots have no seasonal observations. Keep this
+        // explicit constant-temperature PET fallback instead of saving false zeros.
+        for i in 0..patch.cell_count() {
+            let pet = tf_sim::scientific::monthly_pet(
+                &[fields.temperature[i]; 12],
+                patch.latitude_deg(i).to_radians(),
+                params.planet.axial_tilt_deg.to_radians(),
+            );
+            fields.potential_evaporation[i] = pet.iter().sum();
+            fields.aridity[i] = fields.precipitation[i] / fields.potential_evaporation[i].max(1.);
+        }
+    }
     let ecology =
         tf_sim::ecology::run_ecology_with_diversity(&patch, &fields, params.biome_diversity);
     progress("气候与生态", 0.9);
@@ -138,6 +164,8 @@ pub fn run_child_generation(
         Channel::CrustType,
         Channel::CrustAge,
         Channel::PlateId,
+        Channel::CrustalStrain,
+        Channel::OrogenAge,
     ] {
         if let Some(values) = store.get_field(&parent.id, channel)? {
             let data = if channel == Channel::PlateId {
@@ -183,11 +211,13 @@ pub fn run_child_generation(
         (Channel::Biome, &biome),
         (Channel::Soil, &soil),
         (Channel::SoilDepth, &ecology.soil_depth_m),
+        (Channel::PotentialEvaporation, &fields.potential_evaporation),
+        (Channel::Aridity, &fields.aridity),
     ];
     for (channel, data) in &inherited {
         channels.push((*channel, data.as_slice()));
     }
-    store.publish_fields(&node.id,&channels,&serde_json::json!({"generator_version":"tf-0.3","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates")}))?;
+    store.publish_fields(&node.id,&channels,&serde_json::json!({"generator_version":"tf-0.4","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")}))?;
     progress("完成", 1.);
     Ok(())
 }

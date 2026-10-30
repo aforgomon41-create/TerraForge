@@ -4074,6 +4074,7 @@ dependencies = [
  "rand_chacha",
  "rayon",
  "serde",
+ "serde_json",
  "tf-core",
  "tf-grid",
  "thiserror 2.0.21",

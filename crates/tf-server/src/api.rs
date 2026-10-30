@@ -64,6 +64,11 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::surface::get_overlay),
         )
         .route("/api/v1/maps/{id}/metadata", get(get_metadata))
+        .route("/api/v1/maps/{id}/climate", get(get_monthly_climate))
+        .route(
+            "/api/v1/maps/{id}/tectonics",
+            get(crate::tectonics::get_tectonics),
+        )
         .route("/api/v1/maps/{id}/sample", get(sample_map))
         .route("/api/v1/maps/{id}/children", post(generate_child))
         .route("/api/v1/maps/{id}/export.json", get(export_json))
@@ -430,7 +435,7 @@ async fn generate_world(
         created_at: now_millis() as i64,
         completed_at: None,
         seed: params.seed,
-        generator_version: "tf-0.3".into(),
+        generator_version: "tf-0.4".into(),
     };
 
     let job_id = st
@@ -915,7 +920,7 @@ async fn generate_child(
         completed_at: None,
         grid: Some(grid),
         seed: params.seed,
-        generator_version: "tf-0.3".into(),
+        generator_version: "tf-0.4".into(),
     };
     let job_id = st
         .jobs
@@ -950,6 +955,9 @@ async fn get_metadata(
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut metadata = st.store.get_metadata(&id)?.unwrap_or_default();
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove("climate_atlas");
+    }
     if let Some(cell) = query.get("cell") {
         let cell = cell
             .parse::<u64>()
@@ -959,6 +967,41 @@ async fn get_metadata(
         }
     }
     Ok(Json(metadata))
+}
+
+async fn get_monthly_climate(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use tf_grid::GridOps;
+    let node = st
+        .store
+        .get_map_node(&id)?
+        .ok_or_else(|| ApiError::not_found("地图不存在"))?;
+    let cell = query
+        .get("cell")
+        .and_then(|x| x.parse::<usize>().ok())
+        .ok_or_else(|| ApiError::bad_request("请指定格子编号"))?;
+    if cell >= node.cells as usize {
+        return Err(ApiError::bad_request("格子编号超出范围"));
+    }
+    let permit = st
+        .exports
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::busy("气候资料读取繁忙"))?;
+    let result=tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+        let _permit=permit;
+        let Some(atlas)=crate::climatology::for_map(&st.store,&node)? else { return Ok(serde_json::json!({"available":false,"reason":"旧工程没有月气候资料"})); };
+        let descriptor=node.grid.as_ref().ok_or_else(||anyhow::anyhow!("缺少网格"))?;
+        let grid=descriptor.build(); let climate_grid=atlas.grid.build();
+        let t=st.store.get_field(&id,Channel::Temperature)?.ok_or_else(||anyhow::anyhow!("缺少年均温"))?;
+        let p=st.store.get_field(&id,Channel::Precipitation)?.ok_or_else(||anyhow::anyhow!("缺少年降水"))?;
+        let (temperature,rain,pet)=atlas.sample(&climate_grid,grid.center_dir(cell),t[cell],p[cell]);
+        Ok(serde_json::json!({"available":true,"cell":cell,"model":atlas.model,"temperature_c":temperature,"precipitation_mm":rain,"potential_evaporation_mm":pet,"months":"January through December, equal-duration model months","pet_method":"Thornthwaite approximation","energy":atlas.energy,"water":atlas.water}))
+    }).await??;
+    Ok(Json(result))
 }
 async fn export_json(
     State(st): State<AppState>,

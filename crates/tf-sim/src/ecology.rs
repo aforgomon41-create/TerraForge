@@ -105,6 +105,7 @@ pub fn run_ecology_with_diversity<G: GridOps>(
     let mut biome = vec![0u8; n];
     let mut soil = vec![0u8; n];
     let mut soil_depth = vec![0.0f32; n];
+    let climate_grid = fields.climate.as_ref().map(|c| c.grid.build());
 
     // 生物群系：温度 x 降水 -> Whittaker 图
     //
@@ -131,7 +132,17 @@ pub fn run_ecology_with_diversity<G: GridOps>(
         let t = fields.temperature[i] + mix * 1.8;
         let prec = (fields.precipitation[i] * (1.0 + mix * 0.22)).max(0.0);
 
-        *b = classify_biome(t, prec, fields.elevation[i]) as u8;
+        *b = if let (Some(atlas), Some(climate_grid)) = (&fields.climate, &climate_grid) {
+            let (temperature, rain, pet) = atlas.sample(climate_grid, grid.center_dir(i), t, prec);
+            classify_seasonal(&temperature, &rain, &pet, fields.elevation[i]) as u8
+        } else {
+            // Legacy engineering files have no monthly state; retain their explicit
+            // annual-only fallback rather than inventing an observed wet season.
+            classify_biome(t, prec, fields.elevation[i]) as u8
+        };
+        if fields.lake_depth[i] > 0.01 && fields.elevation[i] > 0. && fields.temperature[i] > 0. {
+            *b = Biome::Wetland as u8;
+        }
     });
 
     // 土壤：Jenny 方程的简化实现
@@ -228,6 +239,119 @@ pub fn classify_biome(temp_c: f32, precip_mm: f32, elevation: f32) -> Biome {
         } else {
             Biome::Desert
         }
+    }
+}
+
+/// Biome heuristic based on seasonal water availability, not a target desert area.
+/// P/PET follows the aridity-index convention; climate classes and vegetation
+/// are not claimed to be an exact Köppen–Geiger implementation.
+pub fn classify_seasonal(
+    temperature: &[f32; 12],
+    precipitation: &[f32; 12],
+    pet: &[f32; 12],
+    elevation: f32,
+) -> Biome {
+    let warm = temperature
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let cold = temperature.iter().copied().fold(f32::INFINITY, f32::min);
+    let mean = temperature.iter().sum::<f32>() / 12.;
+    if warm < 0. {
+        return Biome::IceSheet;
+    }
+    if warm < 10. {
+        return if elevation > 4000. {
+            Biome::AlpineMeadow
+        } else {
+            Biome::Tundra
+        };
+    }
+    let annual_rain = precipitation.iter().sum::<f32>();
+    let annual_pet = pet.iter().sum::<f32>().max(1.);
+    let aridity = annual_rain / annual_pet;
+    if aridity < 0.20 {
+        return Biome::Desert;
+    }
+    if aridity < 0.50 {
+        return if cold >= 18. {
+            Biome::Savanna
+        } else {
+            Biome::TemperateGrassland
+        };
+    }
+    let growing = temperature.iter().filter(|&&t| t >= 5.).count();
+    if cold >= 18. {
+        let dry = precipitation.iter().copied().fold(f32::INFINITY, f32::min);
+        if dry >= 60. && annual_rain > 1500. {
+            return Biome::TropicalRainforest;
+        }
+        let droughts = precipitation
+            .iter()
+            .zip(pet)
+            .filter(|(p, e)| **p < **e * 0.5)
+            .count();
+        return if droughts >= 4 {
+            Biome::Savanna
+        } else {
+            Biome::TropicalSeasonalForest
+        };
+    }
+    if cold < -3. && growing < 7 {
+        return Biome::BorealForest;
+    }
+    let mut months: Vec<_> = (0..12).collect();
+    months.sort_by(|&a, &b| temperature[b].total_cmp(&temperature[a]));
+    let summer = months
+        .iter()
+        .take(6)
+        .map(|&m| precipitation[m])
+        .sum::<f32>();
+    let winter = months
+        .iter()
+        .skip(6)
+        .map(|&m| precipitation[m])
+        .sum::<f32>();
+    let summer_pet = months.iter().take(6).map(|&m| pet[m]).sum::<f32>();
+    if cold > 0. && summer < summer_pet * 0.5 && winter > summer * 1.8 {
+        return Biome::Mediterranean;
+    }
+    if aridity < 0.65 || mean < -2. {
+        Biome::TemperateGrassland
+    } else {
+        Biome::TemperateForest
+    }
+}
+
+#[cfg(test)]
+mod seasonal_tests {
+    use super::*;
+    #[test]
+    fn the_same_rainfall_can_support_cold_grassland_or_hot_desert() {
+        let rain = [20.; 12];
+        assert_ne!(
+            classify_seasonal(&[7.; 12], &rain, &[30.; 12], 100.),
+            Biome::Desert
+        );
+        assert_eq!(
+            classify_seasonal(&[29.; 12], &rain, &[160.; 12], 100.),
+            Biome::Desert
+        );
+    }
+    #[test]
+    fn dry_summers_are_distinct_from_equal_annual_rainfall_with_wet_summers() {
+        let t = [8., 9., 12., 16., 20., 24., 27., 26., 22., 17., 12., 9.];
+        let p = [120., 100., 70., 40., 15., 5., 5., 5., 15., 60., 90., 120.];
+        let e = [
+            20., 25., 40., 65., 90., 120., 145., 130., 90., 60., 35., 20.,
+        ];
+        assert_eq!(classify_seasonal(&t, &p, &e, 100.), Biome::Mediterranean);
+        let mut flipped = p;
+        flipped.rotate_left(6);
+        assert_ne!(
+            classify_seasonal(&t, &flipped, &e, 100.),
+            Biome::Mediterranean
+        );
     }
 }
 

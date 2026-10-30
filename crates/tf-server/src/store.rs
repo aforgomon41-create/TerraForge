@@ -98,10 +98,14 @@ pub enum Channel {
     Soil = 10,
     SoilDepth = 11,
     PlateId = 12,
+    CrustalStrain = 13,
+    OrogenAge = 14,
+    PotentialEvaporation = 15,
+    Aridity = 16,
 }
 
 impl Channel {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 17] = [
         Self::Elevation,
         Self::CrustThickness,
         Self::CrustType,
@@ -115,6 +119,10 @@ impl Channel {
         Self::Soil,
         Self::SoilDepth,
         Self::PlateId,
+        Self::CrustalStrain,
+        Self::OrogenAge,
+        Self::PotentialEvaporation,
+        Self::Aridity,
     ];
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|ch| ch.name() == name)
@@ -134,6 +142,10 @@ impl Channel {
             Channel::Soil => "soil",
             Channel::SoilDepth => "soil_depth",
             Channel::PlateId => "plate_id",
+            Channel::CrustalStrain => "crustal_strain",
+            Channel::OrogenAge => "orogen_age",
+            Channel::PotentialEvaporation => "potential_evaporation",
+            Channel::Aridity => "aridity",
         }
     }
 }

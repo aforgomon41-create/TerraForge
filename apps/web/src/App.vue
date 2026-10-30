@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useWorldStore } from '@/stores/world'
-import { api, type MapNode } from '@/api/client'
+import { api, type MapNode, type TectonicDiagnostic } from '@/api/client'
 import { HexSphereRenderer, MapStyle } from '@/renderer/HexSphereRenderer'
 import { buildSphereGrid } from '@/renderer/sphereGrid'
 import { direction, latLon, patchDirection, patchProject, nearestCell } from '@/renderer/geometry'
@@ -70,7 +70,36 @@ const biomes = [
   '高山草甸',
   '湿地',
 ]
+const tectonics = ref<TectonicDiagnostic | null>(null)
+let tectonicController: AbortController | undefined
+let tectonicCache: { id: string; data: TectonicDiagnostic } | undefined
+const selectedPlate = computed(() => {
+  const cell = selection.value?.cell,
+    data = tectonics.value,
+    grid = store.currentMap?.grid
+  if (cell === undefined || !data?.available || !grid || !store.plateIds) return null
+  const id = Math.round(store.plateIds[cell]),
+    plate = data.plates?.find((p) => p.id === id)
+  if (!plate) return null
+  let v = data.planar_velocities?.[id]
+  if (!v) {
+    const p = direction(selection.value!.lat, selection.value!.lon).map((x) => x * grid.radius_m)
+    const a = plate.euler_pole
+    v = [a[1] * p[2] - a[2] * p[1], a[2] * p[0] - a[0] * p[2], a[0] * p[1] - a[1] * p[0]].map(
+      (x) => x * plate.omega,
+    )
+  }
+  return { id, speed: Math.hypot(...v) * 1e-4 }
+})
 const layers = [
+  {
+    id: 6,
+    name: '板块与运动',
+    icon: '↗',
+    unit: '边界类型 · 运动方向；点击查看速度',
+    ends: ['汇聚', '张裂', '走滑'],
+    gradient: 'linear-gradient(90deg,#a63829,#19708c,#8c66a6)',
+  },
   {
     id: 0,
     name: '地形地图',
@@ -260,6 +289,31 @@ watch(displaySpacingKm, () => {
     void refreshOverlay()
   }, 200)
 })
+async function refreshTectonics() {
+  tectonicController?.abort()
+  const node = store.currentMap
+  if (!node || !renderer) return
+  const controller = new AbortController()
+  tectonicController = controller
+  try {
+    const data =
+      tectonicCache?.id === node.id
+        ? tectonicCache.data
+        : await api.tectonics(node.id, controller.signal)
+    if (controller.signal.aborted || node.id !== store.currentMap?.id) return
+    tectonicCache = { id: node.id, data }
+    tectonics.value = data
+    const scale = node.grid?.type === 'sphere' ? 1 : 2 / (node.grid?.width_m || 2)
+    renderer.setDiagnostics((data.groups || []).map((g) => Float32Array.from(g, (v) => v * scale)))
+  } catch (e) {
+    if (
+      !controller.signal.aborted &&
+      node.id === store.currentMap?.id &&
+      (e as Error).name !== 'AbortError'
+    )
+      tectonics.value = { available: false, reason: (e as Error).message }
+  }
+}
 function applyMap() {
   const node = store.currentMap
   if (!renderer) return
@@ -289,12 +343,16 @@ function applyMap() {
     temperatures: store.temperature || undefined,
     precipitations: store.precipitation || undefined,
     flows: store.flow || undefined,
+    plateIds: store.plateIds || undefined,
     count: node.cells,
   })
   renderer.mapMetres =
     node.grid?.type === 'sphere' ? node.grid.radius_m : (node.grid?.width_m || 2) / 2
   renderer.setOverlay(new Float32Array())
-  void refreshOverlay()
+  renderer.setDiagnostics([])
+  tectonics.value = null
+  if (layer.value === 6) void refreshTectonics()
+  if (layer.value !== 6) void refreshOverlay()
   renderer.heightScale = 0.025 / Math.max(mapStats.value?.max || 1, 1)
   renderer.layer = layer.value
   renderer.style = style.value
@@ -318,6 +376,8 @@ watch(
   },
 )
 watch(layer, (v) => {
+  if (v === 6) void refreshTectonics()
+  else void refreshOverlay()
   if (renderer) renderer.layer = v
 })
 watch(style, (v) => {
@@ -579,6 +639,7 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
+  tectonicController?.abort()
   store.dispose()
   renderer?.dispose()
   interaction?.abort()
@@ -884,6 +945,13 @@ onBeforeUnmount(() => {
             <i v-if="layer === l.id">●</i>
           </button>
         </div>
+        <p v-if="layer === 6" class="layer-help" role="status">
+          {{
+            tectonics?.available
+              ? '箭头等长，仅表示方向；点击地图查看 cm/年。'
+              : tectonics?.reason || '正在读取板块记录…'
+          }}
+        </p>
         <label class="style-select">
           显示网格
           <select
@@ -961,6 +1029,13 @@ onBeforeUnmount(() => {
             <div>
               <dt>生态</dt>
               <dd>{{ selectedFacts.biome }}</dd>
+            </div>
+            <div v-if="selectedPlate && layer === 6">
+              <dt>板块 {{ selectedPlate.id + 1 }}</dt>
+              <dd>
+                {{ selectedPlate.speed.toFixed(2) }}
+                <small>cm/年</small>
+              </dd>
             </div>
           </dl>
           <button v-if="next && !refine" class="primary" :disabled="locked" @click="refine = true">

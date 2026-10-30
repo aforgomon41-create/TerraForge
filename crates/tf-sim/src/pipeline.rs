@@ -11,11 +11,7 @@ use crate::climate::{run_climate_cancellable, ClimateParams};
 use crate::ecology::{find_minerals, run_ecology_with_diversity, EcologyResult, MineralDeposit};
 use crate::erosion::{compute_distance_to_sea, ErosionParams, ErosionState};
 use crate::fields::WorldFields;
-use crate::landforms::{apply_hotspots, generate_hotspots, LandformParams};
-use crate::plates::{
-    apply_airy_isostasy, apply_seafloor_age, build_plates, find_boundaries, init_crust,
-    step_tectonics, TectonicState,
-};
+use crate::plates::{find_boundaries, TectonicState};
 use crate::Stage;
 
 /// 一次生成的完整产物。
@@ -70,10 +66,9 @@ pub fn generate_cancellable<G: GridOps>(
     if cancel() {
         return None;
     }
-    let mut rng = DeterministicRng::derive(params.seed, "tectonics");
     let mut fields = WorldFields::with_capacity(grid.cell_count());
     let mut timings = Vec::new();
-    let mut cumulative = 0.0;
+    let mut cumulative;
 
     let local = params.is_local();
     let tectonic = if local {
@@ -86,80 +81,28 @@ pub fn generate_cancellable<G: GridOps>(
         on_progress(Stage::Landforms, cumulative);
         context
     } else {
-        // ---- 阶段 1：板块构造 ----
-        let t = Instant::now();
-        on_progress(Stage::Tectonics, cumulative);
-        let (mut tectonic, plate_id) = build_plates(grid, params, &mut rng);
-        init_crust(grid, &plate_id, &tectonic, &mut fields, &mut rng, params);
-        for plate in &mut tectonic.plates {
-            let mut total = 0.;
-            let mut continental = 0.;
-            for (i, &id) in plate_id.iter().enumerate() {
-                if id == plate.id {
-                    total += 1.;
-                    continental += fields.crust_type[i] as f64;
-                }
-            }
-            plate.oceanic = continental < total * 0.5;
-        }
-
-        // 板块构造演化：跑若干个百万年的步长，让地壳厚度在边界处增厚/减薄。
-        // 步数由精度档位决定。
-        let tectonic_steps = (8.0 * params.quality.iteration_scale()).round() as u32;
-        for tick in 0..tectonic_steps {
-            if cancel() {
-                return None;
-            }
-            step_tectonics(
-                grid,
-                &tectonic,
-                &mut fields,
-                params,
-                2.0 / tectonic_steps.max(1) as f64,
-            );
-            on_progress(
-                Stage::Tectonics,
-                Stage::Tectonics.weight() * (tick + 1) as f64 / tectonic_steps.max(1) as f64,
-            );
-        }
-
-        // 相对初始平衡地壳的厚度变化产生隆起，保留大陆原有的低地基面。
-        apply_airy_isostasy(grid, &mut fields, params);
-
-        let boundaries = find_boundaries(grid, &plate_id, &tectonic, &fields);
-        cumulative += Stage::Tectonics.weight();
-        timings.push((Stage::Tectonics, t.elapsed().as_millis()));
+        let start = Instant::now();
+        on_progress(Stage::Tectonics, 0.);
+        let tectonic = crate::evolution::generate(
+            grid,
+            params,
+            &mut fields,
+            &mut |p| on_progress(Stage::Tectonics, p * Stage::Tectonics.weight()),
+            cancel,
+        )?;
+        cumulative = Stage::Tectonics.weight();
+        timings.push((Stage::Tectonics, start.elapsed().as_millis()));
         on_frame(Stage::Tectonics, &fields);
-        on_progress(Stage::Tectonics, cumulative);
-
-        // ---- 阶段 2：构造地貌 ----
-        let t = Instant::now();
+        let start = Instant::now();
         on_progress(Stage::Landforms, cumulative);
-        let lf = LandformParams::default();
-        // Apply thermal ocean subsidence before adding ridges, trenches and arcs.
+        crate::evolution::landforms(grid, &mut fields, &tectonic, params);
         if cancel() {
             return None;
         }
-        apply_seafloor_age(
-            grid,
-            &mut fields,
-            &tectonic,
-            &boundaries,
-            params.spreading_rate,
-        );
-        crate::terrain::apply_relief(grid, &mut fields, &boundaries, params);
-        let hotspots = generate_hotspots(
-            params.hotspot_count,
-            &mut DeterministicRng::derive(params.seed, "hotspots"),
-        );
-        apply_hotspots(grid, &mut fields, &hotspots, &lf);
-
-        crate::plates::adjust_sea_level(grid, &mut fields, params.land_fraction);
         cumulative += Stage::Landforms.weight();
-        timings.push((Stage::Landforms, t.elapsed().as_millis()));
+        timings.push((Stage::Landforms, start.elapsed().as_millis()));
         on_frame(Stage::Landforms, &fields);
         on_progress(Stage::Landforms, cumulative);
-
         tectonic
     };
     let boundaries = find_boundaries(grid, &fields.plate_id, &tectonic, &fields);

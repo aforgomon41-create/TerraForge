@@ -324,11 +324,32 @@ pub fn persist_fields(
     let biome: Vec<f32> = world.ecology.biome.iter().map(|&b| b as f32).collect();
     let plate: Vec<f32> = f.plate_id.iter().map(|&v| v as f32).collect();
     let soil: Vec<f32> = world.ecology.soil.iter().map(|&b| b as f32).collect();
-    store.publish_fields(map_id,&[
-        (Channel::Elevation,&f.elevation),(Channel::CrustThickness,&f.crust_thickness),
-        (Channel::CrustType,&f.crust_type),(Channel::CrustAge,&f.crust_age),
-        (Channel::Temperature,&f.temperature),(Channel::Precipitation,&f.precipitation),
-        (Channel::FlowAccumulation,&f.flow_accumulation),(Channel::LakeDepth,&f.lake_depth),
-        (Channel::DistanceToSea,&f.distance_to_sea),(Channel::Biome,&biome),(Channel::Soil,&soil),(Channel::SoilDepth,&world.ecology.soil_depth_m),(Channel::PlateId,&plate)
-    ],&serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"generator_version":"tf-0.3"}))
+    let mut metadata = serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"planar_velocities":world.tectonic.planar_velocities,"motion_domain":if world.tectonic.planar_velocities.is_some() {"plane"} else {"sphere"},"tectonic_history":world.tectonic.history,"generator_version":"tf-0.4"});
+    if let Some(atlas) = &f.climate {
+        metadata["climate_atlas"] = crate::climatology::encode(atlas)?;
+        metadata["climate_model"] = serde_json::json!({"name":atlas.model,"months":12,"cells":atlas.grid.cell_count(),"energy":atlas.energy,"water":atlas.water,"pet":"Thornthwaite temperature/daylength approximation"});
+    }
+    store.publish_fields(
+        map_id,
+        &[
+            (Channel::Elevation, &f.elevation),
+            (Channel::CrustThickness, &f.crust_thickness),
+            (Channel::CrustType, &f.crust_type),
+            (Channel::CrustAge, &f.crust_age),
+            (Channel::Temperature, &f.temperature),
+            (Channel::Precipitation, &f.precipitation),
+            (Channel::FlowAccumulation, &f.flow_accumulation),
+            (Channel::LakeDepth, &f.lake_depth),
+            (Channel::DistanceToSea, &f.distance_to_sea),
+            (Channel::Biome, &biome),
+            (Channel::Soil, &soil),
+            (Channel::SoilDepth, &world.ecology.soil_depth_m),
+            (Channel::PlateId, &plate),
+            (Channel::CrustalStrain, &f.crustal_strain),
+            (Channel::OrogenAge, &f.orogen_age),
+            (Channel::PotentialEvaporation, &f.potential_evaporation),
+            (Channel::Aridity, &f.aridity),
+        ],
+        &metadata,
+    )
 }

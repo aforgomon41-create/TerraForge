@@ -1,5 +1,7 @@
 # 0.3 生成质量重构进度
 
+> 本文为 tf-0.3 阶段的历史记录；当前实现及验证以 [tf-0.4 科学模型记录](scientific-model-implementation.md) 为准。
+
 更新：2026-10-30。开发分支 `codex/generation-fields`；本文件不替代 0.2 的历史发布验收。
 
 ## 当前状态

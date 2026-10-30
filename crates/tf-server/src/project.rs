@@ -77,7 +77,7 @@ pub fn export(store: &Store, world_id: &str) -> anyhow::Result<Vec<u8>> {
     );
     Ok(serde_json::to_vec(&Project {
         format: FORMAT.into(),
-        generator_version: "tf-0.3".into(),
+        generator_version: "tf-0.4".into(),
         world,
         maps,
     })?)
@@ -101,7 +101,10 @@ pub fn import(
     );
     anyhow::ensure!(
         project.format == FORMAT
-            && matches!(project.generator_version.as_str(), "tf-0.2" | "tf-0.3"),
+            && matches!(
+                project.generator_version.as_str(),
+                "tf-0.2" | "tf-0.3" | "tf-0.4"
+            ),
         "不支持的工程版本"
     );
     let limit = if config.desktop { 256 } else { 16 };
@@ -167,7 +170,10 @@ pub fn import(
             "网格与格数不匹配"
         );
         anyhow::ensure!(
-            matches!(node.generator_version.as_str(), "tf-0.2" | "tf-0.3") && node.status == "done",
+            matches!(
+                node.generator_version.as_str(),
+                "tf-0.2" | "tf-0.3" | "tf-0.4"
+            ) && node.status == "done",
             "地图版本或状态无效"
         );
         anyhow::ensure!(node.name.chars().count() <= 80, "地图名称过长");
@@ -253,7 +259,7 @@ pub fn import(
                 _ => anyhow::bail!("父子图的空间形状不一致"),
             }
         }
-        if node.generator_version == "tf-0.3" {
+        if matches!(node.generator_version.as_str(), "tf-0.3" | "tf-0.4") {
             let spacing = match descriptor {
                 tf_grid::GridDescriptor::Plane { width_m, size, .. }
                 | tf_grid::GridDescriptor::Patch { width_m, size, .. } => *width_m / *size as f64,
@@ -308,6 +314,13 @@ pub fn import(
         node.parent = node.parent.map(|p| ids[&p].clone());
         node.world_id = world.id.clone();
         let mut metadata: serde_json::Value = serde_json::from_str(m.metadata.get())?;
+        if let Some(climate) = metadata.get("climate_atlas") {
+            let atlas = crate::climatology::decode(climate)?;
+            anyhow::ensure!(
+                (atlas.grid.radius_m() - params.planet.radius_m).abs() < 0.001,
+                "月气候半径与工程不一致"
+            );
+        }
         if let Some(obj) = metadata.as_object_mut() {
             if let Some(parent) = &node.parent {
                 obj.insert("parent".into(), serde_json::json!(parent));

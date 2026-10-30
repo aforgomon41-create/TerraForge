@@ -24,7 +24,8 @@ export const useWorldStore = defineStore('world', () => {
     biome = shallowRef<Uint8Array | null>(null),
     temperature = shallowRef<Float32Array | null>(null),
     precipitation = shallowRef<Float32Array | null>(null),
-    flow = shallowRef<Float32Array | null>(null)
+    flow = shallowRef<Float32Array | null>(null),
+    plateIds = shallowRef<Float32Array | null>(null)
   const indices = shallowRef<Uint32Array | null>(null)
   let loadController: AbortController | null = null,
     closed = false,
@@ -45,6 +46,7 @@ export const useWorldStore = defineStore('world', () => {
     loadController?.abort()
     currentMap.value = null
     centers.value = elevation.value = temperature.value = precipitation.value = flow.value = null
+    plateIds.value = null
     biome.value = null
     indices.value = null
   }
@@ -95,9 +97,19 @@ export const useWorldStore = defineStore('world', () => {
           api.getField(id, ch, controller.signal),
         ),
       )
-      const f = await api.getField(id, 'flow_accumulation', controller.signal)
+      const [f, ids] = await Promise.all([
+        api.getField(id, 'flow_accumulation', controller.signal),
+        api.getField(id, 'plate_id', controller.signal).catch((e: Error & { status?: number }) => {
+          if (e.status === 404) return null
+          throw e
+        }),
+      ])
       if (controller.signal.aborted) return
-      if (xyz.length !== node.cells * 3 || [e, b, t, p, f].some((a) => a.length !== node.cells))
+      if (
+        xyz.length !== node.cells * 3 ||
+        [e, b, t, p, f].some((a) => a.length !== node.cells) ||
+        (ids && ids.length !== node.cells)
+      )
         throw new Error('地图数据与坐标尺寸不一致')
       centers.value = xyz
       indices.value = surface.indices
@@ -106,6 +118,7 @@ export const useWorldStore = defineStore('world', () => {
       temperature.value = t
       precipitation.value = p
       flow.value = f
+      plateIds.value = ids
       currentMap.value = node
     } catch (e) {
       if ((e as Error).name !== 'AbortError') throw e
@@ -215,6 +228,7 @@ export const useWorldStore = defineStore('world', () => {
     temperature,
     precipitation,
     flow,
+    plateIds,
     init,
     refreshWorlds,
     refreshMaps,

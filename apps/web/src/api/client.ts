@@ -39,6 +39,14 @@ export type GridDescriptor =
       radius_m: number
       version: number
     }
+export interface TectonicDiagnostic {
+  available: boolean
+  reason?: string
+  groups?: number[][]
+  plates?: { id: number; euler_pole: number[]; omega: number }[]
+  planar_velocities?: number[][] | null
+  reference_frame?: string
+}
 export interface Surface {
   centers: Float32Array
   indices: Uint32Array
@@ -192,6 +200,10 @@ export const api = {
     const data = await r.arrayBuffer()
     if (data.byteLength % 24) throw new Error('显示网格长度无效')
     return { lines: new Float32Array(data), spacing: Number(r.headers.get('x-tf-grid-spacing-m')) }
+  },
+  async tectonics(id: string, signal?: AbortSignal): Promise<TectonicDiagnostic> {
+    const response = await geometryRequest(`/maps/${id}/tectonics`, signal)
+    return response.json()
   },
   metadata: (id: string, cell?: number) =>
     request<Record<string, unknown>>(

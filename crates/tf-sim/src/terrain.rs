@@ -75,6 +75,7 @@ fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<
             center = DVec3::ZERO;
         }
         anchors.push(center);
+        let scale = scale * rng.range_f64(0.60, 1.30);
         let bearing = rng.range_f64(0., std::f64::consts::TAU);
         let bend = rng.range_f64(-0.65, 0.65);
         let mut nodes = Vec::new();
@@ -92,7 +93,7 @@ fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<
             };
             nodes.push((
                 p,
-                scale * (1.05 - 0.15 * step.unsigned_abs() as f64) * rng.range_f64(0.85, 1.15),
+                scale * (0.95 - 0.18 * step.unsigned_abs() as f64) * rng.range_f64(0.55, 1.35),
             ));
         }
         for pair in nodes.windows(2) {
@@ -121,6 +122,28 @@ fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<
             ra: root.1 * 0.85,
             rb: scale * 0.45,
         });
+        // Initial continental terranes are not all joined to the same spine.
+        // Their subsequent movement and collision are handled by the crust solver.
+        for _ in 0..3 {
+            let angle = rng.range_f64(0., std::f64::consts::TAU);
+            let distance = scale * rng.range_f64(1.8, 3.5);
+            let a = if planar {
+                center + DVec3::new(angle.sin(), angle.cos(), 0.) * distance
+            } else {
+                UnitVec3::from_vec(center)
+                    .unwrap()
+                    .offset(angle, distance / radius)
+                    .as_vec()
+                    * radius
+            };
+            let r = scale * rng.range_f64(0.13, 0.40);
+            segments.push(CrustSegment {
+                a,
+                b: a,
+                ra: r,
+                rb: r,
+            });
+        }
     }
     segments
 }
@@ -473,7 +496,8 @@ mod tests {
                 let mut f = WorldFields::with_capacity(g.cell_count());
                 init_continents(&g, &mut f, &p);
                 let parts = landmass_shares(&g, &f.elevation);
-                let top = parts.iter().take(3).sum::<f64>();
+                // Four requested continental cores may now remain separate.
+                let top = parts.iter().take(p.continent_count as usize).sum::<f64>();
                 assert!(top > 0.85, "seed {seed}, f{frequency}: {parts:?}");
                 shares.push(parts[0]);
             }
