@@ -9,7 +9,7 @@
 
 use glam::DVec3;
 use rayon::prelude::*;
-use std::collections::HashMap;
+
 use tf_core::geo::UnitVec3;
 use tf_core::params::GenerationParams;
 use tf_core::DeterministicRng;
@@ -32,6 +32,10 @@ pub struct ConvectionCell {
 pub struct TectonicState {
     pub plates: Vec<Plate>,
     pub convection: Vec<ConvectionCell>,
+    pub planar_velocities: Option<Vec<DVec3>>,
+    pub centers: Vec<DVec3>,
+    pub partition_scale: f64,
+    pub partition_seed: u64,
 }
 
 /// 生成对流胞。
@@ -101,6 +105,33 @@ pub fn build_plates<G: GridOps>(
         .collect();
 
     let convection = build_convection_cells(rng, plate_count * 4);
+    let planar_seeds = if grid.field_is_planar() {
+        grid.extent_m()
+    } else {
+        None
+    }
+    .map(|(w, h)| {
+        let span = w.max(h).max(3_000_000.);
+        (0..plate_count)
+            .map(|_| {
+                DVec3::new(
+                    rng.range_f64(-0.7, 0.7) * span,
+                    rng.range_f64(-0.7, 0.7) * span,
+                    0.,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let planar_velocities = planar_seeds.as_ref().map(|_| {
+        (0..plate_count)
+            .map(|_| {
+                let a = rng.range_f64(0., std::f64::consts::TAU);
+                DVec3::new(a.cos(), a.sin(), 0.)
+                    * rng.range_f64(25000., 75000.)
+                    * params.tectonic_activity
+            })
+            .collect::<Vec<_>>()
+    });
 
     // 板块划分：球面 Voronoi。
     //
@@ -111,10 +142,31 @@ pub fn build_plates<G: GridOps>(
     let plate_id: Vec<u16> = (0..n)
         .into_par_iter()
         .map(|i| {
+            if let Some(seeds) = &planar_seeds {
+                let p = grid.field_position(i);
+                let (w, h) = grid.extent_m().unwrap();
+                let scale = w.max(h).max(3_000_000.);
+                let warp = DVec3::new(
+                    warp_noise.sample(p.x / scale * 4., p.y / scale * 4., 17.),
+                    warp_noise.sample(p.x / scale * 4., p.y / scale * 4., 37.),
+                    0.,
+                ) * scale
+                    * 0.08;
+                return seeds
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (p + warp - **a)
+                            .length_squared()
+                            .total_cmp(&(p + warp - **b).length_squared())
+                    })
+                    .unwrap()
+                    .0 as u16;
+            }
             let c = grid.center_dir(i);
             let cv = c.as_vec();
             // 低频噪声扰动：让边界蜿蜒而不是直线
-            let warp = warp_noise.fbm(cv.x * 3.5, cv.y * 3.5, cv.z * 3.5, 3, 2.0, 0.5) * 0.06;
+            let warp = warp_noise.fbm(cv.x * 3.5, cv.y * 3.5, cv.z * 3.5, 3, 2.0, 0.5) * 0.18;
             let mut best = 0usize;
             let mut best_score = f64::NEG_INFINITY;
             for (k, s) in seeds.iter().enumerate() {
@@ -178,7 +230,22 @@ pub fn build_plates<G: GridOps>(
         })
         .collect();
 
-    (TectonicState { plates, convection }, plate_id)
+    let centers = planar_seeds
+        .unwrap_or_else(|| seeds.iter().map(|p| p.as_vec() * grid.radius_m()).collect());
+    let partition_scale = grid
+        .extent_m()
+        .map_or(grid.radius_m(), |(w, h)| w.max(h).max(3_000_000.));
+    (
+        TectonicState {
+            plates,
+            convection,
+            planar_velocities,
+            centers,
+            partition_scale,
+            partition_seed: params.seed ^ 0xB0A7D,
+        },
+        plate_id,
+    )
 }
 
 /// 初始化地壳场。
@@ -193,74 +260,9 @@ pub fn init_crust<G: GridOps>(
     rng: &mut DeterministicRng,
     params: &GenerationParams,
 ) {
-    let n = grid.cell_count();
-    let plate_map: HashMap<u16, &Plate> = state.plates.iter().map(|p| (p.id, p)).collect();
-    let interior_noise = tf_core::noise::SimplexNoise::new(params.seed ^ 0x1A7E);
-
-    // 每个板块的基准厚度。加一点板块间差异，让大陆不是千篇一律的台地。
-    let plate_thickness: Vec<f32> = state
-        .plates
-        .iter()
-        .map(|p| {
-            if p.oceanic {
-                (7_000.0 + rng.range_f64(-800.0, 800.0)) as f32
-            } else {
-                // 陆壳基准 32-42 km，越厚抬得越高
-                (36_000.0 + rng.range_f64(-3500.0, 3500.0)) as f32
-            }
-        })
-        .collect();
-
-    fields
-        .crust_thickness
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(i, t)| {
-            let p = plate_id[i] as usize;
-            // 板块内部结构。
-            //
-            // 真实大陆不是一块平板，它有大尺度的克拉通（稳定高原）、
-            // 裂谷盆地、以及被侵蚀削平的准平原。
-            // 用三个尺度的噪声叠加来生成这种结构：
-            //   - 超低频：决定这是一块高原区还是低地区
-            //   - 中频：山间盆地与台地
-            //   - 高频：局部起伏
-            let c = grid.center_dir(i).as_vec();
-            let oceanic = plate_map[&plate_id[i]].oceanic;
-
-            if oceanic {
-                // 洋壳：微弱起伏即可
-                let d = interior_noise.fbm(c.x * 4.0, c.y * 4.0, c.z * 4.0, 2, 2.0, 0.5);
-                *t = plate_thickness[p] + (d as f32) * 400.0;
-            } else {
-                // 陆壳：三层结构
-                let macro_n = interior_noise.fbm(c.x * 1.1, c.y * 1.1, c.z * 1.1, 2, 2.0, 0.55);
-                let meso_n = interior_noise.fbm(c.x * 3.2, c.y * 3.2, c.z * 3.2, 3, 2.0, 0.5);
-                let micro_n = interior_noise.fbm(c.x * 9.0, c.y * 9.0, c.z * 9.0, 2, 2.0, 0.45);
-
-                // 超低频振幅最大：决定克拉通 vs 盆地，±9 km 地壳厚度
-                let macro_amp = (macro_n as f32) * 9000.0;
-                let meso = (meso_n as f32) * 3500.0;
-                let micro = (micro_n as f32) * 900.0;
-
-                *t = plate_thickness[p] + macro_amp + meso + micro;
-            }
-        });
-
-    fields
-        .crust_type
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(i, t)| {
-            *t = if plate_map[&plate_id[i]].oceanic {
-                0.0
-            } else {
-                1.0
-            };
-        });
-
+    let _ = (state, rng);
+    crate::terrain::init_continents(grid, fields, params);
     fields.plate_id.copy_from_slice(plate_id);
-    let _ = (n, params);
 }
 
 /// 计算板块的旋转速度向量（球面叉积）。
@@ -274,6 +276,52 @@ fn plate_velocity(plate: &Plate, p: DVec3) -> DVec3 {
     axis.cross(p) * plate.omega
 }
 
+fn partition_normal<G: GridOps>(
+    grid: &G,
+    state: &TectonicState,
+    noise: &tf_core::noise::SimplexNoise,
+    i: usize,
+    j: usize,
+    a: usize,
+    b: usize,
+) -> DVec3 {
+    let planar = state.planar_velocities.is_some();
+    let midpoint = (grid.field_position(i) + grid.field_position(j)) * 0.5;
+    let (east, north) = if planar {
+        (DVec3::X, DVec3::Y)
+    } else {
+        UnitVec3::from_normalized(midpoint.normalize()).tangent_frame()
+    };
+    let score = |point: DVec3, k: usize| {
+        if planar {
+            let scale = state.partition_scale;
+            let warp = DVec3::new(
+                noise.sample(point.x / scale * 4., point.y / scale * 4., 17.),
+                noise.sample(point.x / scale * 4., point.y / scale * 4., 37.),
+                0.,
+            ) * scale
+                * 0.08;
+            -(point + warp - state.centers[k]).length_squared() / (scale * scale)
+        } else {
+            let p = point.normalize();
+            let phase = k as f64 * 1.7;
+            let warp = noise.fbm(p.x * 3.5, p.y * 3.5, p.z * 3.5, 3, 2., 0.5) * 0.18;
+            p.dot(state.centers[k].normalize())
+                + warp * ((p.x + phase).sin() + (p.y - phase).cos()) * 0.5
+        }
+    };
+    let difference = |p| score(p, b) - score(p, a);
+    let epsilon = 100.;
+    let ex = difference(midpoint + east * epsilon) - difference(midpoint - east * epsilon);
+    let ny = difference(midpoint + north * epsilon) - difference(midpoint - north * epsilon);
+    let gradient = east * ex + north * ny;
+    if gradient.length_squared() > 1e-24 {
+        gradient.normalize()
+    } else {
+        (grid.field_position(j) - grid.field_position(i)).normalize()
+    }
+}
+
 /// 识别板块边界并分类。
 pub fn find_boundaries<G: GridOps>(
     grid: &G,
@@ -281,71 +329,71 @@ pub fn find_boundaries<G: GridOps>(
     state: &TectonicState,
     fields: &WorldFields,
 ) -> Vec<BoundaryCell> {
-    let n = grid.cell_count();
-
-    (0..n)
-        .into_par_iter()
-        .filter_map(|i| {
-            let my_plate = plate_id[i] as usize;
-            for &nb in grid.neighbors(i) {
-                let other_plate = plate_id[nb as usize] as usize;
-                if other_plate == my_plate {
-                    continue;
-                }
-                let p = grid.center_dir(i).as_vec();
-                let q = grid.center_dir(nb as usize).as_vec();
-
-                let v1 = plate_velocity(&state.plates[my_plate], p);
-                let v2 = plate_velocity(&state.plates[other_plate], q);
-                let v_rel = v1 - v2;
-
-                let mut normal = q - p;
-                normal -= p * p.dot(normal);
-                let nl = normal.length();
-                if nl < 1e-9 {
-                    continue;
-                }
-                let normal = normal / nl;
-                let v_normal_m = v_rel.dot(normal) * grid.radius_m();
-
-                // 阈值：板块角速度是弧度/百万年量级，乘半径后典型值
-                // 在几十到几百米/百万年。取 8 米/百万年做分类边界。
-                let threshold = 8.0;
-                let kind = if v_normal_m > threshold {
-                    BoundaryKind::Convergent
-                } else if v_normal_m < -threshold {
-                    BoundaryKind::Divergent
-                } else {
-                    BoundaryKind::Transform
-                };
-
-                let me_oceanic = fields.crust_type[i] < 0.5;
-                let other_oceanic = fields.crust_type[nb as usize] < 0.5;
-                let subtype = match (kind, me_oceanic, other_oceanic) {
-                    (BoundaryKind::Convergent, true, true) => BoundarySubtype::OceanOceanConvergent,
-                    (BoundaryKind::Convergent, _, _) => {
-                        if me_oceanic == other_oceanic {
-                            BoundarySubtype::ContinentContinentConvergent
-                        } else {
-                            BoundarySubtype::OceanContinentConvergent
-                        }
-                    }
-                    (BoundaryKind::Divergent, true, true) => BoundarySubtype::OceanOceanDivergent,
-                    (BoundaryKind::Divergent, _, _) => BoundarySubtype::ContinentContinentDivergent,
-                    _ => BoundarySubtype::Transform,
-                };
-
-                return Some(BoundaryCell {
-                    cell: i as u32,
-                    other: nb,
-                    kind,
-                    subtype,
-                    normal_velocity: v_normal_m,
-                });
+    let mut result = Vec::new();
+    let warp_noise = tf_core::noise::SimplexNoise::new(state.partition_seed);
+    for i in 0..grid.cell_count() {
+        for &nb in grid.neighbors(i) {
+            let j = nb as usize;
+            if j <= i || plate_id[i] == plate_id[j] {
+                continue;
             }
-            None
-        })
-        .collect()
+            let (i, j) = if plate_id[i] < plate_id[j] {
+                (i, j)
+            } else {
+                (j, i)
+            };
+            let (p, q) = (grid.center_dir(i).as_vec(), grid.center_dir(j).as_vec());
+            let normal = partition_normal(
+                grid,
+                state,
+                &warp_noise,
+                i,
+                j,
+                plate_id[i] as usize,
+                plate_id[j] as usize,
+            );
+            let relative = if let Some(velocities) = &state.planar_velocities {
+                velocities[plate_id[i] as usize] - velocities[plate_id[j] as usize]
+            } else {
+                // Both velocities must be evaluated at the same boundary point.
+                let mid = (p + q).normalize();
+                (plate_velocity(&state.plates[plate_id[i] as usize], mid)
+                    - plate_velocity(&state.plates[plate_id[j] as usize], mid))
+                    * grid.radius_m()
+            };
+            let vn = relative.dot(normal);
+            let shear = (relative - normal * vn).length();
+            let threshold = (shear * 0.45).max(1000.);
+            let kind = if vn > threshold {
+                BoundaryKind::Convergent
+            } else if vn < -threshold {
+                BoundaryKind::Divergent
+            } else {
+                BoundaryKind::Transform
+            };
+            let (a, b) = (fields.crust_type[i] < 0.5, fields.crust_type[j] < 0.5);
+            let subtype = match (kind, a, b) {
+                (BoundaryKind::Convergent, true, true) => BoundarySubtype::OceanOceanConvergent,
+                (BoundaryKind::Convergent, false, false) => {
+                    BoundarySubtype::ContinentContinentConvergent
+                }
+                (BoundaryKind::Convergent, _, _) => BoundarySubtype::OceanContinentConvergent,
+                (BoundaryKind::Divergent, true, true) => BoundarySubtype::OceanOceanDivergent,
+                (BoundaryKind::Divergent, _, _) => BoundarySubtype::ContinentContinentDivergent,
+                _ => BoundarySubtype::Transform,
+            };
+            result.push(BoundaryCell {
+                cell: i as u32,
+                other: j as u32,
+                kind,
+                subtype,
+                normal_velocity: vn,
+                tangential_velocity: shear,
+                normal: normal.to_array(),
+            });
+        }
+    }
+    result
 }
 
 /// 板块运动的一个迭代步：地壳增厚/减薄。
@@ -397,11 +445,9 @@ pub fn step_tectonics<G: GridOps>(
         .for_each(|(i, t)| {
             let delta = spread[i] * dt_myr as f32;
             // 只有陆壳能大幅增厚。洋壳被挤压时会俯冲，不会隆起成山。
-            let eff = if is_continental[i] > 0.5 {
-                delta
-            } else {
-                delta * 0.15
-            };
+            let continental = is_continental[i].clamp(0., 1.);
+            let response = continental * continental * (3. - 2. * continental);
+            let eff = delta * (0.15 + 0.85 * response);
             *t = (old[i] + eff).clamp(4_000.0, 78_000.0);
         });
 
@@ -454,7 +500,16 @@ pub fn adjust_sea_level<G: GridOps>(grid: &G, fields: &mut WorldFields, target_l
     let mut sample: Vec<f32> = (0..n).map(|i| fields.elevation[i]).collect();
     sample.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let target = target_land_fraction.clamp(0.02, 0.95);
+    if target_land_fraction <= 0. || target_land_fraction >= 1. {
+        let offset = if target_land_fraction >= 1. {
+            sample[0] - 1.
+        } else {
+            sample[n - 1] + 1.
+        };
+        fields.elevation.par_iter_mut().for_each(|h| *h -= offset);
+        return;
+    }
+    let target = target_land_fraction;
     let idx = (((1.0 - target) * n as f64).round() as usize).min(n - 1);
     let sea_level = sample[idx];
 
@@ -477,89 +532,91 @@ pub fn apply_seafloor_age<G: GridOps>(
     spreading_rate: f64,
 ) {
     let n = grid.cell_count();
-
-    // 洋壳年龄的正确算法：从洋中脊（离散边界）出发做 BFS，
-    // 距离除以扩张速率就是年龄。
-    //
-    // 之前的实现用「到板块欧拉极的角距」估年龄，会在板块内部
-    // 产生一圈圈同心圆——那不是地貌，是数学伪影。
-    let mut age = vec![f32::INFINITY; n];
-    let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
-
-    // 所有离散边界（洋中脊）作为年龄为 0 的源
+    let mut sources = vec![0f32; n];
     for b in boundaries {
-        if b.kind == BoundaryKind::Divergent && fields.crust_type[b.cell as usize] < 0.5 {
-            age[b.cell as usize] = 0.0;
-            queue.push_back(b.cell);
-        }
-    }
-
-    // 如果没有离散边界，退化为「从所有洋壳边缘开始」
-    if queue.is_empty() {
-        for i in 0..n {
-            if fields.crust_type[i] < 0.5 {
-                // 与陆壳相邻的洋壳算年轻
-                let near_land = grid
-                    .neighbors(i)
-                    .iter()
-                    .any(|&nb| fields.crust_type[nb as usize] > 0.5);
-                if near_land {
-                    age[i] = 0.0;
-                    queue.push_back(i as u32);
+        if b.kind == BoundaryKind::Divergent {
+            for i in [b.cell as usize, b.other as usize] {
+                if fields.crust_type[i] < 0.7 {
+                    sources[i] = 1.;
                 }
             }
         }
     }
-
-    // BFS 传播年龄。扩张速率：典型洋中脊 5 cm/年 = 50 km/百万年 = 50000 m/Myr
-    let rate_m_per_myr = 50_000.0 * spreading_rate.max(0.1);
-    while let Some(cur) = queue.pop_front() {
-        let cur_age = age[cur as usize];
-        for &nb in grid.neighbors(cur as usize) {
-            // 只在大洋板块内部传播
-            if fields.crust_type[nb as usize] >= 0.5 {
-                continue;
-            }
-            let dist = grid.distance_m(cur as usize, nb as usize);
-            let nb_age = cur_age + (dist / rate_m_per_myr) as f32;
-            if nb_age < age[nb as usize] {
-                age[nb as usize] = nb_age;
-                queue.push_back(nb);
-            }
-        }
-    }
-
-    // 无法到达的洋壳（被陆壳完全隔开）给个中老龄
+    let has_source = sources.iter().any(|&x| x > 0.);
+    let (distance, _) = crate::landforms::nearest_sources(
+        grid,
+        &sources,
+        std::f64::consts::PI * grid.radius_m() * 2.,
+    );
+    let rate = 50_000. * spreading_rate.max(0.1);
     for i in 0..n {
-        if !age[i].is_finite() {
-            age[i] = if fields.crust_type[i] < 0.5 {
-                60.0
-            } else {
-                0.0
-            };
-        }
+        let ocean_age = if has_source {
+            (distance[i] / rate).clamp(0., 200.)
+        } else {
+            60.
+        };
+        let continental = fields.crust_type[i] as f64;
+        fields.crust_age[i] = (ocean_age * (1. - continental) + 600. * continental) as f32;
+        let depth = if ocean_age < 70. {
+            2500. + 350. * ocean_age.sqrt()
+        } else {
+            6400. - (6400. - (2500. + 350. * 70_f64.sqrt())) * (-(ocean_age - 70.) / 62.8).exp()
+        };
+        // Apply cooling relative to the young-ocean isostatic surface, continuously.
+        fields.elevation[i] -= ((depth - 2500.) * (1. - continental).powi(2)) as f32;
     }
-
-    fields.crust_age = age;
-
-    // 施加热沉降：只作用于洋壳
-    fields
-        .elevation
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(i, e)| {
-            if fields.crust_type[i] >= 1.0 {
-                return;
-            }
-            let a = fields.crust_age[i] as f64;
-            let depth = if a < 70.0 {
-                2500.0 + 350.0 * a.sqrt()
-            } else {
-                6400.0 - 3200.0 * (-a / 62.8).exp()
-            };
-            let weight = (1. - fields.crust_type[i]).clamp(0., 1.);
-            *e = *e * (1. - weight) - (depth as f32) * weight;
-        });
-
     let _ = state;
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+    #[test]
+    fn shortening_response_is_continuous_through_mixed_crust() {
+        let g = tf_grid::FlatGrid::new(32, 24, 3_200_000., 30., 0., 6371000.);
+        let params = GenerationParams {
+            seed: 42,
+            plate_count: 8,
+            ..Default::default()
+        };
+        let (state, ids) = build_plates(
+            &g,
+            &params,
+            &mut DeterministicRng::derive(params.seed, "plates"),
+        );
+        let mut a = WorldFields::with_capacity(g.cell_count());
+        a.plate_id = ids;
+        a.crust_thickness.fill(21500.);
+        a.crust_type.fill(0.499);
+        let mut b = a.clone();
+        b.crust_type.fill(0.501);
+        step_tectonics(&g, &state, &mut a, &params, 1.);
+        step_tectonics(&g, &state, &mut b, &params, 1.);
+        assert!(a.crust_thickness.iter().any(|&x| (x - 21500.).abs() > 100.));
+        assert!(a
+            .crust_thickness
+            .iter()
+            .zip(&b.crust_thickness)
+            .all(|(x, y)| (x - y).abs() < 100.));
+    }
+    #[test]
+    fn thermal_cooling_has_no_crust_halfway_wall() {
+        let g = tf_grid::FlatGrid::new(4, 4, 4000., 30., 0., 6371000.);
+        let mut f = WorldFields::with_capacity(16);
+        f.elevation.fill(100.);
+        f.crust_type.fill(0.499);
+        f.crust_type[1] = 0.5;
+        f.crust_type[2] = 0.501;
+        let state = TectonicState {
+            plates: vec![],
+            convection: vec![],
+            planar_velocities: None,
+            centers: vec![],
+            partition_scale: 1.,
+            partition_seed: 0,
+        };
+        apply_seafloor_age(&g, &mut f, &state, &[], 1.);
+        assert!((f.elevation[0] - f.elevation[1]).abs() < 5.);
+        assert!((f.elevation[1] - f.elevation[2]).abs() < 5.);
+    }
 }

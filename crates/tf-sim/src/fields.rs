@@ -111,4 +111,6 @@ pub struct BoundaryCell {
     pub subtype: BoundarySubtype,
     /// 法向相对速度，米每百万年。正值是汇聚（当前格朝相邻格运动）。
     pub normal_velocity: f64,
+    pub tangential_velocity: f64,
+    pub normal: [f64; 3],
 }

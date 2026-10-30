@@ -9,7 +9,9 @@ pub struct ClimateParams {
     pub greenhouse: f64,
     pub precipitation_scale: f64,
     pub monsoon: bool,
-    pub advection_iterations: u32,
+    pub wind_speed_m_s: f64,
+    pub orographic_strength: f64,
+    pub moisture_recycling: f64,
 }
 impl Default for ClimateParams {
     fn default() -> Self {
@@ -17,7 +19,9 @@ impl Default for ClimateParams {
             greenhouse: 1.,
             precipitation_scale: 1.,
             monsoon: true,
-            advection_iterations: 80,
+            wind_speed_m_s: 10.,
+            orographic_strength: 1.,
+            moisture_recycling: 0.35,
         }
     }
 }
@@ -87,55 +91,6 @@ fn compute_temperature<G: GridOps>(
             *t = (sea_level + greenhouse - lapse - inland).clamp(-100., 90.) as f32;
         });
 }
-fn compute_wind<G: GridOps>(
-    grid: &G,
-    fields: &WorldFields,
-    planet: &PlanetParams,
-    monsoon: bool,
-) -> Vec<(f64, f64)> {
-    let hadley = (30. * (planet.rotation_period_hours / 24.).powf(0.35)).clamp(10., 60.);
-    (0..grid.cell_count())
-        .into_par_iter()
-        .map(|i| {
-            let lat = grid.latitude_deg(i);
-            let a = lat.abs();
-            let (mut u, mut v) = if a < hadley {
-                (-1., -lat.signum() * 0.5)
-            } else if a < (hadley + 30.).min(80.) {
-                (1., lat.signum() * 0.5)
-            } else {
-                (-1., -lat.signum() * 0.4)
-            };
-            let (east, north) = grid.center_dir(i).tangent_frame();
-            let mut sx = 0.;
-            let mut sy = 0.;
-            let mut thermal_x = 0.;
-            let mut thermal_y = 0.;
-            for &j in grid.neighbors(i) {
-                let j = j as usize;
-                let dir = grid.center_dir(j).as_vec() - grid.center_dir(i).as_vec();
-                let len = dir.length().max(1e-12);
-                let dir = dir / len;
-                let slope = (fields.elevation[j] - fields.elevation[i]) as f64
-                    / grid.distance_m(i, j).max(1.);
-                sx += slope * dir.dot(east);
-                sy += slope * dir.dot(north);
-                let thermal = (fields.temperature[j] - fields.temperature[i]) as f64 / 20.;
-                thermal_x += thermal * dir.dot(east);
-                thermal_y += thermal * dir.dot(north);
-            }
-            u -= sy * 8.;
-            v += sx * 8.;
-            if monsoon {
-                let seasonal = (planet.axial_tilt_deg / 23.44).min(2.);
-                u += thermal_x * seasonal * 0.35;
-                v += thermal_y * seasonal * 0.35;
-            }
-            let m = (u * u + v * v).sqrt().max(1e-12);
-            (u / m, v / m)
-        })
-        .collect()
-}
 fn compute_precipitation<G: GridOps>(
     grid: &G,
     fields: &mut WorldFields,
@@ -143,99 +98,7 @@ fn compute_precipitation<G: GridOps>(
     params: &ClimateParams,
     cancel: &dyn Fn() -> bool,
 ) -> bool {
-    let n = grid.cell_count();
-    let wind = compute_wind(grid, fields, planet, params.monsoon);
-    let capacity: Vec<f64> = fields
-        .temperature
-        .iter()
-        .map(|&t| (0.06 * (t as f64 - 20.)).exp().clamp(0.01, 4.))
-        .collect();
-    // One transport step is the time taken to cross one average neighbour spacing.
-    let spacing = (0..n.min(1024))
-        .map(|i| {
-            grid.neighbors(i)
-                .first()
-                .map_or(1., |&j| grid.distance_m(i, j as usize))
-        })
-        .sum::<f64>()
-        / n.min(1024).max(1) as f64;
-    let dt = (spacing / 10.).clamp(60., 86400.);
-    let steps_per_year = 31_557_600. / dt;
-    let mut transport: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
-    let mut fractions = Vec::with_capacity(n);
-    for i in 0..n {
-        let (east, north) = grid.center_dir(i).tangent_frame();
-        let w = east * wind[i].0 + north * wind[i].1;
-        let mut upstream = Vec::with_capacity(3);
-        let mut total = 0.;
-        let mut lift = 0.;
-        for &j in grid.neighbors(i) {
-            let j = j as usize;
-            let d = grid.center_dir(j).as_vec() - grid.center_dir(i).as_vec();
-            let align = -w.dot(d) / d.length().max(1e-12);
-            if align > 0. {
-                let weight = align * align;
-                upstream.push((j, weight));
-                total += weight;
-                lift += (fields.elevation[i] - fields.elevation[j]).max(0.) as f64 * weight;
-            }
-        }
-        if total > 0. {
-            for p in &mut upstream {
-                p.1 /= total;
-            }
-            lift /= total;
-        }
-        let lat = grid.latitude_deg(i).abs();
-        let itcz = (-0.5 * (lat / 14.).powi(2)).exp();
-        let storm = (-0.5 * ((lat - 55.) / 12.).powi(2)).exp();
-        let convection = (dt / (8. * 86400.) * (0.35 + 1.3 * itcz + 0.6 * storm)).min(0.8);
-        let oro = 1. - (-lift / 2200.).exp();
-        fractions.push((convection + oro * 0.75).clamp(0., 0.9));
-        transport.push(upstream);
-    }
-    let mut moisture: Vec<f64> = (0..n)
-        .map(|i| {
-            if fields.elevation[i] <= 0. {
-                capacity[i]
-            } else {
-                0.
-            }
-        })
-        .collect();
-    let mut next = vec![0.; n];
-    let mut rain = vec![0.; n];
-    let iterations = params.advection_iterations.max(1);
-    for _ in 0..iterations {
-        if cancel() {
-            return false;
-        }
-        for i in 0..n {
-            let inflow = transport[i]
-                .iter()
-                .map(|&(j, w)| moisture[j] * w)
-                .sum::<f64>();
-            let carried = if fields.elevation[i] <= 0. {
-                capacity[i]
-            } else {
-                moisture[i] * 0.25 + inflow * 0.75
-            };
-            let saturation = (carried - capacity[i]).max(0.);
-            let condensed = (carried.min(capacity[i]) * fractions[i] + saturation).min(carried);
-            rain[i] += condensed;
-            next[i] = (carried - condensed).max(0.);
-        }
-        std::mem::swap(&mut moisture, &mut next);
-    }
-    for i in 0..n {
-        fields.precipitation[i] = (rain[i] / iterations as f64
-            * 30.
-            * steps_per_year
-            * params.precipitation_scale
-            * planet.atmosphere_density.sqrt())
-        .clamp(0., 15000.) as f32;
-    }
-    !cancel()
+    crate::climate_transport::solve(grid, fields, planet, params, cancel)
 }
 fn apply_ocean_currents<G: GridOps>(grid: &G, fields: &mut WorldFields) {
     // Symmetric equator-to-midlatitude transport; kept in the final temperature.
@@ -300,6 +163,87 @@ mod tests {
         assert!(
             annual_insolation(89_f64.to_radians(), 80_f64.to_radians())
                 > annual_insolation(89_f64.to_radians(), 0.)
+        );
+    }
+    fn mountain_cross_section(cols: u32, atmosphere_spacing: f64) -> (f64, f64, f64) {
+        use tf_grid::GridOps;
+        let rows = cols / 4;
+        let g = tf_grid::FlatGrid::new(cols, rows, 3_200_000., 45., 0., 6371000.);
+        let mut f = WorldFields::with_capacity(g.cell_count());
+        for i in 0..g.cell_count() {
+            let x = g.xy(i).0;
+            f.elevation[i] = if x < -1_050_000. {
+                -100.
+            } else {
+                (200. + 2600. * (-0.5 * (x / 140000.).powi(2)).exp()) as f32
+            };
+        }
+        crate::erosion::compute_distance_to_sea(&g, &mut f);
+        let params = ClimateParams {
+            monsoon: false,
+            ..Default::default()
+        };
+        compute_temperature(&g, &mut f, &PlanetParams::default(), &params);
+        apply_ocean_currents(&g, &mut f);
+        crate::climate_transport::solve_at_resolution(
+            &g,
+            &mut f,
+            &PlanetParams::default(),
+            &params,
+            &|| false,
+            atmosphere_spacing,
+            32,
+        );
+        let average = |low: f64, high: f64| {
+            let selected: Vec<_> = (0..g.cell_count())
+                .filter(|&i| {
+                    let (x, y) = g.xy(i);
+                    x > low && x < high && y.abs() < 120000.
+                })
+                .collect();
+            selected
+                .iter()
+                .map(|&i| f.precipitation[i] as f64)
+                .sum::<f64>()
+                / selected.len() as f64
+        };
+        (
+            average(-350000., -60000.),
+            average(150000., 450000.),
+            f.precipitation.iter().copied().fold(0_f32, f32::max) as f64,
+        )
+    }
+    #[test]
+    fn rain_shadow_converges_when_the_atmospheric_solver_is_refined() {
+        let a = mountain_cross_section(192, 75_000.);
+        let b = mountain_cross_section(192, 37_500.);
+        let c = mountain_cross_section(192, 18_750.);
+        let ab = (a.0 / a.1 / (b.0 / b.1) - 1.).abs();
+        let bc = (b.0 / b.1 / (c.0 / c.1) - 1.).abs();
+        assert!(
+            bc < ab && bc < 0.15,
+            "coarse {a:?}, medium {b:?}, fine {c:?}; drift {ab} -> {bc}"
+        );
+        assert!(
+            (b.0 / c.0 - 1.).abs() < 0.15,
+            "rainfall drift: {b:?}, {c:?}"
+        );
+    }
+    #[test]
+    fn windward_rain_and_lee_shadow_survive_a_change_in_sampling_density() {
+        let a = mountain_cross_section(64, 75_000.);
+        let b = mountain_cross_section(128, 75_000.);
+        assert!(
+            a.0 > a.1 * 1.3 && b.0 > b.1 * 1.3,
+            "windward/lee: {a:?}, {b:?}"
+        );
+        assert!(
+            (a.0 / b.0 - 1.).abs() < 0.25,
+            "resolution changed rainfall: {a:?}, {b:?}"
+        );
+        assert!(
+            a.2 < 15000. && b.2 < 15000.,
+            "unphysical saturation clipping: {a:?}, {b:?}"
         );
     }
 }

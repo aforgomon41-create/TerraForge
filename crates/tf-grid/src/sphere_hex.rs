@@ -654,6 +654,9 @@ fn spherical_triangle_solid_angle(a: DVec3, b: DVec3, c: DVec3) -> f64 {
 }
 
 impl crate::GridOps for SphereHexGrid {
+    fn locate(&self, dir: UnitVec3) -> Option<usize> {
+        Some(self.cell_at(dir))
+    }
     fn radius_m(&self) -> f64 {
         self.radius_m
     }

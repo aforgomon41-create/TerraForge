@@ -170,6 +170,15 @@ impl PlanetParams {
     }
 }
 
+/// The generation domain is independent of its viewing projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldShape {
+    #[default]
+    Sphere,
+    Plane,
+}
+
 /// 完整的世界生成参数。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -180,6 +189,26 @@ pub struct GenerationParams {
     pub quality: SimQuality,
     /// 星球物理参数。
     pub planet: PlanetParams,
+
+    /// Starting scope. Local scopes may be generated without an ancestor.
+    pub start_level: LevelKind,
+    pub world_shape: WorldShape,
+    pub map_width_m: f64,
+    pub map_height_m: f64,
+    pub center_lat_deg: f64,
+    pub center_lon_deg: f64,
+    /// Continuous province scale, independent of plate ownership.
+    pub continent_scale: f64,
+    pub orogeny_strength: f64,
+    pub rift_strength: f64,
+    pub shear_strength: f64,
+    pub interior_relief: f64,
+    /// Atmospheric transport uses seconds, metres, and millimetres of column water.
+    pub wind_speed_m_s: f64,
+    pub orographic_strength: f64,
+    pub moisture_recycling: f64,
+    /// Display-only preference; changing it must not change generated fields.
+    pub display_grid_m: f64,
 
     // ---- 构造 ----
     /// 板块数量。8-30，默认 14。
@@ -234,6 +263,21 @@ impl Default for GenerationParams {
             seed: 0,
             quality: SimQuality::Standard,
             planet: PlanetParams::default(),
+            start_level: LevelKind::World,
+            world_shape: WorldShape::Sphere,
+            map_width_m: 8_000_000.,
+            map_height_m: 5_000_000.,
+            center_lat_deg: 25.,
+            center_lon_deg: 0.,
+            continent_scale: 1.,
+            orogeny_strength: 1.,
+            rift_strength: 1.,
+            shear_strength: 1.,
+            interior_relief: 1.,
+            wind_speed_m_s: 10.,
+            orographic_strength: 1.,
+            moisture_recycling: 0.35,
+            display_grid_m: 100_000.,
             plate_count: 14,
             land_fraction: 0.29,
             tectonic_activity: 1.0,
@@ -255,11 +299,8 @@ impl GenerationParams {
         if !(8..=30).contains(&self.plate_count) {
             return Err(format!("板块数量 {} 超出范围 8-30", self.plate_count));
         }
-        if !(0.05..=0.90).contains(&self.land_fraction) {
-            return Err(format!(
-                "陆地占比 {} 超出范围 0.05-0.90",
-                self.land_fraction
-            ));
+        if !(0.0..=1.0).contains(&self.land_fraction) {
+            return Err(format!("陆地占比 {} 超出范围 0-1", self.land_fraction));
         }
         if !(0.2..=2.0).contains(&self.tectonic_activity) {
             return Err(format!(
@@ -300,6 +341,19 @@ impl GenerationParams {
             ("温室效应", self.planet.greenhouse_factor, 0.1, 3.),
             ("扩张速率", self.spreading_rate, 0.1, 3.),
             ("生态丰度", self.biome_diversity, 0.3, 2.),
+            ("大陆尺度", self.continent_scale, 0.3, 3.),
+            ("造山强度", self.orogeny_strength, 0., 3.),
+            ("裂谷强度", self.rift_strength, 0., 3.),
+            ("走滑强度", self.shear_strength, 0., 3.),
+            ("内陆起伏", self.interior_relief, 0., 3.),
+            ("盛行风速", self.wind_speed_m_s, 1., 40.),
+            ("地形雨强度", self.orographic_strength, 0., 3.),
+            ("水汽再循环", self.moisture_recycling, 0., 0.8),
+            ("显示格距", self.display_grid_m, 0., 10_000_000.),
+            ("地图宽度", self.map_width_m, 4., 200_000_000.),
+            ("地图高度", self.map_height_m, 4., 100_000_000.),
+            ("参考纬度", self.center_lat_deg, -85., 85.),
+            ("参考经度", self.center_lon_deg, -180., 180.),
         ] {
             if !value.is_finite() || !(min..=max).contains(&value) {
                 return Err(format!("{name} 超出范围 {min}～{max}"));
@@ -338,7 +392,7 @@ mod tests {
         assert!(p.validate().is_err());
 
         let mut p = GenerationParams::default();
-        p.land_fraction = 0.99;
+        p.land_fraction = 1.01;
         assert!(p.validate().is_err());
 
         let mut p = GenerationParams::default();

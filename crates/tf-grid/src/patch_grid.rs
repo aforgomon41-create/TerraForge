@@ -230,6 +230,23 @@ impl PatchGrid {
 }
 
 impl crate::GridOps for PatchGrid {
+    fn locate(&self, dir: UnitVec3) -> Option<usize> {
+        self.cell_at(dir)
+    }
+    fn field_position(&self, i: usize) -> DVec3 {
+        // A child patch retains its geographic continuous-field coordinates.
+        self.center_dir(i).as_vec() * self.radius_m
+    }
+    fn extent_m(&self) -> Option<(f64, f64)> {
+        Some((
+            self.size as f64 * self.cell_size_m,
+            self.size as f64 * self.cell_size_m * 3_f64.sqrt() / 2.,
+        ))
+    }
+    fn local_center_m(&self, i: usize) -> Option<(f64, f64)> {
+        Some(self.local_center(i))
+    }
+
     fn radius_m(&self) -> f64 {
         self.radius_m
     }

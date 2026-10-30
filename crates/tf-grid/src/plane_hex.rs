@@ -240,6 +240,36 @@ impl HexGrid2D {
 }
 
 impl crate::GridOps for HexGrid2D {
+    fn field_is_planar(&self) -> bool {
+        true
+    }
+    fn field_position(&self, i: usize) -> glam::DVec3 {
+        let (x, y) = self.local_center_m(i).unwrap();
+        glam::DVec3::new(x, y, 0.)
+    }
+    fn locate(&self, dir: UnitVec3) -> Option<usize> {
+        (0..self.cell_count()).max_by(|&a, &b| {
+            self.center_dir(a)
+                .as_vec()
+                .dot(dir.as_vec())
+                .total_cmp(&self.center_dir(b).as_vec().dot(dir.as_vec()))
+        })
+    }
+    fn extent_m(&self) -> Option<(f64, f64)> {
+        Some((
+            self.width as f64 * self.cell_size_m,
+            self.height as f64 * self.cell_size_m * 3_f64.sqrt() / 2.,
+        ))
+    }
+    fn local_center_m(&self, i: usize) -> Option<(f64, f64)> {
+        let (r, c) = (i / self.width as usize, i % self.width as usize);
+        Some((
+            (c as f64 + (r % 2) as f64 * 0.5 - (self.width as f64 - 1.) / 2. - 0.25)
+                * self.cell_size_m,
+            ((self.height as f64 - 1.) / 2. - r as f64) * self.cell_size_m * 3_f64.sqrt() / 2.,
+        ))
+    }
+
     fn cell_count(&self) -> usize {
         self.centers.len()
     }

@@ -220,6 +220,25 @@ pub fn run_erosion_cancellable<G: GridOps>(
         if iteration > 0 && iteration % 8 == 0 {
             state = refresh_hydrology(grid, fields);
         }
+        // Rainfall-weighted discharge is separate from the stored contributing area.
+        let rain_driven = fields.precipitation.iter().any(|&p| p > 0.);
+        let mut discharge: Vec<f64> = (0..grid.cell_count())
+            .map(|i| {
+                grid.area_m2(i)
+                    * if rain_driven {
+                        (fields.precipitation[i] as f64 / 1000.).max(0.)
+                    } else {
+                        1.
+                    }
+            })
+            .collect();
+        for &cell in &state.topo_order {
+            let i = cell as usize;
+            let target = state.flow_dir[i];
+            if target != u32::MAX {
+                discharge[target as usize] += discharge[i];
+            }
+        }
         // The downstream solution must be available before its upstream cell.
         for &cell in state.topo_order.iter().rev() {
             let i = cell as usize;
@@ -231,10 +250,7 @@ pub fn run_erosion_cancellable<G: GridOps>(
             let dist = grid.distance_m(i, j).max(1.);
             let h = fields.elevation[i] as f64;
             let down = (fields.elevation[j] + fields.lake_depth[j]).max(0.) as f64;
-            let k = params.k_river
-                * params.timestep_years
-                * (fields.flow_accumulation[i] as f64).powf(params.m)
-                / dist;
+            let k = params.k_river * params.timestep_years * discharge[i].powf(params.m) / dist;
             fields.elevation[i] = ((h + k * down) / (1. + k)).min(h).max(0.001) as f32;
         }
         if params.k_diffusion > 0. {

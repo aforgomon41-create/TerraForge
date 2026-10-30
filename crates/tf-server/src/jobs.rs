@@ -257,7 +257,7 @@ impl JobManager {
         let mid = map_id.clone();
         let flag = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            if node.kind == "world" {
+            if node.parent.is_none() {
                 crate::generate::run_generation(&store, &tx, &jid, &mid, &node, &params, &flag)
             } else {
                 crate::child_gen::run_child_generation(&store, &tx, &jid, &node, &params, &flag)
@@ -330,5 +330,5 @@ pub fn persist_fields(
         (Channel::Temperature,&f.temperature),(Channel::Precipitation,&f.precipitation),
         (Channel::FlowAccumulation,&f.flow_accumulation),(Channel::LakeDepth,&f.lake_depth),
         (Channel::DistanceToSea,&f.distance_to_sea),(Channel::Biome,&biome),(Channel::Soil,&soil),(Channel::SoilDepth,&world.ecology.soil_depth_m),(Channel::PlateId,&plate)
-    ],&serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"generator_version":"tf-0.2"}))
+    ],&serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"generator_version":"tf-0.3"}))
 }

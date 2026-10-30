@@ -11,10 +11,7 @@ use crate::climate::{run_climate_cancellable, ClimateParams};
 use crate::ecology::{find_minerals, run_ecology_with_diversity, EcologyResult, MineralDeposit};
 use crate::erosion::{compute_distance_to_sea, ErosionParams, ErosionState};
 use crate::fields::WorldFields;
-use crate::landforms::{
-    apply_boundary_landforms, apply_hotspots, apply_volcanic_arcs, generate_hotspots,
-    LandformParams,
-};
+use crate::landforms::{apply_hotspots, generate_hotspots, LandformParams};
 use crate::plates::{
     apply_airy_isostasy, apply_seafloor_age, build_plates, find_boundaries, init_crust,
     step_tectonics, TectonicState,
@@ -81,8 +78,19 @@ pub fn generate_cancellable<G: GridOps>(
     // ---- 阶段 1：板块构造 ----
     let t = Instant::now();
     on_progress(Stage::Tectonics, cumulative);
-    let (tectonic, plate_id) = build_plates(grid, params, &mut rng);
+    let (mut tectonic, plate_id) = build_plates(grid, params, &mut rng);
     init_crust(grid, &plate_id, &tectonic, &mut fields, &mut rng, params);
+    for plate in &mut tectonic.plates {
+        let mut total = 0.;
+        let mut continental = 0.;
+        for (i, &id) in plate_id.iter().enumerate() {
+            if id == plate.id {
+                total += 1.;
+                continental += fields.crust_type[i] as f64;
+            }
+        }
+        plate.oceanic = continental < total * 0.5;
+    }
 
     // 板块构造演化：跑若干个百万年的步长，让地壳厚度在边界处增厚/减薄。
     // 步数由精度档位决定。
@@ -129,14 +137,14 @@ pub fn generate_cancellable<G: GridOps>(
         &boundaries,
         params.spreading_rate,
     );
-    apply_boundary_landforms(grid, &mut fields, &boundaries, &lf);
-    apply_volcanic_arcs(grid, &mut fields, &boundaries, &lf);
+    crate::terrain::apply_relief(grid, &mut fields, &boundaries, params);
     let hotspots = generate_hotspots(
         params.hotspot_count,
         &mut DeterministicRng::derive(params.seed, "hotspots"),
     );
     apply_hotspots(grid, &mut fields, &hotspots, &lf);
 
+    crate::plates::adjust_sea_level(grid, &mut fields, params.land_fraction);
     cumulative += Stage::Landforms.weight();
     timings.push((Stage::Landforms, t.elapsed().as_millis()));
     on_frame(Stage::Landforms, &fields);
@@ -150,7 +158,8 @@ pub fn generate_cancellable<G: GridOps>(
     ero_params.iterations =
         (ero_params.iterations as f64 * params.quality.iteration_scale()) as u32;
     ero_params.k_river *= params.erosion_strength;
-    let erosion = crate::erosion::run_erosion_cancellable(grid, &mut fields, &ero_params, cancel)?;
+    let mut erosion =
+        crate::erosion::run_erosion_cancellable(grid, &mut fields, &ero_params, cancel)?;
     cumulative += Stage::Erosion.weight();
     timings.push((Stage::Erosion, t.elapsed().as_millis()));
     on_frame(Stage::Erosion, &fields);
@@ -173,10 +182,23 @@ pub fn generate_cancellable<G: GridOps>(
     clim.greenhouse = params.planet.greenhouse_factor;
     clim.precipitation_scale = params.precipitation_scale;
     clim.monsoon = params.monsoon_enabled;
-    clim.advection_iterations =
-        (clim.advection_iterations as f64 * params.quality.iteration_scale()) as u32;
+    clim.wind_speed_m_s = params.wind_speed_m_s;
+    clim.orographic_strength = params.orographic_strength;
+    clim.moisture_recycling = params.moisture_recycling;
     if !run_climate_cancellable(grid, &mut fields, &params.planet, &clim, cancel) {
         return None;
+    }
+    if params.erosion_strength > 0. {
+        let feedback = ErosionParams {
+            iterations: 6,
+            k_river: ErosionParams::default().k_river * params.erosion_strength,
+            ..Default::default()
+        };
+        erosion = crate::erosion::run_erosion_cancellable(grid, &mut fields, &feedback, cancel)?;
+        compute_distance_to_sea(grid, &mut fields);
+        if !run_climate_cancellable(grid, &mut fields, &params.planet, &clim, cancel) {
+            return None;
+        }
     }
     cumulative += Stage::Climate.weight();
     timings.push((Stage::Climate, t.elapsed().as_millis()));
@@ -210,7 +232,7 @@ pub fn generate_cancellable<G: GridOps>(
             fields.elevation[i] = (old[i] - loss).max(0.001);
             fields.temperature[i] += loss * 0.0065;
         }
-        crate::erosion::refresh_hydrology(grid, &mut fields);
+        erosion = crate::erosion::refresh_hydrology(grid, &mut fields);
         compute_distance_to_sea(grid, &mut fields);
     }
     let ecology = run_ecology_with_diversity(grid, &fields, params.biome_diversity);
@@ -276,6 +298,20 @@ mod regression {
             assert_eq!(f.elevation, second.fields.elevation);
             assert_eq!(f.precipitation, second.fields.precipitation);
         }
+    }
+    #[test]
+    fn display_grid_size_does_not_change_the_generated_fields() {
+        let grid = tf_grid::FlatGrid::new(24, 16, 2_400_000., 25., 0., 6371000.);
+        let mut params = GenerationParams {
+            seed: 42,
+            quality: tf_core::params::SimQuality::Economy,
+            ..Default::default()
+        };
+        let a = generate(&grid, &params, &mut |_, _| {});
+        params.display_grid_m = 500_000.;
+        let b = generate(&grid, &params, &mut |_, _| {});
+        assert_eq!(a.fields.elevation, b.fields.elevation);
+        assert_eq!(a.fields.precipitation, b.fields.precipitation);
     }
     #[test]
     fn cancellation_does_not_return_a_completed_world() {

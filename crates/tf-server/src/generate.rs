@@ -6,6 +6,7 @@
 //! - 响应取消标志
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use tf_grid::GridOps;
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -32,8 +33,11 @@ pub fn run_generation(
     }
     info!("开始生成 {}: {} 格", map_id, node.cells);
 
-    let freq = params.quality.world_subdiv_freq();
-    let grid = tf_grid::SphereHexGrid::build(freq, params.planet.radius_m, (glam::DVec3::Z, 0.0));
+    let grid = node
+        .grid
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("地图缺少生成域"))?
+        .build();
 
     let mut last_progress = -1.0f64;
     let mut last_stage = String::new();
@@ -121,7 +125,7 @@ pub fn run_generation(
 ///   [3]    降水（u8，对数刻度）
 ///   [4]    河流流量（u8，对数刻度）
 pub fn build_field_frame(
-    grid: &tf_grid::SphereHexGrid,
+    grid: &tf_grid::MapGrid,
     fields: &tf_sim::WorldFields,
 ) -> (Vec<u8>, FrameStats) {
     let n = grid.cell_count();
@@ -168,7 +172,20 @@ pub fn build_field_frame(
         for px in 0..FRAME_W {
             let lon = (px as f64 + 0.5) / FRAME_W as f64 * 360.0 - 180.0;
             let dir = tf_core::geo::UnitVec3::from_lat_lon_deg(lat, lon);
-            let cell = grid.cell_at(dir);
+            let cell = match grid {
+                tf_grid::MapGrid::Sphere(g) => g.cell_at(dir),
+                tf_grid::MapGrid::Plane(g) => g
+                    .cell_at_xy(
+                        ((px as f64 + 0.5) / FRAME_W as f64 - 0.5) * g.width(),
+                        (0.5 - (py as f64 + 0.5) / FRAME_H as f64) * g.height(),
+                    )
+                    .unwrap_or(0),
+                tf_grid::MapGrid::Patch(g) => {
+                    ((py as usize * g.size() as usize / FRAME_H as usize) * g.size() as usize
+                        + (px as usize * g.size() as usize / FRAME_W as usize))
+                        .min(g.cell_count() - 1)
+                }
+            };
 
             let idx = ((py * FRAME_W + px) * 5) as usize;
             let e = fields.elevation[cell];

@@ -24,9 +24,9 @@
 use tf_grid::{GridOps, PatchGrid, SphereHexGrid};
 
 /// A missing parent cell is an error, never an invented ocean or default climate.
-pub fn sample_from_grid(
+pub fn sample_from_grid<C: GridOps>(
     parent: &tf_grid::MapGrid,
-    child: &PatchGrid,
+    child: &C,
     elevation: &[f32],
     temperature: &[f32],
     precipitation: &[f32],
@@ -50,9 +50,9 @@ pub fn sample_from_grid(
     Ok(sample)
 }
 
-pub fn interpolate_from_grid(
+pub fn interpolate_from_grid<C: GridOps>(
     parent: &tf_grid::MapGrid,
-    child: &PatchGrid,
+    child: &C,
     elevation: &[f32],
 ) -> Result<Vec<f32>, String> {
     if elevation.len() != parent.cell_count() {
@@ -66,7 +66,13 @@ pub fn interpolate_from_grid(
             let mut weights = 0.0;
             for j in std::iter::once(cell).chain(parent.neighbors(cell).iter().map(|&j| j as usize))
             {
-                let d = dir.angle_to(&parent.center_dir(j));
+                let d = if let tf_grid::MapGrid::Plane(g) = parent {
+                    let (x, y) = g.project(dir);
+                    let (a, b) = g.xy(j);
+                    (x - a).hypot(y - b)
+                } else {
+                    dir.angle_to(&parent.center_dir(j)) * parent.radius_m()
+                };
                 if d < 1e-12 {
                     return Ok(elevation[j]);
                 }
@@ -134,27 +140,18 @@ pub fn sample_from_parent(
 /// 中心区域约束弱（允许自由生长）。
 ///
 /// 这样保证子图和父图在接缝处严格一致，同时内部有新的细节。
-pub fn constraint_weights(patch: &PatchGrid) -> Vec<f32> {
-    let size = patch.size();
+pub fn constraint_weights<G: GridOps>(patch: &G) -> Vec<f32> {
+    let (width, height) = patch.extent_m().unwrap_or((1., 1.));
+    let band = (width.min(height) * 0.08).max(1e-6);
     (0..patch.cell_count())
         .map(|i| {
-            let (row, col) = patch.row_col(i);
-            // 到四条边的最小距离（归一化）
-            let d = [
-                col as f32,
-                (size - 1 - col) as f32,
-                row as f32,
-                (size - 1 - row) as f32,
-            ]
-            .into_iter()
-            .fold(f32::INFINITY, f32::min);
-
-            // 边缘 8% 的区域 λ=1，向内衰减到 0.3
-            let edge_band = (size as f32 * 0.08).max(2.0);
-            let t = (d / edge_band).clamp(0.0, 1.0);
-            // smoothstep
-            let s = t * t * (3.0 - 2.0 * t);
-            1.0 - s * 0.7
+            if patch.boundary_mask()[i] {
+                return 1.;
+            }
+            let (x, y) = patch.local_center_m(i).unwrap_or((0., 0.));
+            let d = (width / 2. - x.abs()).min(height / 2. - y.abs()).max(0.);
+            let t = (d / band).clamp(0., 1.);
+            (1. - 0.7 * t * t * (3. - 2. * t)) as f32
         })
         .collect()
 }
@@ -163,8 +160,8 @@ pub fn constraint_weights(patch: &PatchGrid) -> Vec<f32> {
 ///
 /// 在子图生成完成后调用。对每个格子：
 ///   h_final = h_sim + λ·(h_parent − h_sim)
-pub fn blend_with_parent(
-    patch: &PatchGrid,
+pub fn blend_with_parent<G: GridOps>(
+    patch: &G,
     simulated: &mut [f32],
     parent: &ParentSample,
     weights: &[f32],

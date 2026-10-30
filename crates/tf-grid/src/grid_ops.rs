@@ -8,8 +8,26 @@ use tf_core::geo::UnitVec3;
 
 /// 网格操作的公共接口。
 pub trait GridOps: Send + Sync {
+    fn field_is_planar(&self) -> bool {
+        false
+    }
+    /// Metric coordinates for continuous fields; unrelated to display tiling.
+    fn field_position(&self, i: usize) -> glam::DVec3 {
+        self.center_dir(i).as_vec() * self.radius_m()
+    }
+    fn extent_m(&self) -> Option<(f64, f64)> {
+        None
+    }
+    fn local_center_m(&self, _i: usize) -> Option<(f64, f64)> {
+        None
+    }
+
     fn radius_m(&self) -> f64 {
         6_371_000.0
+    }
+    /// Spatial lookup for sampling a continuous field onto an independent solver mesh.
+    fn locate(&self, _dir: UnitVec3) -> Option<usize> {
+        None
     }
     /// 格子总数。
     fn cell_count(&self) -> usize;

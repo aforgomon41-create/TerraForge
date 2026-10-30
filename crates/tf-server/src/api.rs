@@ -55,6 +55,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/maps/{id}/field/{channel}", get(get_field))
         .route("/api/v1/maps/{id}/preview", get(get_preview))
         .route("/api/v1/maps/{id}/grid", get(get_grid))
+        .route(
+            "/api/v1/maps/{id}/surface",
+            get(crate::surface::get_surface),
+        )
+        .route(
+            "/api/v1/maps/{id}/overlay",
+            get(crate::surface::get_overlay),
+        )
         .route("/api/v1/maps/{id}/metadata", get(get_metadata))
         .route("/api/v1/maps/{id}/sample", get(sample_map))
         .route("/api/v1/maps/{id}/children", post(generate_child))
@@ -312,16 +320,44 @@ async fn delete_world(
 
 // ---------------- 生成 ----------------
 
+pub(crate) fn root_descriptor(
+    params: &tf_core::params::GenerationParams,
+    limit: u32,
+) -> Result<tf_grid::GridDescriptor, String> {
+    use tf_core::params::{LevelKind, WorldShape};
+    let descriptor = if params.start_level == LevelKind::World
+        && params.world_shape == WorldShape::Sphere
+    {
+        tf_grid::GridDescriptor::sphere(params.quality.world_subdiv_freq(), params.planet.radius_m)
+    } else {
+        let aspect = params.map_height_m / params.map_width_m;
+        let columns = (limit as f64 / (aspect * 2. / 3_f64.sqrt()).max(1.)).floor();
+        let row_count = aspect * columns * 2. / 3_f64.sqrt();
+        if columns < 4. || row_count < 3.5 {
+            return Err("当前精度无法保持这样狭长的地图比例，请调整宽度或高度".into());
+        }
+        let cols = columns as u32;
+        let rows = row_count.round().clamp(4., limit as f64) as u32;
+        tf_grid::GridDescriptor::plane(
+            params.center_lat_deg,
+            params.center_lon_deg,
+            params.map_width_m,
+            cols,
+            rows,
+            params.planet.radius_m,
+        )
+    };
+    descriptor.validate()?;
+    Ok(descriptor)
+}
+
 async fn generate_world(
     State(st): State<AppState>,
     Path(world_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let _admission = st.admission.lock().await;
     let existing = st.store.list_map_nodes(&world_id)?;
-    if !st.config.desktop
-        && (existing.len() >= 16
-            || existing.iter().map(|m| m.cells as u64).sum::<u64>() + 655_362 > 4_000_000)
-    {
+    if !st.config.desktop && (existing.len() >= 16) {
         return Err(ApiError::bad_request("当前世界地图数量或总格数已达上限"));
     }
     let world = st
@@ -331,27 +367,42 @@ async fn generate_world(
     let params: tf_core::params::GenerationParams = serde_json::from_str(&world.params_json)?;
 
     let map_id = short_id("map");
-    let freq = params.quality.world_subdiv_freq();
-    let cell_size = params.planet.surface_area_m2() / (10.0 * freq as f64 * freq as f64 + 2.0);
-
+    let descriptor =
+        root_descriptor(&params, st.config.max_patch_side()).map_err(ApiError::bad_request)?;
+    let cells = descriptor.cell_count() as u32;
+    if !st.config.desktop
+        && existing.iter().map(|m| m.cells as u64).sum::<u64>() + cells as u64 > 4_000_000
+    {
+        return Err(ApiError::bad_request("当前工程的总采样数已达上限"));
+    }
+    let kind = match params.start_level {
+        tf_core::params::LevelKind::World => "world",
+        tf_core::params::LevelKind::Continent => "continent",
+        tf_core::params::LevelKind::Region => "region",
+        tf_core::params::LevelKind::Site => "site",
+    };
+    let cell_size = match &descriptor {
+        tf_grid::GridDescriptor::Sphere { .. } => {
+            (params.planet.surface_area_m2() / cells as f64).sqrt()
+        }
+        tf_grid::GridDescriptor::Plane { width_m, size, .. } => width_m / *size as f64,
+        _ => unreachable!(),
+    };
     let node = MapNodeRecord {
         id: map_id.clone(),
         world_id: world_id.clone(),
-        kind: "world".to_string(),
-        name: "世界总图".into(),
+        kind: kind.into(),
+        name: format!("{}总图", params.start_level.name_zh()),
         parent: None,
-        cells: 10 * freq * freq + 2,
-        cell_size_m: cell_size.sqrt(),
-        extent_json: "{\"type\":\"sphere\"}".to_string(),
-        status: "pending".to_string(),
+        cells,
+        cell_size_m: cell_size,
+        extent_json: serde_json::to_string(&descriptor)?,
+        grid: Some(descriptor),
+        status: "pending".into(),
         created_at: now_millis() as i64,
         completed_at: None,
-        grid: Some(tf_grid::GridDescriptor::sphere(
-            freq,
-            params.planet.radius_m,
-        )),
         seed: params.seed,
-        generator_version: "tf-0.2".into(),
+        generator_version: "tf-0.3".into(),
     };
 
     let job_id = st
@@ -695,6 +746,8 @@ struct ChildRequest {
     center_lat: f64,
     /// 覆盖范围的总宽度（米）
     width_m: f64,
+    /// Optional solver spacing. The server returns the actual rounded spacing.
+    cell_size_m: Option<f64>,
     /// 可选的名称
     name: Option<String>,
 }
@@ -731,12 +784,18 @@ async fn generate_child(
     if body.kind != expected || parent.status != "done" {
         return Err(ApiError::bad_request("只能从已完成的父图生成下一层"));
     }
-    let cell_size_m = match body.kind.as_str() {
+    let default_spacing = match body.kind.as_str() {
         "continent" => 1000.,
         "region" => 100.,
         "site" => 1.,
         _ => unreachable!(),
     };
+    let cell_size_m = body.cell_size_m.unwrap_or(default_spacing);
+    if !cell_size_m.is_finite() || cell_size_m < 1. || cell_size_m >= parent.cell_size_m {
+        return Err(ApiError::bad_request(
+            "子图格距必须至少 1 米，并小于父图格距",
+        ));
+    }
     if !body.width_m.is_finite()
         || body.width_m <= 0.
         || !body.center_lat.is_finite()
@@ -758,27 +817,41 @@ async fn generate_child(
     let side = side_f as u32;
     let width_m = side as f64 * cell_size_m;
     let params: tf_core::params::GenerationParams = serde_json::from_str(&world.params_json)?;
-    let grid = tf_grid::GridDescriptor::patch(
-        body.center_lat,
-        body.center_lon,
-        width_m,
-        side,
-        params.planet.radius_m,
-    );
-    grid.validate().map_err(ApiError::bad_request)?;
     let parent_desc = parent
         .grid
         .as_ref()
         .ok_or_else(|| ApiError::bad_request("旧版父图缺少空间描述，请重新生成"))?;
-    if let tf_grid::MapGrid::Patch(parent_grid) = parent_desc.build() {
+    let grid = if let tf_grid::GridDescriptor::Plane {
+        reference_lat,
+        center_lat,
+        ..
+    } = parent_desc
+    {
+        tf_grid::GridDescriptor::Plane {
+            center_lat: body.center_lat,
+            center_lon: body.center_lon,
+            width_m,
+            size: side,
+            rows: side,
+            radius_m: params.planet.radius_m,
+            version: tf_grid::descriptor::PLANE_GRID_VERSION,
+            reference_lat: Some(reference_lat.unwrap_or(*center_lat)),
+        }
+    } else {
+        tf_grid::GridDescriptor::patch(
+            body.center_lat,
+            body.center_lon,
+            width_m,
+            side,
+            params.planet.radius_m,
+        )
+    };
+    grid.validate().map_err(ApiError::bad_request)?;
+    let parent_grid = parent_desc.build();
+    if !matches!(parent_grid, tf_grid::MapGrid::Sphere(_)) {
         use tf_grid::GridOps;
         let child_grid = grid.build();
-        for i in [
-            0,
-            side as usize - 1,
-            (side as usize - 1) * side as usize,
-            side as usize * side as usize - 1,
-        ] {
+        for i in child_grid.boundary_mask().iter_ones() {
             if parent_grid.cell_at(child_grid.center_dir(i)).is_none() {
                 return Err(ApiError::bad_request(
                     "子图超出父图覆盖范围，请缩小选区或移动中心",
@@ -814,7 +887,7 @@ async fn generate_child(
         completed_at: None,
         grid: Some(grid),
         seed: params.seed,
-        generator_version: "tf-0.2".into(),
+        generator_version: "tf-0.3".into(),
     };
     let job_id = st
         .jobs
@@ -984,10 +1057,13 @@ impl ApiError {
             message: msg.into(),
         }
     }
-    fn bad_request(msg: impl Into<String>) -> Self {
+    pub(crate) fn busy(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, msg)
+    }
+    pub(crate) fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, msg)
     }
-    fn not_found(msg: impl Into<String>) -> Self {
+    pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, msg)
     }
 }

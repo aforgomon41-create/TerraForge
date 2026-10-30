@@ -20,6 +20,9 @@ pub fn render_map_png(
     let grid = descriptor.build();
     let height = match &grid {
         MapGrid::Sphere(_) => width / 2,
+        MapGrid::Plane(g) => (width as f64 * g.height() / g.width())
+            .round()
+            .clamp(1., 8192.) as u32,
         MapGrid::Patch(_) => (width as f64 * 3_f64.sqrt() / 2.).round() as u32,
     };
     let colors: Vec<_> = (0..elevation.len())
@@ -60,6 +63,12 @@ pub fn render_map_png(
                             90. - (y as f64 + 0.5) / height as f64 * 180.,
                             (x as f64 + 0.5) / width as f64 * 360. - 180.,
                         )),
+                        MapGrid::Plane(g) => g
+                            .cell_at_xy(
+                                ((x as f64 + 0.5) / width as f64 - 0.5) * g.width(),
+                                (0.5 - (y as f64 + 0.5) / height as f64) * g.height(),
+                            )
+                            .unwrap_or(0),
                         MapGrid::Patch(g) => {
                             let side = (g.cell_count() as f64).sqrt() as usize;
                             let r = ((y as f64 + 0.5) / height as f64 * side as f64)

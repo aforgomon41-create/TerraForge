@@ -22,9 +22,8 @@ pub fn run_child_generation(
         .grid
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("地图缺少网格描述"))?;
-    let tf_grid::MapGrid::Patch(patch) = descriptor.build() else {
-        anyhow::bail!("子图必须使用局部网格")
-    };
+    let patch = descriptor.build();
+    anyhow::ensure!(patch.extent_m().is_some(), "子图必须使用有限平面域");
     let parent = store
         .get_map_node(
             node.parent
@@ -53,6 +52,39 @@ pub fn run_child_generation(
     fields.elevation = sample.elevation.clone();
     fields.distance_to_sea = tf_sim::downscale::interpolate_from_grid(&parent_grid, &patch, &pd)
         .map_err(anyhow::Error::msg)?;
+    // Add only wavelengths the parent could not resolve, using a stable root coordinate frame.
+    let mut root = parent.clone();
+    while let Some(id) = &root.parent {
+        root = store
+            .get_map_node(id)?
+            .ok_or_else(|| anyhow::anyhow!("缺少根地图"))?;
+    }
+    let root_grid = root
+        .grid
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("缺少根几何"))?
+        .build();
+    let world_seed = store
+        .get_world(&node.world_id)?
+        .ok_or_else(|| anyhow::anyhow!("缺少工程"))?
+        .seed;
+    let noise = tf_core::noise::SimplexNoise::new(world_seed ^ 0x0ED0_6E17);
+    let crust = field(Channel::CrustType)?;
+    let child_crust = tf_sim::downscale::interpolate_from_grid(&parent_grid, &patch, &crust)
+        .map_err(anyhow::Error::msg)?;
+    for i in 0..patch.cell_count() {
+        let dir = patch.center_dir(i);
+        let p = if let tf_grid::MapGrid::Plane(g) = &root_grid {
+            let (x, y) = g.project(dir);
+            glam::DVec3::new(x, y, 0.)
+        } else {
+            dir.as_vec() * root_grid.radius_m()
+        };
+        let detail = tf_sim::terrain::interior_detail(&noise, p, node.cell_size_m)
+            - tf_sim::terrain::interior_detail(&noise, p, parent.cell_size_m);
+        fields.elevation[i] +=
+            (detail * params.interior_relief * (0.12 + 0.88 * child_crust[i] as f64)) as f32;
+    }
     let weights = tf_sim::downscale::constraint_weights(&patch);
     tf_sim::downscale::blend_with_parent(&patch, &mut fields.elevation, &sample, &weights, true);
     fields.temperature = sample.temperature.clone();
@@ -155,7 +187,7 @@ pub fn run_child_generation(
     for (channel, data) in &inherited {
         channels.push((*channel, data.as_slice()));
     }
-    store.publish_fields(&node.id,&channels,&serde_json::json!({"generator_version":"tf-0.2","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates")}))?;
+    store.publish_fields(&node.id,&channels,&serde_json::json!({"generator_version":"tf-0.3","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates")}))?;
     progress("完成", 1.);
     Ok(())
 }

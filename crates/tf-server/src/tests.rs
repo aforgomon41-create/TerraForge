@@ -143,6 +143,11 @@ async fn capabilities_isolate_world_map_field_job_events_and_delete() {
         ("POST", format!("/api/v1/worlds/{w}/generate")),
         ("GET", "/api/v1/maps/map-test".into()),
         ("GET", "/api/v1/maps/map-test/field/elevation".into()),
+        ("GET", "/api/v1/maps/map-test/surface".into()),
+        (
+            "GET",
+            "/api/v1/maps/map-test/overlay?spacing_m=100000".into(),
+        ),
         ("GET", "/api/v1/jobs/job-test".into()),
         ("POST", "/api/v1/jobs/job-test/cancel".into()),
         ("GET", "/api/v1/events?job_id=job-test".into()),
@@ -406,4 +411,137 @@ async fn static_assets_and_api_work_under_the_deployment_prefix() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(response.headers()["location"], "/map/");
+}
+
+#[test]
+fn every_starting_scope_has_a_real_independent_domain() {
+    use tf_core::params::{GenerationParams, LevelKind, WorldShape};
+    let narrow = GenerationParams {
+        world_shape: WorldShape::Plane,
+        map_height_m: 4.,
+        ..Default::default()
+    };
+    assert!(api::root_descriptor(&narrow, 512).is_err());
+    for kind in [
+        LevelKind::World,
+        LevelKind::Continent,
+        LevelKind::Region,
+        LevelKind::Site,
+    ] {
+        for shape in [WorldShape::Sphere, WorldShape::Plane] {
+            let p = GenerationParams {
+                start_level: kind,
+                world_shape: shape,
+                ..Default::default()
+            };
+            let descriptor = api::root_descriptor(&p, 32).unwrap();
+            assert_eq!(
+                matches!(descriptor, tf_grid::GridDescriptor::Sphere { .. }),
+                kind == LevelKind::World && shape == WorldShape::Sphere
+            );
+            descriptor.validate().unwrap();
+        }
+    }
+}
+#[tokio::test]
+async fn independent_region_plane_child_geometry_and_project_round_trip() {
+    use tf_grid::GridOps;
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let w = f.world(&token).await;
+    let params = tf_core::params::GenerationParams {
+        seed: 42,
+        start_level: tf_core::params::LevelKind::Region,
+        map_width_m: 64000.,
+        map_height_m: 55000.,
+        center_lat_deg: 25.,
+        center_lon_deg: 179.9,
+        quality: tf_core::params::SimQuality::Economy,
+        ..Default::default()
+    };
+    let mut world = f.state.store.get_world(&w).unwrap().unwrap();
+    world.params_json = serde_json::to_string(&params).unwrap();
+    f.state.store.put_world(&world).unwrap();
+    let descriptor = api::root_descriptor(&params, 32).unwrap();
+    let mut n = node(&w, "region-root");
+    n.kind = "region".into();
+    n.grid = Some(descriptor.clone());
+    n.cells = descriptor.cell_count() as u32;
+    n.cell_size_m = params.map_width_m / 32.;
+    n.generator_version = "tf-0.3".into();
+    f.state
+        .store
+        .submit_job(&n, &job(&w, &n.id, "root-job"))
+        .unwrap();
+    f.state
+        .store
+        .transition_job("root-job", "running", None)
+        .unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel(16);
+    crate::generate::run_generation(
+        &f.state.store,
+        &tx,
+        "root-job",
+        &n.id,
+        &n,
+        &params,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(
+        f.state.store.get_map_node(&n.id).unwrap().unwrap().status,
+        "done"
+    );
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/maps/{}/surface", n.id))
+                .header("host", "test.local")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+    let read = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+    assert_eq!(read(0), 1);
+    assert_eq!(read(4), n.cells);
+    assert_eq!(
+        bytes.len(),
+        12 + n.cells as usize * 12 + read(8) as usize * 4
+    );
+    let (status,result)=f.request("POST",&format!("/api/v1/maps/{}/children",n.id),Some(&token),Some(json!({"kind":"site","center_lat":25.05,"center_lon":179.9,"width_m":16000.,"cell_size_m":500.}))).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let id = result["map_id"].as_str().unwrap();
+    let jid = result["job_id"].as_str().unwrap();
+    for _ in 0..500 {
+        let j = f.state.store.get_job(jid).unwrap().unwrap();
+        if j.state == "done" {
+            break;
+        }
+        assert_ne!(j.state, "failed", "{:?}", j.error);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let child = f.state.store.get_map_node(id).unwrap().unwrap();
+    assert_eq!(child.status, "done");
+    let Some(tf_grid::GridDescriptor::Plane { reference_lat, .. }) = &child.grid else {
+        panic!("child must retain planar metric")
+    };
+    assert_eq!(*reference_lat, Some(25.));
+    let parent_grid = descriptor.build();
+    let child_grid = child.grid.as_ref().unwrap().build();
+    for i in 0..child.cells as usize {
+        assert!(parent_grid.cell_at(child_grid.center_dir(i)).is_some());
+    }
+    let data = project::export(&f.state.store, &w).unwrap();
+    let imported = project::import(&f.state.store, &data, "new-owner", &f.state.config).unwrap();
+    let maps = f.state.store.list_map_nodes(&imported.id).unwrap();
+    assert_eq!(maps.len(), 2);
+    assert!(maps
+        .iter()
+        .any(|m| m.parent.is_none() && m.kind == "region"));
 }

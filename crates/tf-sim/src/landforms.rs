@@ -121,7 +121,11 @@ pub fn spread_by_distance<G: GridOps>(grid: &G, sources: &[f32], sigma_m: f64) -
         })
         .collect()
 }
-fn nearest_sources<G: GridOps>(grid: &G, sources: &[f32], cutoff: f64) -> (Vec<f64>, Vec<usize>) {
+pub(crate) fn nearest_sources<G: GridOps>(
+    grid: &G,
+    sources: &[f32],
+    cutoff: f64,
+) -> (Vec<f64>, Vec<usize>) {
     use std::{cmp::Ordering, collections::BinaryHeap};
     #[derive(PartialEq)]
     struct Step(f64, usize, usize);
@@ -281,6 +285,8 @@ mod tests {
             kind: crate::fields::BoundaryKind::Convergent,
             subtype: BoundarySubtype::OceanOceanConvergent,
             normal_velocity: 100000.,
+            tangential_velocity: 0.,
+            normal: [1., 0., 0.],
         };
         apply_volcanic_arcs(&grid, &mut fields, &[boundary], &LandformParams::default());
         assert!(fields.elevation.iter().any(|&e| e > 0.));

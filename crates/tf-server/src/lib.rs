@@ -8,6 +8,7 @@ pub mod jobs;
 mod project;
 pub mod render;
 pub mod store;
+mod surface;
 
 use api::AppState;
 use axum::Router;
@@ -100,7 +101,7 @@ pub fn application(state: &AppState, web: Option<Router>) -> anyhow::Result<Rout
                 );
         }
     }
-    Ok(app)
+    Ok(app.layer(tower_http::compression::CompressionLayer::new()))
 }
 
 #[cfg(test)]

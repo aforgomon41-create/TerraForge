@@ -77,7 +77,7 @@ pub fn export(store: &Store, world_id: &str) -> anyhow::Result<Vec<u8>> {
     );
     Ok(serde_json::to_vec(&Project {
         format: FORMAT.into(),
-        generator_version: "tf-0.2".into(),
+        generator_version: "tf-0.3".into(),
         world,
         maps,
     })?)
@@ -100,7 +100,8 @@ pub fn import(
         "地质元数据超过当前模式限制"
     );
     anyhow::ensure!(
-        project.format == FORMAT && project.generator_version == "tf-0.2",
+        project.format == FORMAT
+            && matches!(project.generator_version.as_str(), "tf-0.2" | "tf-0.3"),
         "不支持的工程版本"
     );
     let limit = if config.desktop { 256 } else { 16 };
@@ -144,6 +145,11 @@ pub fn import(
         !world.name.trim().is_empty() && world.name.chars().count() <= 80,
         "世界名称无效"
     );
+    let parent_nodes: HashMap<_, _> = project
+        .maps
+        .iter()
+        .map(|m| (m.node.id.clone(), m.node.clone()))
+        .collect();
     let mut maps = Vec::new();
     for m in project.maps {
         let mut node = m.node;
@@ -161,11 +167,26 @@ pub fn import(
             "网格与格数不匹配"
         );
         anyhow::ensure!(
-            node.generator_version == "tf-0.2" && node.status == "done",
+            matches!(node.generator_version.as_str(), "tf-0.2" | "tf-0.3") && node.status == "done",
             "地图版本或状态无效"
         );
         anyhow::ensure!(node.name.chars().count() <= 80, "地图名称过长");
         match descriptor {
+            tf_grid::GridDescriptor::Plane { size, rows, .. } => {
+                anyhow::ensure!(*size <= max_patch && *rows <= max_patch, "平面网格精度超限");
+                if node.parent.is_none() {
+                    anyhow::ensure!(
+                        node.kind
+                            == match params.start_level {
+                                tf_core::params::LevelKind::World => "world",
+                                tf_core::params::LevelKind::Continent => "continent",
+                                tf_core::params::LevelKind::Region => "region",
+                                tf_core::params::LevelKind::Site => "site",
+                            },
+                        "独立地图类型与工程参数不一致"
+                    );
+                }
+            }
             tf_grid::GridDescriptor::Sphere { frequency, .. } => anyhow::ensure!(
                 node.kind == "world" && node.parent.is_none() && *frequency <= max_frequency,
                 "世界网格精度或父级无效"
@@ -186,11 +207,65 @@ pub fn import(
                     kinds.get(parent).map(String::as_str) == Some(expected.0),
                     "地图父子关系无效"
                 );
-                anyhow::ensure!(
-                    (width_m / *size as f64 - expected.1).abs() < 0.001,
-                    "局部图格宽无效"
-                );
+                anyhow::ensure!(width_m / *size as f64 >= 1., "局部图格宽无效");
             }
+        }
+        if let Some(parent_id) = &node.parent {
+            let parent = parent_nodes
+                .get(parent_id)
+                .ok_or_else(|| anyhow::anyhow!("地图父图不存在"))?;
+            let expected = match parent.kind.as_str() {
+                "world" => "continent",
+                "continent" => "region",
+                "region" => "site",
+                _ => anyhow::bail!("地图父子关系无效"),
+            };
+            anyhow::ensure!(
+                node.kind == expected
+                    && node.cell_size_m >= 1.
+                    && node.cell_size_m < parent.cell_size_m,
+                "子图层级或格距无效"
+            );
+            match (parent.grid.as_ref(), descriptor) {
+                (
+                    Some(tf_grid::GridDescriptor::Plane {
+                        center_lat,
+                        reference_lat,
+                        ..
+                    }),
+                    tf_grid::GridDescriptor::Plane {
+                        center_lat: child_lat,
+                        reference_lat: child_ref,
+                        ..
+                    },
+                ) => anyhow::ensure!(
+                    (reference_lat.unwrap_or(*center_lat) - child_ref.unwrap_or(*child_lat)).abs()
+                        < 1e-8,
+                    "平面子图坐标基准不一致"
+                ),
+                (
+                    Some(
+                        tf_grid::GridDescriptor::Sphere { .. }
+                        | tf_grid::GridDescriptor::Patch { .. },
+                    ),
+                    tf_grid::GridDescriptor::Patch { .. },
+                ) => {}
+                _ => anyhow::bail!("父子图的空间形状不一致"),
+            }
+        }
+        if node.generator_version == "tf-0.3" {
+            let spacing = match descriptor {
+                tf_grid::GridDescriptor::Plane { width_m, size, .. }
+                | tf_grid::GridDescriptor::Patch { width_m, size, .. } => *width_m / *size as f64,
+                tf_grid::GridDescriptor::Sphere { radius_m, .. } => {
+                    (4. * std::f64::consts::PI * radius_m.powi(2) / descriptor.cell_count() as f64)
+                        .sqrt()
+                }
+            };
+            anyhow::ensure!(
+                node.cell_size_m.is_finite() && (node.cell_size_m - spacing).abs() < spacing * 1e-6,
+                "地图采样间距与几何不一致"
+            );
         }
         let mut channels = Vec::new();
         for (name, field) in m.channels {
