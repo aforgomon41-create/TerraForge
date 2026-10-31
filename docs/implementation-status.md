@@ -6,6 +6,8 @@
 
 2026-10-31 的最新改进见 [形态修正记录](morphology-validation-2026-10-31.md) 与 [科学模型实现](scientific-model-implementation.md)。当前 `/map/` 已由另一套 geogen 程序使用，下文 0.2 网址与性能仅为历史记录。
 
+同日形态候选版已在独立 `/terraforge/` 上线；[部署记录](deployment-morphology-2026-10-31.md) 包含实际生成、工程往返、外网响应与未完成的浏览器验收范围。
+
 本文主体为 0.2 发布时的历史验收记录，不能据此推断新算法或其视觉质量已经验收。0.3 开发分支的连续地形、降雨、网格与独立生成状态另见 [generation-v03-progress.md](generation-v03-progress.md)，目前未部署正式产品。
 
 ## 对应审计项
