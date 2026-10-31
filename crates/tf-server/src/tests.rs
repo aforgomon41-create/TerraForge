@@ -608,3 +608,34 @@ async fn automatic_seeds_and_scope_defaults_preserve_explicit_overrides() {
     assert_eq!(p.map_height_m, 7500.);
     assert_eq!(p.base_elevation_m, 150.);
 }
+
+#[tokio::test]
+async fn plane_coast_preference_is_saved_and_missing_values_keep_legacy_cropping() {
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    for setting in [None, Some(false), Some(true)] {
+        let mut params = json!({"world_shape":"plane"});
+        if let Some(value) = setting {
+            params["allow_land_at_edge"] = json!(value);
+        }
+        let (status, body) = f
+            .request(
+                "POST",
+                "/api/v1/worlds",
+                Some(&token),
+                Some(json!({"name":"Flat coast", "seed":42, "params":params})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let world = f
+            .state
+            .store
+            .get_world(body["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let p: tf_core::params::GenerationParams =
+            serde_json::from_str(&world.params_json).unwrap();
+        assert_eq!(p.world_shape, tf_core::params::WorldShape::Plane);
+        assert_eq!(p.allow_land_at_edge, setting.unwrap_or(true));
+    }
+}

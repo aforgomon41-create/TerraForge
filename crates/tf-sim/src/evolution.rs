@@ -9,6 +9,8 @@ use tf_grid::{FlatGrid, GridOps, MapGrid, SphereHexGrid};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct History {
+    #[serde(default)]
+    pub model: String,
     pub duration_myr: f64,
     pub steps: u32,
     pub initial_crust_m3: f64,
@@ -36,6 +38,72 @@ pub struct Volcano {
     pub along_arc: [f64; 3],
     #[serde(default)]
     pub arc_platform_fraction: f64,
+    #[serde(default)]
+    pub shape_seed: u64,
+    /// Time since the last growth episode; distinct from the edifice's age.
+    #[serde(default)]
+    pub quiet_myr: f64,
+    /// Present relief after decay, allowing new growth on an old edifice.
+    #[serde(default)]
+    pub preserved_growth_m: Option<f64>,
+}
+
+fn volcano_amplitude(v: &Volcano) -> f64 {
+    v.preserved_growth_m.unwrap_or_else(|| {
+        let lifetime = if v.origin == "hotspot" { 75. } else { 28. };
+        v.summit_growth_m * (-v.age_myr / lifetime).exp()
+    })
+}
+
+struct Hotspot {
+    position: DVec3,
+    next_eruption: f64,
+    episode: u64,
+    seed: u64,
+}
+
+fn hotspot_events(
+    grid: &MapGrid,
+    f: &WorldFields,
+    state: &TectonicState,
+    history: &mut History,
+    hotspots: &mut [Hotspot],
+    elapsed: f64,
+) {
+    for source in hotspots {
+        while elapsed >= source.next_eruption {
+            let mut rng = DeterministicRng::derive(source.seed ^ source.episode, "plume-episode");
+            let age = elapsed - source.next_eruption;
+            if let Some(cell) = locate(grid, source.position) {
+                let plate_id = f.plate_id[cell];
+                let (east, north) = if grid.field_is_planar() {
+                    (DVec3::X, DVec3::Y)
+                } else {
+                    UnitVec3::from_vec(source.position).unwrap().tangent_frame()
+                };
+                let bearing = rng.range_f64(0., std::f64::consts::TAU);
+                let along = east * bearing.cos() + north * bearing.sin();
+                history.volcanoes.push(Volcano {
+                    position_m: move_point(state, plate_id as usize, source.position, age)
+                        .to_array(),
+                    plate_id,
+                    age_myr: age,
+                    radius_m: rng.range_f64(22_000., 90_000.),
+                    summit_growth_m: rng.range_f64(2400., 8800.),
+                    origin: "hotspot".into(),
+                    along_arc: along.to_array(),
+                    arc_platform_fraction: 0.,
+                    shape_seed: source.seed ^ source.episode,
+                    quiet_myr: age,
+                    preserved_growth_m: None,
+                });
+            }
+            source.episode += 1;
+            // Each mantle source has its own episodic clock and quiet periods.
+            // Event spacing follows plate travel during these unequal intervals.
+            source.next_eruption += rng.range_f64(1.2, 9.5);
+        }
+    }
 }
 
 pub fn rotate(point: DVec3, axis: DVec3, radians: f64) -> DVec3 {
@@ -196,6 +264,81 @@ fn transport_parameter(state: &TectonicState, id: usize) -> DVec3 {
 
 /// Transfer crustal volume and tracer moments to the moved positions, then account
 /// explicitly for newly exposed mantle and sinking oceanic material.
+struct Reconstruction {
+    value: f64,
+    gradient: DVec3,
+    low: f64,
+    high: f64,
+}
+impl Reconstruction {
+    fn sample(&self, offset: DVec3) -> f64 {
+        (self.value + self.gradient.dot(offset)).clamp(self.low, self.high)
+    }
+}
+
+/// Least-squares gradients with a local extrema limiter on the physical mesh.
+fn reconstruction(grid: &MapGrid, values: &[f64]) -> Vec<Reconstruction> {
+    (0..grid.cell_count())
+        .map(|i| {
+            let (east, north) = if grid.field_is_planar() {
+                (DVec3::X, DVec3::Y)
+            } else {
+                grid.center_dir(i).tangent_frame()
+            };
+            let p = grid.field_position(i);
+            let (mut xx, mut xy, mut yy, mut vx, mut vy) = (0., 0., 0., 0., 0.);
+            let (mut low, mut high) = (values[i], values[i]);
+            for &j in grid.neighbors(i) {
+                let j = j as usize;
+                let d = grid.field_position(j) - p;
+                let (x, y) = (d.dot(east), d.dot(north));
+                let weight = 1. / d.length_squared().max(1.);
+                xx += x * x * weight;
+                xy += x * y * weight;
+                yy += y * y * weight;
+                vx += x * (values[j] - values[i]) * weight;
+                vy += y * (values[j] - values[i]) * weight;
+                low = low.min(values[j]);
+                high = high.max(values[j]);
+            }
+            let determinant = xx * yy - xy * xy;
+            let mut gradient = if determinant > 1e-12 {
+                east * ((yy * vx - xy * vy) / determinant)
+                    + north * ((xx * vy - xy * vx) / determinant)
+            } else {
+                DVec3::ZERO
+            };
+            let mut limit = 1_f64;
+            for &j in grid.neighbors(i) {
+                let delta = gradient.dot((grid.field_position(j as usize) - p) * 0.5);
+                if delta > 1e-20 {
+                    limit = limit.min((high - values[i]) / delta);
+                } else if delta < -1e-20 {
+                    limit = limit.min((low - values[i]) / delta);
+                }
+            }
+            gradient *= limit.clamp(0., 1.);
+            Reconstruction {
+                value: values[i],
+                gradient,
+                low,
+                high,
+            }
+        })
+        .collect()
+}
+
+fn flux_limit(flat: f64, proposed: f64, low: f64, high: f64) -> f64 {
+    let delta = proposed - flat;
+    if delta > 1e-20 {
+        ((high - flat) / delta).clamp(0., 1.)
+    } else if delta < -1e-20 {
+        ((low - flat) / delta).clamp(0., 1.)
+    } else {
+        1.
+    }
+}
+
 fn remap(
     grid: &MapGrid,
     geometry: &[Vec<(usize, DVec3)>],
@@ -216,15 +359,39 @@ fn remap(
     let mut orogen_age = vec![0.; n];
     let mut shear_strain = vec![0.; n];
     let mut votes = vec![0_f64; n * count];
+    let thickness: Vec<_> = f.crust_thickness.iter().map(|v| *v as f64).collect();
+    let reference_height: Vec<_> = f
+        .reference_crust_thickness
+        .iter()
+        .map(|v| *v as f64)
+        .collect();
+    let continental: Vec<_> = thickness
+        .iter()
+        .zip(&f.crust_type)
+        .map(|(h, c)| h * (*c as f64))
+        .collect();
+    let rh = reconstruction(grid, &thickness);
+    let rr = reconstruction(grid, &reference_height);
+    let rc = reconstruction(grid, &continental);
     for i in 0..n {
         let area = grid.area_m2(i);
         let plate = f.plate_id[i] as usize;
         let motion = transport_parameter(state, plate);
+        // Face fluxes carry reconstructed rock densities, with a half-step
+        // predictor. The retained mass is the exact donor remainder.
+        let p = grid.field_position(i);
+        let predictor = velocity(state, plate, p) * dt * 0.5;
         let mut shares: Vec<_> = geometry[i]
             .iter()
-            .map(|&(j, metric)| (j, motion.dot(metric).max(0.) * dt))
+            .map(|&(j, metric)| {
+                (
+                    Some(j),
+                    motion.dot(metric).max(0.) * dt,
+                    (grid.field_position(j) - p) * 0.5 - predictor,
+                )
+            })
+            .filter(|(_, a, _)| *a > 0.)
             .collect();
-        let mut outward = 0.;
         let mut inward = 0.;
         if grid.field_is_planar() && grid.neighbors(i).len() < 6 {
             let spacing = grid.distance_m(i, grid.neighbors(i)[0] as usize);
@@ -242,7 +409,9 @@ fn remap(
                     (grid.field_position(j) - p - direction * spacing).length() < spacing * 0.1
                 }) {
                     let flux = motion.dot(direction) * area * 2. / (3. * spacing) * dt;
-                    outward += flux.max(0.);
+                    if flux > 0. {
+                        shares.push((None, flux, direction * spacing * 0.5 - predictor));
+                    }
                     inward += (-flux).max(0.);
                 }
             }
@@ -256,16 +425,67 @@ fn remap(
         age[i] += inward * 70.;
         votes[i * count + plate] += inward;
         history.imported_crust_m3 += inward * 7000.;
-        let outgoing = shares.iter().map(|(_, a)| a).sum::<f64>() + outward;
+        let outgoing = shares.iter().map(|(_, a, _)| a).sum::<f64>();
         assert!(outgoing <= area * 0.51, "tectonic CFL violated");
-        history.exported_crust_m3 += f.crust_thickness[i] as f64 * outward;
-        shares.push((i, area - outgoing));
-        for (j, share) in shares {
-            let v = f.crust_thickness[i] as f64 * share;
+        let retained_area = area - outgoing;
+        let sum_h = shares
+            .iter()
+            .map(|(_, a, d)| rh[i].sample(*d) * a)
+            .sum::<f64>();
+        let sum_r = shares
+            .iter()
+            .map(|(_, a, d)| rr[i].sample(*d) * a)
+            .sum::<f64>();
+        let lh = flux_limit(
+            thickness[i] * outgoing,
+            sum_h,
+            thickness[i] * area - rh[i].high * retained_area,
+            thickness[i] * area - rh[i].low * retained_area,
+        );
+        let lr = flux_limit(
+            reference_height[i] * outgoing,
+            sum_r,
+            reference_height[i] * area - rr[i].high * retained_area,
+            reference_height[i] * area - rr[i].low * retained_area,
+        );
+        let hface = |d| thickness[i] + lh * (rh[i].sample(d) - thickness[i]);
+        let rface = |d| reference_height[i] + lr * (rr[i].sample(d) - reference_height[i]);
+        let out_h = shares.iter().map(|(_, a, d)| hface(*d) * a).sum::<f64>();
+        let retained_h = (thickness[i] * area - out_h).max(0.);
+        let fraction_c = f.crust_type[i] as f64;
+        let out_c = shares
+            .iter()
+            .map(|(_, a, d)| rc[i].sample(*d).clamp(0., hface(*d)) * a)
+            .sum::<f64>();
+        let lc = flux_limit(
+            fraction_c * out_h,
+            out_c,
+            (continental[i] * area - retained_h).max(0.),
+            (continental[i] * area).min(out_h),
+        );
+        let mut kept_c = continental[i] * area;
+        let mut kept_r = reference_height[i] * area;
+        let mut transfers = Vec::with_capacity(shares.len() + 1);
+        for (j, a, d) in shares {
+            let h = hface(d) * a;
+            let r = rface(d) * a;
+            let c = (fraction_c * hface(d)
+                + lc * (rc[i].sample(d).clamp(0., hface(d)) - fraction_c * hface(d)))
+                * a;
+            kept_c -= c;
+            kept_r -= r;
+            if let Some(j) = j {
+                transfers.push((j, a, h, c, r));
+            } else {
+                history.exported_crust_m3 += h;
+            }
+        }
+        transfers.push((i, retained_area, retained_h, kept_c.max(0.), kept_r.max(0.)));
+        for (j, share, h, c, r) in transfers {
             coverage[j] += share;
-            volume[j] += v;
-            continental_volume[j] += v * f.crust_type[i] as f64;
-            reference[j] += f.reference_crust_thickness[i] as f64 * share;
+            volume[j] += h;
+            continental_volume[j] += c;
+            reference[j] += r;
             basement[j] += f.elevation[i] as f64 * share;
             age[j] += f.crust_age[i] as f64 * share;
             strain[j] += f.crustal_strain[i] as f64 * share;
@@ -374,28 +594,12 @@ fn volcano_events(
     f: &WorldFields,
     state: &TectonicState,
     history: &mut History,
-    hotspots: &[DVec3],
     elapsed: f64,
     seed: u64,
 ) {
     let mut rng = DeterministicRng::derive(seed ^ elapsed.to_bits(), "volcanic-events");
-    for &p in hotspots {
-        let Some(cell) = locate(grid, p) else {
-            continue;
-        };
-        history.volcanoes.push(Volcano {
-            position_m: p.to_array(),
-            plate_id: f.plate_id[cell],
-            age_myr: 0.,
-            radius_m: rng.range_f64(30_000., 65_000.),
-            summit_growth_m: rng.range_f64(4800., 7500.),
-            origin: "hotspot".into(),
-            along_arc: [0.; 3],
-            arc_platform_fraction: 0.,
-        });
-    }
     let boundaries = crate::plates::find_boundaries(grid, &f.plate_id, state, f);
-    let mut chosen: Vec<DVec3> = Vec::new();
+    let mut candidates = Vec::new();
     let productivity = tf_core::noise::SimplexNoise::new(seed ^ 0xA7C0_1440);
     for b in boundaries {
         if b.kind != crate::BoundaryKind::Convergent || b.normal_velocity < 8000. {
@@ -420,22 +624,6 @@ fn volcano_events(
         if !grid.field_is_planar() {
             p = p.normalize() * grid.radius_m();
         }
-        if chosen
-            .iter()
-            .any(|q| (*q - p).length_squared() < 220000_f64.powi(2))
-        {
-            continue;
-        }
-        // A volcanic front reuses long-lived centres; it does not plant a new
-        // regular row of identical cones at every reconstruction epoch.
-        if history.volcanoes.iter().any(|v| {
-            v.origin == "subduction_arc"
-                && v.plate_id == f.plate_id[upper]
-                && v.age_myr < 100.
-                && (DVec3::from_array(v.position_m) - p).length_squared() < 700000_f64.powi(2)
-        }) {
-            continue;
-        }
         if locate(grid, p).is_none() {
             continue;
         }
@@ -459,21 +647,71 @@ fn volcano_events(
             p.normalize().cross(normal)
         }
         .normalize_or_zero();
-        chosen.push(p);
-        history.volcanoes.push(Volcano {
-            position_m: p.to_array(),
-            plate_id: f.plate_id[upper],
-            age_myr: 0.,
-            radius_m: rng.range_f64(25000., 55000.),
-            summit_growth_m: if f.crust_type[upper] < 0.25 {
-                rng.range_f64(5000., 7500.)
-            } else {
-                rng.range_f64(700., 1800.)
+        let radius = rng.range_f64(18_000., 65_000.) * (1. + supply * 0.4);
+        let priority = supply + (b.normal_velocity / 60_000.).min(1.) * 0.25;
+        candidates.push((
+            priority,
+            Volcano {
+                position_m: p.to_array(),
+                plate_id: f.plate_id[upper],
+                age_myr: 0.,
+                radius_m: radius,
+                summit_growth_m: if f.crust_type[upper] < 0.25 {
+                    rng.range_f64(2800., 8500.)
+                } else {
+                    rng.range_f64(700., 1800.)
+                },
+                origin: "subduction_arc".into(),
+                along_arc: along.to_array(),
+                arc_platform_fraction: 0.35,
+                shape_seed: seed ^ elapsed.to_bits() ^ b.cell as u64,
+                quiet_myr: 0.,
+                preserved_growth_m: None,
             },
-            origin: "subduction_arc".into(),
-            along_arc: along.to_array(),
-            arc_platform_fraction: 0.35,
-        });
+        ));
+    }
+    // Select productive segments first, rather than filling the front in cell
+    // order. Edifice footprints set the spacing; no fixed 700-km exclusion belt.
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut chosen: Vec<usize> = Vec::new();
+    for (_, candidate) in candidates {
+        let p = DVec3::from_array(candidate.position_m);
+        let overlaps = |v: &Volcano| {
+            v.origin == "subduction_arc"
+                && v.plate_id == candidate.plate_id
+                && (DVec3::from_array(v.position_m) - p).length()
+                    < (v.radius_m + candidate.radius_m) * 2.5
+        };
+        if chosen.iter().any(|&i| overlaps(&history.volcanoes[i])) {
+            continue;
+        }
+        let nearby = history
+            .volcanoes
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| overlaps(v))
+            .min_by(|(_, a), (_, b)| {
+                (DVec3::from_array(a.position_m) - p)
+                    .length_squared()
+                    .total_cmp(&(DVec3::from_array(b.position_m) - p).length_squared())
+            })
+            .map(|(i, _)| i);
+        if let Some(i) = nearby {
+            let v = &mut history.volcanoes[i];
+            // Recharge an existing centre, retaining its original birth and
+            // plate trajectory. Growth is a bounded procedural magma proxy.
+            if v.quiet_myr >= 4. {
+                v.preserved_growth_m =
+                    Some((volcano_amplitude(v) + candidate.summit_growth_m * 0.12).min(9500.));
+                v.summit_growth_m =
+                    (v.summit_growth_m + candidate.summit_growth_m * 0.12).min(9500.);
+                v.quiet_myr = 0.;
+            }
+            chosen.push(i);
+        } else {
+            chosen.push(history.volcanoes.len());
+            history.volcanoes.push(candidate);
+        }
     }
 }
 
@@ -573,6 +811,7 @@ pub fn generate<G: GridOps>(
     }
     material.orogen_age.fill(150.);
     let mut history = History {
+        model: "muscl-conservative-terrane+episodic-volcanism-v2".into(),
         initial_crust_m3: crust_volume(&grid, &material),
         duration_myr: params.tectonic_age_myr,
         ..Default::default()
@@ -589,9 +828,9 @@ pub fn generate<G: GridOps>(
         })
         .fold(0., f64::max);
     let mut hot_rng = DeterministicRng::derive(params.seed, "mantle-hotspots");
-    let hotspots: Vec<_> = (0..params.hotspot_count)
-        .map(|_| {
-            if let Some((w, h)) = grid.extent_m() {
+    let mut hotspots: Vec<_> = (0..params.hotspot_count)
+        .map(|id| {
+            let position = if let Some((w, h)) = grid.extent_m() {
                 DVec3::new(
                     hot_rng.range_f64(-0.45, 0.45) * w,
                     hot_rng.range_f64(-0.45, 0.45) * h,
@@ -599,10 +838,17 @@ pub fn generate<G: GridOps>(
                 )
             } else {
                 hot_rng.unit_sphere().as_vec() * grid.radius_m()
+            };
+            Hotspot {
+                position,
+                next_eruption: hot_rng.range_f64(0.5, 10.),
+                episode: 1,
+                seed: params.seed ^ (id as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15),
             }
         })
         .collect();
-    let mut next_event = 8.;
+    let mut arc_rng = DeterministicRng::derive(params.seed, "arc-epochs");
+    let mut next_event = arc_rng.range_f64(3., 10.);
     let mut elapsed = 0.;
     while elapsed < params.tectonic_age_myr {
         if history.steps >= 4096 {
@@ -636,6 +882,10 @@ pub fn generate<G: GridOps>(
             )
             .to_array();
             v.age_myr += dt;
+            v.quiet_myr += dt;
+            if let Some(height) = &mut v.preserved_growth_m {
+                *height *= (-dt / 28.).exp();
+            }
         }
         remap(&grid, &geometry, &mut material, &state, dt, &mut history);
         collision_resistance(&grid, &mut material, &mut state, dt);
@@ -644,17 +894,24 @@ pub fn generate<G: GridOps>(
         }
         elapsed += dt;
         history.steps += 1;
+        hotspot_events(
+            &grid,
+            &material,
+            &state,
+            &mut history,
+            &mut hotspots,
+            elapsed,
+        );
         if elapsed >= next_event {
             volcano_events(
                 &grid,
                 &material,
                 &state,
                 &mut history,
-                &hotspots,
-                elapsed,
+                next_event,
                 params.seed,
             );
-            next_event += 8.;
+            next_event += arc_rng.range_f64(4., 11.);
         }
         progress(elapsed / params.tectonic_age_myr);
     }
@@ -739,7 +996,27 @@ pub fn landforms<G: GridOps>(
 ) {
     let noise = tf_core::noise::SimplexNoise::new(params.seed ^ 0x0ED0_6E17);
     let sampling = (grid.area_m2(0) * 2. / 3_f64.sqrt()).sqrt();
-    let bin_size = 400000.;
+    let axis_ratio = |v: &Volcano| {
+        if v.shape_seed == 0 {
+            1.
+        } else {
+            0.7 + (v.shape_seed % 1009) as f64 / 1009. * 0.8
+        }
+    };
+    let support = |v: &Volcano| {
+        let ratio = axis_ratio(v);
+        (v.radius_m * ratio.max(1. / ratio)).max(if v.arc_platform_fraction > 0. {
+            80000.
+        } else {
+            0.
+        }) * 4.
+    };
+    let bin_size = state
+        .history
+        .volcanoes
+        .iter()
+        .map(support)
+        .fold(400000., f64::max);
     let key = |p: DVec3| {
         (
             (p.x / bin_size).floor() as i32,
@@ -764,13 +1041,29 @@ pub fn landforms<G: GridOps>(
         let basement = fields.elevation[i] as f64;
         let strain = fields.crustal_strain[i] as f64;
         let detail = crate::terrain::interior_detail(&noise, p, sampling) * params.interior_relief;
+        let mut gradient = DVec3::ZERO;
+        for &j in grid.neighbors(i) {
+            let j = j as usize;
+            let root =
+                fields.crust_thickness[j] as f64 - fields.reference_crust_thickness[j] as f64;
+            gradient += (grid.field_position(j) - p).normalize_or_zero() * (root - excess)
+                / grid.distance_m(i, j).max(1.);
+        }
+        let up = if grid.field_is_planar() {
+            DVec3::Z
+        } else {
+            p.normalize()
+        };
+        let strike = up.cross(gradient).normalize_or_zero();
+        let folded =
+            crate::terrain::orogenic_detail(&noise, p, strike, sampling) * params.interior_relief;
         // Old orogens lose relief gradually. Width emerges from transported material
         // and lateral crustal redistribution; local folds have no global fixed wavelength.
         let old_decay = (-fields.orogen_age[i] as f64 / 180.).exp();
-        let folds = detail
-            * (0.20
-                + (strain * 3.).min(2.) * old_decay
-                + (fields.shear_strain[i] as f64).min(1.) * 0.35 * params.shear_strength);
+        let folds = detail * 0.35
+            + folded
+                * ((strain * 2.).min(1.5) * old_decay
+                    + (fields.shear_strain[i] as f64).min(1.) * 0.35 * params.shear_strength);
         let mut height = ocean * (1. - c) + (basement + uplift + rift + folds) * c;
         let (kx, ky, kz) = key(p);
         for x in kx - 1..=kx + 1 {
@@ -788,26 +1081,44 @@ pub fn landforms<G: GridOps>(
                                 )
                             };
                             let radius = v.radius_m;
-                            if distance
-                                > radius.max(if v.arc_platform_fraction > 0. {
-                                    80000.
-                                } else {
-                                    radius
-                                }) * 4.
-                            {
+                            if distance > support(v) {
                                 continue;
                             }
-                            let sigma2 = radius * radius + sampling * sampling / 12.;
-                            let lifetime = if v.origin == "hotspot" { 75. } else { 28. };
-                            let preserved = (-v.age_myr / lifetime).exp();
-                            let amplitude = v.summit_growth_m * preserved;
-                            let cone = amplitude * radius * radius / sigma2
-                                * (-0.5 * distance * distance / sigma2).exp();
+                            let amplitude = volcano_amplitude(v);
                             let along = DVec3::from_array(v.along_arc);
                             let delta = p - q;
                             let longitudinal = delta.dot(along);
                             let transverse2 =
                                 (distance * distance - longitudinal * longitudinal).max(0.);
+                            let ratio = axis_ratio(v);
+                            let longitudinal_sigma =
+                                (radius * ratio).powi(2) + sampling.powi(2) / 12.;
+                            let transverse_sigma =
+                                (radius / ratio).powi(2) + sampling.powi(2) / 12.;
+                            let sigma2 = radius * radius + sampling * sampling / 12.;
+                            let phase = (v.shape_seed % 65521) as f64 * 0.013;
+                            // Unequal construction and erosion on the flanks. The
+                            // edifice still follows its transported geological centre.
+                            let flank = if v.shape_seed == 0 {
+                                1.
+                            } else {
+                                1. + 0.25
+                                    * noise.fbm(
+                                        delta.x / radius + phase,
+                                        delta.y / radius,
+                                        delta.z / radius,
+                                        2,
+                                        2.,
+                                        0.5,
+                                    )
+                            };
+                            let cone = amplitude * radius * radius
+                                / (longitudinal_sigma * transverse_sigma).sqrt()
+                                * (-0.5
+                                    * (longitudinal.powi(2) / longitudinal_sigma
+                                        + transverse2 / transverse_sigma))
+                                    .exp()
+                                * flank;
                             let long_radius = (radius * 2.5).min(80000.);
                             let platform = amplitude
                                 * (-0.5
@@ -830,11 +1141,226 @@ pub fn landforms<G: GridOps>(
         fields.elevation[i] = height as f32;
     }
     crate::plates::adjust_sea_level(grid, fields, params.land_fraction);
+    crate::terrain::apply_planar_coast_constraint(grid, fields, params);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn episodic_hotspot_chain_has_irregular_ages_and_keeps_its_motion_at_finer_steps() {
+        let g = MapGrid::Plane(FlatGrid::new(32, 16, 10_000_000., 25., 0., 6371000.));
+        let f = WorldFields::with_capacity(g.cell_count());
+        let state = TectonicState {
+            plates: vec![crate::Plate {
+                id: 0,
+                euler_pole: DVec3::Y.to_array(),
+                omega: 0.,
+                oceanic: true,
+            }],
+            planar_velocities: Some(vec![DVec3::X * 40_000.]),
+            ..Default::default()
+        };
+        let run = |dt: f64| {
+            let mut sources = vec![Hotspot {
+                position: DVec3::ZERO,
+                next_eruption: 2.3,
+                episode: 1,
+                seed: 42,
+            }];
+            let mut history = History::default();
+            for step in 1..=(80. / dt) as usize {
+                for v in &mut history.volcanoes {
+                    v.age_myr += dt;
+                    v.position_m[0] += 40_000. * dt;
+                }
+                hotspot_events(&g, &f, &state, &mut history, &mut sources, step as f64 * dt);
+            }
+            history.volcanoes
+        };
+        let (coarse, fine) = (run(1.), run(0.5));
+        assert!(coarse.len() > 8);
+        assert_eq!(coarse.len(), fine.len());
+        let intervals: Vec<_> = coarse
+            .windows(2)
+            .map(|v| v[0].age_myr - v[1].age_myr)
+            .collect();
+        assert!(
+            intervals.iter().copied().fold(0_f64, f64::max)
+                > intervals.iter().copied().fold(f64::INFINITY, f64::min) * 2.
+        );
+        for (a, b) in coarse.iter().zip(&fine) {
+            assert!((a.position_m[0] - a.age_myr * 40_000.).abs() < 1e-7);
+            assert!((a.position_m[0] - b.position_m[0]).abs() < 1e-7);
+            assert!((a.age_myr - b.age_myr).abs() < 1e-9);
+            assert_eq!(a.radius_m, b.radius_m);
+            assert_eq!(a.summit_growth_m, b.summit_growth_m);
+        }
+    }
+    #[test]
+    fn an_active_subduction_front_recharges_its_existing_centres() {
+        let g = MapGrid::Plane(FlatGrid::new(48, 36, 4_800_000., 25., 0., 6371000.));
+        let mut f = WorldFields::with_capacity(g.cell_count());
+        f.crust_type.fill(0.);
+        f.crust_age.fill(70.);
+        for i in 0..g.cell_count() {
+            f.plate_id[i] = if g.field_position(i).x < 0. { 0 } else { 1 };
+        }
+        let state = TectonicState {
+            plates: (0..2)
+                .map(|id| crate::Plate {
+                    id,
+                    euler_pole: DVec3::Y.to_array(),
+                    omega: 0.,
+                    oceanic: true,
+                })
+                .collect(),
+            planar_velocities: Some(vec![DVec3::X * 30_000., -DVec3::X * 30_000.]),
+            centers: vec![-DVec3::X * 1_000_000., DVec3::X * 1_000_000.],
+            ..Default::default()
+        };
+        let mut history = History::default();
+        volcano_events(&g, &f, &state, &mut history, 10., 42);
+        assert!(history.volcanoes.len() > 3);
+        let original = history.volcanoes.clone();
+        for v in &mut history.volcanoes {
+            v.age_myr = 20.;
+            v.quiet_myr = 10.;
+        }
+        // Hold the boundary and supply fixed to isolate centre reuse.
+        volcano_events(&g, &f, &state, &mut history, 10., 42);
+        assert_eq!(history.volcanoes.len(), original.len());
+        assert!(history
+            .volcanoes
+            .iter()
+            .zip(&original)
+            .any(|(a, b)| a.summit_growth_m > b.summit_growth_m));
+        for (a, b) in history.volcanoes.iter().zip(&original) {
+            assert_eq!(a.position_m, b.position_m);
+            assert_eq!(a.age_myr, 20.);
+            assert!(a.summit_growth_m <= 9500.);
+            assert!(volcano_amplitude(a) > b.summit_growth_m * (-20_f64 / 28.).exp());
+        }
+        let widths: Vec<_> = history.volcanoes.iter().map(|v| v.radius_m).collect();
+        assert!(
+            widths.iter().copied().fold(0., f64::max)
+                > widths.iter().copied().fold(f64::INFINITY, f64::min) * 1.5
+        );
+    }
+    #[test]
+    fn smooth_crust_transport_converges_when_the_mesh_and_time_step_are_refined() {
+        let error = |columns: usize, dt: f64| {
+            let rows = columns / 4;
+            let g = MapGrid::Plane(FlatGrid::new(
+                columns as u32,
+                rows as u32,
+                10_000_000.,
+                25.,
+                0.,
+                6371000.,
+            ));
+            let mut f = WorldFields::with_capacity(g.cell_count());
+            let profile = |x: f64| 7000. + 1000. * (-(x / 500_000.).powi(2)).exp();
+            for i in 0..g.cell_count() {
+                f.crust_thickness[i] = profile(g.field_position(i).x + 1_000_000.) as f32;
+                f.reference_crust_thickness[i] = f.crust_thickness[i] + 500.;
+                f.crust_type[i] =
+                    (0.2 + 0.6 * ((f.crust_thickness[i] as f64 - 7000.) / 1000.)) as f32;
+            }
+            let state = TectonicState {
+                plates: vec![crate::Plate {
+                    id: 0,
+                    euler_pole: DVec3::Y.to_array(),
+                    omega: 0.,
+                    oceanic: false,
+                }],
+                planar_velocities: Some(vec![DVec3::X * 40_000.]),
+                centers: vec![DVec3::ZERO],
+                ..Default::default()
+            };
+            let geometry = faces(&g);
+            let initial = crust_volume(&g, &f);
+            let mut history = History::default();
+            for _ in 0..(20. / dt).round() as usize {
+                remap(&g, &geometry, &mut f, &state, dt, &mut history);
+            }
+            let expected_volume = initial + history.imported_crust_m3 + history.new_ocean_crust_m3
+                - history.subducted_crust_m3
+                - history.exported_crust_m3;
+            assert!((crust_volume(&g, &f) - expected_volume).abs() / initial < 1e-6);
+            let (mut difference, mut reference_error, mut phase_error, mut signal) =
+                (0., 0., 0., 0.);
+            for i in (rows / 2 - 2) * columns..(rows / 2 + 2) * columns {
+                let x = g.field_position(i).x;
+                if x.abs() < 3_000_000. {
+                    let exact = profile(x + 200_000.);
+                    difference += (f.crust_thickness[i] as f64 - exact).abs();
+                    reference_error += (f.reference_crust_thickness[i] as f64 - exact - 500.).abs();
+                    phase_error +=
+                        ((f.crust_type[i] as f64 - 0.2) * (1000. / 0.6) - (exact - 7000.)).abs();
+                    signal += exact - 7000.;
+                }
+            }
+            [
+                difference / signal,
+                reference_error / signal,
+                phase_error / signal,
+            ]
+        };
+        let coarse = error(100, 0.25);
+        let fine = error(200, 0.125);
+        let half_dt = error(100, 0.125);
+        for channel in 0..3 {
+            assert!(
+                fine[channel] < coarse[channel] * 0.7,
+                "channel {channel}, coarse {coarse:?}, fine {fine:?}"
+            );
+            assert!(
+                half_dt[channel] < coarse[channel] * 1.1,
+                "channel {channel}, coarse {coarse:?}, half dt {half_dt:?}"
+            );
+        }
+    }
+    #[test]
+    fn a_translated_coast_does_not_diffuse_into_a_wide_mixed_crust_belt() {
+        let g = MapGrid::Plane(FlatGrid::new(100, 24, 10_000_000., 25., 0., 6371000.));
+        let mut f = WorldFields::with_capacity(g.cell_count());
+        f.crust_thickness.fill(35000.);
+        f.reference_crust_thickness.fill(35000.);
+        for i in 0..g.cell_count() {
+            f.crust_type[i] = if g.field_position(i).x.abs() < 500_000. {
+                1.
+            } else {
+                0.
+            };
+        }
+        let state = TectonicState {
+            plates: vec![crate::Plate {
+                id: 0,
+                euler_pole: DVec3::Y.to_array(),
+                omega: 0.,
+                oceanic: false,
+            }],
+            planar_velocities: Some(vec![DVec3::X * 40_000.]),
+            centers: vec![DVec3::ZERO],
+            ..Default::default()
+        };
+        let geometry = faces(&g);
+        let mut history = History::default();
+        for _ in 0..80 {
+            remap(&g, &geometry, &mut f, &state, 0.25, &mut history);
+        }
+        for row in 6..18 {
+            let mixed = (row * 100..(row + 1) * 100)
+                .filter(|&i| f.crust_type[i] > 0.1 && f.crust_type[i] < 0.9)
+                .count();
+            assert!(
+                mixed <= 6,
+                "row {row}: translation smeared two sharp coasts across {mixed} cells"
+            );
+        }
+        assert!(f.crust_type.iter().all(|v| *v >= 0. && *v <= 1.));
+    }
     #[test]
     fn rigid_euler_rotation_keeps_radius_and_arc_distance() {
         let p = DVec3::X * 6371000.;
@@ -932,6 +1458,21 @@ mod tests {
         assert!(h.new_ocean_crust_m3 / h.initial_crust_m3 < 1e-10);
         assert!((crust_volume(&g, &f) - expected).abs() / expected < 1e-6);
         assert!(f.crust_thickness.iter().all(|h| *h > 0.));
+        // Incoming old ocean replaces outgoing rock; it must not be counted
+        // on top of a full retained cell or create an artificial coastal root.
+        f.crust_thickness.fill(7000.);
+        f.reference_crust_thickness.fill(7000.);
+        f.crust_type.fill(0.);
+        let mut ocean_history = History::default();
+        for _ in 0..20 {
+            remap(&g, &geometry, &mut f, &state, 0.2, &mut ocean_history);
+        }
+        assert!(f
+            .crust_thickness
+            .iter()
+            .zip(&f.reference_crust_thickness)
+            .all(|(h, r)| (*h - 7000.).abs() < 0.1 && (*h - *r).abs() < 0.1));
+        assert!(ocean_history.subducted_crust_m3 < 1e-10 * crust_volume(&g, &f));
     }
     #[test]
     fn continental_collision_thickens_a_region_while_oceanic_overlap_subducts() {

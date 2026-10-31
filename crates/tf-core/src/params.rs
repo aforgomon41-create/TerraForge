@@ -217,6 +217,9 @@ pub struct GenerationParams {
     /// Starting scope. Local scopes may be generated without an ancestor.
     pub start_level: LevelKind,
     pub world_shape: WorldShape,
+    /// Flat world/continent roots may be cropped at their rectangular extent.
+    /// False reserves an ocean rim; local regions/sites remain cropped windows.
+    pub allow_land_at_edge: bool,
     pub map_width_m: f64,
     pub map_height_m: f64,
     pub center_lat_deg: f64,
@@ -300,6 +303,7 @@ impl Default for GenerationParams {
             planet: PlanetParams::default(),
             start_level: LevelKind::World,
             world_shape: WorldShape::Sphere,
+            allow_land_at_edge: true,
             map_width_m: 8_000_000.,
             map_height_m: 5_000_000.,
             center_lat_deg: 25.,

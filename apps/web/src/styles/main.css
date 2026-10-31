@@ -1020,6 +1020,10 @@ progress::-moz-progress-bar {
 .check-label input {
   margin: 0;
 }
+.create-form .check-label {
+  font-size: 12px;
+  line-height: 1.5;
+}
 .error-text {
   font-size: 11px;
   color: var(--red);

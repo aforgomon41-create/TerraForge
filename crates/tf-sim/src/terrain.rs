@@ -21,16 +21,110 @@ fn warped(noise: &SimplexNoise, p: DVec3) -> DVec3 {
     ) * 0.22
 }
 
-/// A connected skeleton describes each continental crust province. Noise only roughens its coast.
-struct CrustSegment {
-    a: DVec3,
-    b: DVec3,
-    ra: f64,
-    rb: f64,
+/// A map framing constraint, independent of the rock-volume evolution. Closing
+/// a flat root reserves water at its edge; it does not wrap or stop the plates.
+pub fn apply_planar_coast_constraint<G: GridOps>(
+    grid: &G,
+    fields: &mut WorldFields,
+    params: &GenerationParams,
+) {
+    if params.allow_land_at_edge || params.is_local() {
+        return;
+    }
+    let Some((width, height)) = grid.extent_m() else {
+        return;
+    };
+    let spacing = (grid.area_m2(0) * 2. / 3_f64.sqrt()).sqrt();
+    let minimum_span = width.min(height);
+    let margin = minimum_span * (0.01 + 0.04 * ((1. - params.land_fraction) / 0.7).clamp(0., 1.));
+    let border_noise = SimplexNoise::new(params.seed ^ 0xB04D_3E12);
+    let boundary = grid.boundary_mask();
+    let mut reserved = vec![false; grid.cell_count()];
+    let mut ocean_floor = vec![-10.; grid.cell_count()];
+    let mut candidates = Vec::new();
+    for i in 0..grid.cell_count() {
+        let (x, y) = grid.local_center_m(i).unwrap();
+        let d = (width * 0.5 - x.abs()).min(height * 0.5 - y.abs()).max(0.);
+        let p = grid.field_position(i) / (minimum_span * 0.2).max(1.);
+        let coastal_shape = smooth(-0.55, 0.55, fbm(&border_noise, p, 1., 3));
+        let local_margin = (margin * (0.4 + 2. * coastal_shape)).max(spacing * 2.);
+        let transition = minimum_span * (0.05 + 0.16 * coastal_shape);
+        let t = smooth(local_margin, local_margin + transition, d);
+        fields.elevation[i] = (fields.elevation[i] as f64 * t - 4500. * (1. - t)) as f32;
+        reserved[i] = boundary[i] || d <= local_margin;
+        ocean_floor[i] = (-10. - 2800. * (1. - smooth(0., local_margin, d))) as f32;
+        if !reserved[i] {
+            candidates.push(fields.elevation[i]);
+        }
+    }
+    if candidates.is_empty() {
+        fields.elevation.fill(-10.);
+        return;
+    }
+    candidates.sort_unstable_by(f32::total_cmp);
+    // Keep the requested total land area when the finite grid has enough
+    // non-boundary cells. A fully oceanic rim takes priority on tiny grids.
+    let land_cells = ((params.land_fraction * grid.cell_count() as f64).round() as usize)
+        .min(candidates.len().saturating_sub(1));
+    let sea = candidates[candidates.len() - 1 - land_cells];
+    for i in 0..grid.cell_count() {
+        fields.elevation[i] -= sea;
+        if reserved[i] {
+            fields.elevation[i] = fields.elevation[i].min(ocean_floor[i]);
+        }
+    }
 }
-fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<CrustSegment> {
+
+/// Assembled irregular crustal blocks, rather than buffered lines with round caps.
+struct CrustProvince {
+    center: DVec3,
+    east: DVec3,
+    north: DVec3,
+    vertices: Vec<glam::DVec2>,
+}
+impl CrustProvince {
+    fn radial_extent(&self, p: DVec3, planetary_radius: f64, planar: bool) -> (f64, f64) {
+        let delta = if planar {
+            p - self.center
+        } else {
+            let direction = p.normalize();
+            let center = self.center.normalize();
+            let cosine = direction.dot(center).clamp(-1., 1.);
+            let tangent = direction - center * cosine;
+            if cosine < 0. && tangent.length_squared() < 1e-20 {
+                return (std::f64::consts::PI * planetary_radius, 0.);
+            }
+            tangent.normalize_or_zero() * cosine.acos() * planetary_radius
+        };
+        let p = glam::DVec2::new(delta.dot(self.east), delta.dot(self.north));
+        let radius = p.length();
+        let direction = if radius > 1e-9 {
+            p / radius
+        } else {
+            glam::DVec2::X
+        };
+        let mut boundary = 0_f64;
+        for k in 0..self.vertices.len() {
+            let a = self.vertices[k];
+            let b = self.vertices[(k + 1) % self.vertices.len()];
+            let ab = b - a;
+            let determinant = direction.perp_dot(ab);
+            if determinant.abs() > 1e-12 {
+                let distance = a.perp_dot(ab) / determinant;
+                let along = a.perp_dot(direction) / determinant;
+                if distance >= 0. && (-1e-10..=1. + 1e-10).contains(&along) {
+                    // Blocks are star-shaped about their centre. Use the last
+                    // hit so a ray grazing a concave vertex does not cut a hole.
+                    boundary = boundary.max(distance);
+                }
+            }
+        }
+        (radius, boundary)
+    }
+}
+fn continental_provinces<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<CrustProvince> {
     use tf_core::{geo::UnitVec3, params::LevelKind, DeterministicRng};
-    let mut rng = DeterministicRng::derive(params.seed, "continental-crust-skeleton-v1");
+    let mut rng = DeterministicRng::derive(params.seed, "continental-terrane-assembly-v2");
     let count = if params.start_level == LevelKind::Continent {
         1
     } else {
@@ -48,8 +142,36 @@ fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<
         .sqrt()
         * params.continent_scale.sqrt();
     let mut anchors: Vec<DVec3> = Vec::new();
-    let mut segments = Vec::new();
-    for group in 0..count {
+    let mut provinces = Vec::new();
+    let block = |center: DVec3, size: f64, bearing: f64, rng: &mut DeterministicRng| {
+        let (east, north) = if planar {
+            (DVec3::X, DVec3::Y)
+        } else {
+            UnitVec3::from_vec(center).unwrap().tangent_frame()
+        };
+        let count = rng.range_i32(6, 10) as usize;
+        let aspect = rng.range_f64(0.6, 1.5);
+        let vertices = (0..count)
+            .map(|k| {
+                let angle =
+                    (k as f64 + rng.range_f64(-0.22, 0.22)) * std::f64::consts::TAU / count as f64;
+                let radius = size * rng.range_f64(0.60, 1.25);
+                let x = angle.cos() * radius * aspect;
+                let y = angle.sin() * radius / aspect.sqrt();
+                glam::DVec2::new(
+                    x * bearing.cos() - y * bearing.sin(),
+                    x * bearing.sin() + y * bearing.cos(),
+                )
+            })
+            .collect();
+        CrustProvince {
+            center,
+            east,
+            north,
+            vertices,
+        }
+    };
+    for _group in 0..count {
         let mut center = DVec3::ZERO;
         let mut best = -1.;
         for _ in 0..32 {
@@ -77,11 +199,10 @@ fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<
         anchors.push(center);
         let scale = scale * rng.range_f64(0.60, 1.30);
         let bearing = rng.range_f64(0., std::f64::consts::TAU);
-        let bend = rng.range_f64(-0.65, 0.65);
         let mut nodes = Vec::new();
         for step in -2_i32..=2 {
-            let distance = step as f64 * scale * 1.05;
-            let angle = bearing + bend * step as f64;
+            let distance = step as f64 * scale * rng.range_f64(0.45, 0.9);
+            let angle = bearing + rng.range_f64(-0.65, 0.65);
             let p = if planar {
                 center + DVec3::new(angle.sin(), angle.cos(), 0.) * distance
             } else {
@@ -93,35 +214,58 @@ fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<
             };
             nodes.push((
                 p,
-                scale * (0.95 - 0.18 * step.unsigned_abs() as f64) * rng.range_f64(0.55, 1.35),
+                scale * (1.15 - 0.18 * step.unsigned_abs() as f64) * rng.range_f64(0.7, 1.25),
             ));
         }
         for pair in nodes.windows(2) {
-            segments.push(CrustSegment {
-                a: pair[0].0,
-                b: pair[1].0,
-                ra: pair[0].1,
-                rb: pair[1].1,
+            let center = if planar {
+                (pair[0].0 + pair[1].0) * 0.5
+            } else {
+                (pair[0].0 + pair[1].0).normalize() * radius
+            };
+            let (east, north) = if planar {
+                (DVec3::X, DVec3::Y)
+            } else {
+                UnitVec3::from_vec(center).unwrap().tangent_frame()
+            };
+            let project =
+                |p: DVec3| glam::DVec2::new((p - center).dot(east), (p - center).dot(north));
+            let (a, b) = (project(pair[0].0), project(pair[1].0));
+            let axis = (b - a).normalize_or_zero();
+            let side = glam::DVec2::new(-axis.y, axis.x);
+            provinces.push(CrustProvince {
+                center,
+                east,
+                north,
+                vertices: vec![
+                    a + side * pair[0].1 * 0.6,
+                    b + side * pair[1].1 * 0.6,
+                    b - side * pair[1].1 * 0.6,
+                    a - side * pair[0].1 * 0.6,
+                ],
             });
         }
-        // A broad branch forms a peninsula and an adjacent bay, rather than speckled islands.
-        let root = nodes[if group % 2 == 0 { 1 } else { 3 }];
-        let angle = bearing + 1.3;
-        let tip = if planar {
-            root.0 + DVec3::new(angle.sin(), angle.cos(), 0.) * scale * 1.5
-        } else {
-            UnitVec3::from_vec(root.0)
-                .unwrap()
-                .offset(angle, scale * 1.5 / radius)
-                .as_vec()
-                * radius
-        };
-        segments.push(CrustSegment {
-            a: root.0,
-            b: tip,
-            ra: root.1 * 0.85,
-            rb: scale * 0.45,
-        });
+        for &(p, size) in &nodes {
+            provinces.push(block(p, size, bearing + rng.range_f64(-1., 1.), &mut rng));
+        }
+        // Asymmetric branches leave large embayments between terranes. Their
+        // positions and sizes vary independently instead of tracing one arc.
+        for branch in 0..rng.range_i32(2, 4) {
+            let root = nodes[rng.below(nodes.len() as u32) as usize];
+            let angle = bearing + if branch % 2 == 0 { 1. } else { -1. } * rng.range_f64(0.8, 2.1);
+            let distance = scale * rng.range_f64(0.65, 1.6);
+            let tip = if planar {
+                root.0 + DVec3::new(angle.sin(), angle.cos(), 0.) * distance
+            } else {
+                UnitVec3::from_vec(root.0)
+                    .unwrap()
+                    .offset(angle, distance / radius)
+                    .as_vec()
+                    * radius
+            };
+            let size = scale * rng.range_f64(0.35, 0.8);
+            provinces.push(block(tip, size, angle, &mut rng));
+        }
         // Initial continental terranes are not all joined to the same spine.
         // Their subsequent movement and collision are handled by the crust solver.
         for _ in 0..3 {
@@ -137,53 +281,50 @@ fn continental_skeleton<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<
                     * radius
             };
             let r = scale * rng.range_f64(0.13, 0.40);
-            segments.push(CrustSegment {
-                a,
-                b: a,
-                ra: r,
-                rb: r,
-            });
+            provinces.push(block(a, r, angle, &mut rng));
         }
     }
-    segments
+    provinces
 }
 pub fn init_continents<G: GridOps>(grid: &G, fields: &mut WorldFields, params: &GenerationParams) {
     let noise = SimplexNoise::new(params.seed ^ 0xC071_1E17);
-    let skeleton = continental_skeleton(grid, params);
+    let provinces = continental_provinces(grid, params);
     let radius = grid.radius_m();
+    let characteristic_length = provinces
+        .iter()
+        .map(|province| {
+            province.vertices.iter().map(|v| v.length()).sum::<f64>()
+                / province.vertices.len() as f64
+        })
+        .sum::<f64>()
+        / provinces.len() as f64;
     let values: Vec<f64> = (0..grid.cell_count())
         .into_par_iter()
         .map(|i| {
             let p = grid.field_position(i);
-            let mut distance = f64::INFINITY;
-            for segment in &skeleton {
-                let ab = segment.b - segment.a;
-                let t = ((p - segment.a).dot(ab) / ab.length_squared().max(1.)).clamp(0., 1.);
-                let q = segment.a + ab * t;
-                let d = if grid.field_is_planar() {
-                    (p - q).length()
-                } else {
-                    (p.normalize().dot(q.normalize())).clamp(-1., 1.).acos() * radius
-                } - segment.ra * (1. - t)
-                    - segment.rb * t;
-                // A smooth union rounds junctions; it never cuts the connecting skeleton.
-                let h = (1. - (distance - d).abs() / 120_000.).max(0.);
-                distance = distance.min(d) - h * h * 30_000.;
-            }
             let coast = (fbm(&noise, p / 800_000., 1., 3) * 300_000.
                 + fbm(&noise, p / 180_000., 1., 2) * 70_000.)
                 * params.coast_complexity;
-            -distance + coast
+            // Match land area by scaling the blocks, rather than adding a
+            // constant-radius buffer that rounds every tip and fills every bay.
+            provinces
+                .iter()
+                .map(|province| {
+                    let (distance, boundary) =
+                        province.radial_extent(p, radius, grid.field_is_planar());
+                    (boundary + coast).max(0.) / distance.max(1.)
+                })
+                .max_by(f64::total_cmp)
+                .unwrap()
         })
         .collect();
     let mut sorted = values.clone();
     sorted.sort_unstable_by(f64::total_cmp);
     let threshold = sorted
         [(((1. - params.land_fraction) * sorted.len() as f64) as usize).min(sorted.len() - 1)];
-    let transition =
-        1_200_000_f64.min(grid.extent_m().map_or(1_200_000., |(w, h)| w.min(h) * 0.18));
+    let transition = 400_000_f64.min(grid.extent_m().map_or(400_000., |(w, h)| w.min(h) * 0.08));
     for i in 0..grid.cell_count() {
-        let inland = values[i] - threshold;
+        let inland = (values[i] / threshold.max(1e-12)).max(1e-12).ln() * characteristic_length;
         let p = grid.field_position(i);
         let continental = smooth(-0.466 * transition, 0.534 * transition, inland);
         let basement = fbm(&noise, p / 1_200_000. + DVec3::splat(53.), 1., 3)
@@ -211,9 +352,10 @@ pub fn interior_detail(noise: &SimplexNoise, position: DVec3, spacing: f64) -> f
     let p = position / 900_000.;
     let q = warped(noise, p * 0.3) * 3.3;
     let basin = fbm(noise, q, 0.8, 4) * 420.;
-    let ridge = (1. - fbm(noise, q + DVec3::splat(37.), 2.6, 4).abs()).powi(5);
-    let province = smooth(-0.1, 0.35, fbm(noise, q + DVec3::splat(11.), 0.6, 3));
-    let mut value = basin + province * ridge * 1500.;
+    // A signed, broad field has hills and valleys. Raising the zero contour of
+    // |noise| to a power instead drew closed C-shaped mountain belts unrelated
+    // to any accumulated shortening.
+    let mut value = basin + fbm(noise, q + DVec3::splat(37.), 1.7, 4) * 500.;
     let mut wavelength = 160_000.;
     for octave in 0..18 {
         let sigma = spacing / 12_f64.sqrt();
@@ -225,6 +367,32 @@ pub fn interior_detail(noise: &SimplexNoise, position: DVec3, spacing: f64) -> f
         let v = position / wavelength + DVec3::splat(71. + octave as f64 * 17.);
         value += noise.sample(v.x, v.y, v.z) * amplitude * attenuation;
         wavelength *= 0.5;
+    }
+    value
+}
+
+/// Locally anisotropic roughness following an existing thickened-root trend.
+/// Symmetric samples are invariant to reversing the strike, avoiding phase seams.
+pub fn orogenic_detail(noise: &SimplexNoise, position: DVec3, strike: DVec3, spacing: f64) -> f64 {
+    let mut value = 0.;
+    for (octave, wavelength) in [320_000_f64, 160_000., 80_000.].into_iter().enumerate() {
+        let attenuation =
+            (-0.5 * (std::f64::consts::TAU * spacing / 12_f64.sqrt() / wavelength).powi(2)).exp();
+        for (offset, weight) in [(-2., 0.1), (-1., 0.2), (0., 0.4), (1., 0.2), (2., 0.1)] {
+            let p = (position + strike * offset * wavelength * 0.8) / wavelength
+                + DVec3::splat(127. + octave as f64 * 41.);
+            // Rotate the slice away from the simplex lattice's coordinate planes.
+            let p = glam::DQuat::from_axis_angle(
+                DVec3::new(1., 2., 3.).normalize(),
+                0.71 + octave as f64,
+            )
+            .mul_vec3(p);
+            value += noise.sample(p.x, p.y, p.z)
+                * weight
+                * attenuation
+                * 1500.
+                * (wavelength / 320000.).powf(0.65);
+        }
     }
     value
 }
@@ -404,6 +572,27 @@ pub fn apply_relief<G: GridOps>(
 mod tests {
     use super::*;
     #[test]
+    fn closing_a_plane_reserves_ocean_at_every_boundary_without_changing_the_rock_ledger() {
+        let g = tf_grid::FlatGrid::new(64, 40, 6_400_000., 25., 0., 6_371_000.);
+        let mut f = WorldFields::with_capacity(g.cell_count());
+        for i in 0..g.cell_count() {
+            let (x, y) = g.local_center_m(i).unwrap();
+            f.elevation[i] = (800. + x * 0.0002 + y * 0.00001) as f32;
+            f.crust_thickness[i] = 35000.;
+        }
+        let mut p = GenerationParams::default();
+        let original = f.clone();
+        apply_planar_coast_constraint(&g, &mut f, &p);
+        assert_eq!(f.elevation, original.elevation);
+        assert!(g.boundary_mask().iter_ones().any(|i| f.elevation[i] > 0.));
+        p.allow_land_at_edge = false;
+        apply_planar_coast_constraint(&g, &mut f, &p);
+        assert!(g.boundary_mask().iter_ones().all(|i| f.elevation[i] < 0.));
+        assert_eq!(f.crust_thickness, original.crust_thickness);
+        let share = f.elevation.iter().filter(|h| **h > 0.).count() as f64 / g.cell_count() as f64;
+        assert!((share - p.land_fraction).abs() < 0.005, "{share}");
+    }
+    #[test]
     fn fault_types_have_distinct_folds_rift_shoulders_and_slip() {
         let collision = fault_profile(
             BoundarySubtype::ContinentContinentConvergent,
@@ -462,6 +651,36 @@ mod tests {
             *a /= total;
         }
         areas
+    }
+    #[test]
+    fn increasing_a_crustal_block_does_not_fill_its_large_embayment() {
+        let province = CrustProvince {
+            center: DVec3::ZERO,
+            east: DVec3::X,
+            north: DVec3::Y,
+            vertices: [
+                (-2., -2.),
+                (2., -2.),
+                (2., 2.),
+                (0.2, 2.),
+                (0.2, 0.2),
+                (-2., 0.2),
+            ]
+            .into_iter()
+            .map(|(x, y)| glam::DVec2::new(x, y) * 1_000_000.)
+            .collect(),
+        };
+        for scale in [1., 2., 3.] {
+            let inside = DVec3::new(1., 1., 0.) * scale * 1_000_000.;
+            let bay = DVec3::new(-1., 1., 0.) * scale * 1_000_000.;
+            let (r, bound) = province.radial_extent(inside, 6371000., true);
+            assert!(
+                bound / r > 1. / scale,
+                "scale {scale}, bound {bound}, r {r}"
+            );
+            let (r, bound) = province.radial_extent(bay, 6371000., true);
+            assert!(bound / r < 1. / scale);
+        }
     }
     #[test]
     fn continental_core_control_changes_large_scale_structure() {

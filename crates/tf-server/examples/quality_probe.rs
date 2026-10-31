@@ -33,6 +33,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(count) = std::env::args().nth(4).and_then(|s| s.parse().ok()) {
         params.continent_count = count;
     }
+    params.allow_land_at_edge = !std::env::args().any(|s| s == "--closed-coast");
     let descriptor = tf_server::api::root_descriptor(&params, 512).map_err(anyhow::Error::msg)?;
     descriptor.validate().map_err(anyhow::Error::msg)?;
     let grid = descriptor.build();
@@ -106,6 +107,12 @@ fn main() -> anyhow::Result<()> {
     let connected = serde_json::json!({"largest_land_share":components.first().copied().unwrap_or(0.)/land_area.max(1.),"top_three_share":components.iter().take(3).sum::<f64>()/land_area.max(1.),"small_land_components_share":components.iter().filter(|&&area|area<1e11).sum::<f64>()/land_area.max(1.),"landmasses_over_100000_km2":components.iter().filter(|&&area|area>=1e11).count()});
     let report = serde_json::json!({"seed":params.seed,"connectivity":connected,"domain":mode,"extent_m":grid.extent_m(),"cells":grid.cell_count(),"seconds":elapsed,"land_fraction":land.len() as f64/grid.cell_count() as f64,"elevation_m":{"p10":percentile(&land,0.1),"p50":percentile(&land,0.5),"p90":percentile(&land,0.9),"p99":percentile(&land,0.99)},"rainfall_mm_year":{"p10":percentile(&rain,0.1),"p50":percentile(&rain,0.5),"p90":percentile(&rain,0.9),"p99":percentile(&rain,0.99)},"boundaries":{"convergent":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Convergent).count(),"divergent":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Divergent).count(),"transform":boundaries.iter().filter(|b|b.kind==tf_sim::BoundaryKind::Transform).count()}});
     let mut report = report;
+    report["allow_land_at_edge"] = serde_json::json!(params.allow_land_at_edge);
+    report["edge_land_cells"] = serde_json::json!(grid
+        .boundary_mask()
+        .iter_ones()
+        .filter(|&i| world.fields.elevation[i] > 0.)
+        .count());
     let mut biomes = vec![0usize; 13];
     for (i, &b) in world.ecology.biome.iter().enumerate() {
         if world.fields.elevation[i] > 0. {

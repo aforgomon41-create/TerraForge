@@ -25,7 +25,9 @@ const name = ref('Aetheria'),
   seed = ref(''),
   land = ref(29),
   plates = ref(14),
-  erosion = ref(1)
+  erosion = ref(1),
+  worldShape = ref<'sphere' | 'plane'>('sphere'),
+  allowLandAtEdge = ref(true)
 const style = ref(MapStyle.Parchment),
   layer = ref(0),
   notice = ref(''),
@@ -240,6 +242,8 @@ async function generate() {
       land_fraction: land.value / 100,
       plate_count: plates.value,
       erosion_strength: erosion.value,
+      world_shape: worldShape.value,
+      allow_land_at_edge: allowLandAtEdge.value,
     })
     tab.value = 'tree'
     await store.generate(store.current!.id)
@@ -857,6 +861,20 @@ onBeforeUnmount(() => {
           </label>
           <details>
             <summary>更多生成参数</summary>
+            <label>
+              世界形态
+              <select v-model="worldShape">
+                <option value="sphere">球形世界</option>
+                <option value="plane">平面世界</option>
+              </select>
+            </label>
+            <template v-if="worldShape === 'plane'">
+              <label class="check-label">
+                <input v-model="allowLandAtEdge" type="checkbox" />
+                允许陆地被地图边缘截断
+              </label>
+              <p class="muted">关闭后会保留海洋边缘，让大陆海岸完整留在图内。</p>
+            </template>
             <label>
               构造板块数量
               <input v-model.number="plates" type="number" min="8" max="30" required />
