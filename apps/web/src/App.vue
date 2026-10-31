@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, shallowRef, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useWorldStore } from '@/stores/world'
 import { api, type MapNode, type TectonicDiagnostic } from '@/api/client'
 import { HexSphereRenderer, MapStyle } from '@/renderer/HexSphereRenderer'
@@ -7,7 +7,9 @@ import { buildSphereGrid } from '@/renderer/sphereGrid'
 import { direction, latLon, patchDirection, patchProject, nearestCell } from '@/renderer/geometry'
 import type { Vec3 } from '@/renderer/math'
 import { bindMapInput } from '@/renderer/interaction'
-import { decodeBase64 } from '@/api/sse'
+import type { DecodedFrameEvent } from '@/api/frame'
+import { planarPreviewSurface } from '@/renderer/surface'
+import { projections, type WorldProjection } from '@/renderer/projections'
 import type { ToolContext } from '@/agent/tools'
 import { flatDirection, flatProject } from '@/renderer/geometry'
 import { parseSeed } from '@/generation/seed'
@@ -17,7 +19,40 @@ const store = useWorldStore(),
   canvas = ref<HTMLCanvasElement | null>(null),
   fileInput = ref<HTMLInputElement | null>(null)
 const scaleText = ref('')
-const worldProjection = ref<'sphere' | 'flat'>('sphere')
+const worldProjection = ref<'sphere' | WorldProjection>('sphere')
+const liveFrame = shallowRef<DecodedFrameEvent | null>(null)
+let previewContext = '',
+  previewSphere: ReturnType<typeof buildSphereGrid> | undefined
+const sphericalWorld = computed(
+  () => (liveFrame.value?.grid || store.currentMap?.grid)?.type === 'sphere',
+)
+const projectionHint = computed(
+  () => projections.find((p) => p.id === worldProjection.value)?.hint || '拖动旋转球面',
+)
+const liveLayer = computed(() => {
+  if (!store.generating || !liveFrame.value) return layer.value
+  const flags = liveFrame.value.meta?.available_channels ?? 15
+  if (
+    (layer.value === 1 && !(flags & 2)) ||
+    (layer.value === 2 && !(flags & 4)) ||
+    (layer.value === 5 && !(flags & 8)) ||
+    layer.value === 3 ||
+    layer.value === 6
+  )
+    return 0
+  return layer.value
+})
+const liveCaption = computed(() => {
+  const meta = liveFrame.value?.meta
+  if (!meta) return '等待首个计算状态…'
+  const clock =
+    meta.elapsed_myr != null
+      ? `构造时间 ${meta.elapsed_myr.toFixed(1)} 百万年`
+      : meta.year != null
+        ? `求解第 ${meta.year} 年 / ${meta.month} 月`
+        : `第 ${meta.step} 步`
+  return `低精度实时预览 · ${clock} · ${meta.detail}`
+})
 const tab = ref<'tree' | 'create'>('create'),
   panel = ref<'project' | 'layers' | 'ai' | null>('project'),
   projectOpen = ref(true)
@@ -151,7 +186,7 @@ const layers = [
     gradient: 'linear-gradient(90deg,#e8ede5,#597b56,#cfb580)',
   },
 ]
-const activeLayer = computed(() => layers.find((l) => l.id === layer.value)!),
+const activeLayer = computed(() => layers.find((l) => l.id === liveLayer.value)!),
   modeText = computed(() =>
     store.session?.mode === 'desktop' ? '本地工程 · 自动保存' : '网页体验 · 临时会话',
   )
@@ -321,6 +356,10 @@ async function refreshTectonics() {
 function applyMap() {
   const node = store.currentMap
   if (!renderer) return
+  if (store.generating && liveFrame.value) {
+    renderLiveFrame()
+    return
+  }
   if (!node || !store.centers || !store.indices || !store.elevation || !store.biome) {
     renderer.clear()
     selection.value = null
@@ -337,7 +376,7 @@ function applyMap() {
         (Math.sqrt(3) / 2) * (g.type === 'plane' ? g.rows / g.size : 1),
         canvas.value!.clientHeight / canvas.value!.clientWidth,
       )
-  } else if (worldProjection.value === 'flat') renderer.setWorldFlatMode()
+  } else if (worldProjection.value !== 'sphere') renderer.setWorldFlatMode(worldProjection.value)
   else renderer.setSphereMode()
   renderer.setCells({
     centers,
@@ -366,11 +405,25 @@ function applyMap() {
   refine.value = false
 }
 watch(() => store.currentMap, applyMap)
-watch(worldProjection, applyMap)
+watch(worldProjection, () => {
+  const selected = selection.value
+  applyMap()
+  if (!store.generating && selected) {
+    selection.value = selected
+    updatePin()
+  }
+})
 watch(
   () => store.generating,
   (active) => {
-    if (!active) applyMap()
+    if (!active) {
+      liveFrame.value = null
+      previewContext = ''
+      applyMap()
+    } else {
+      liveFrame.value = null
+      previewContext = ''
+    }
   },
 )
 watch(
@@ -380,6 +433,10 @@ watch(
   },
 )
 watch(layer, (v) => {
+  if (store.generating && liveFrame.value) {
+    if (renderer) renderer.layer = liveLayer.value
+    return
+  }
   if (v === 6) void refreshTectonics()
   else void refreshOverlay()
   if (renderer) renderer.layer = v
@@ -584,6 +641,44 @@ const toolCtx: ToolContext = {
 function leave(e: PageTransitionEvent) {
   if (!e.persisted && store.session?.mode === 'web' && !ended.value) api.leave()
 }
+function renderLiveFrame() {
+  const f = liveFrame.value
+  if (!renderer || !canvas.value || !f || !store.generating) return
+  const grid = f.grid || store.maps.find((m) => m.id === store.job?.map_id)?.grid
+  if (!grid) return
+  const context = `${f.job_id}:${grid.type}:${grid.type === 'sphere' ? worldProjection.value : 'local'}`
+  if (previewContext !== context) {
+    renderer.clear()
+    let geometry
+    if (grid.type === 'sphere') {
+      geometry = previewSphere ||= buildSphereGrid(32)
+      if (worldProjection.value === 'sphere') renderer.setSphereMode()
+      else renderer.setWorldFlatMode(worldProjection.value)
+      renderer.previewHalfHeight = 1
+      renderer.mapMetres = grid.radius_m
+    } else {
+      const aspect = (Math.sqrt(3) / 2) * (grid.type === 'plane' ? grid.rows / grid.size : 1)
+      geometry = planarPreviewSurface(aspect)
+      renderer.setPlanarMode()
+      renderer.previewHalfHeight = aspect
+      renderer.planarHalfHeight =
+        1.08 * Math.max(aspect, canvas.value.clientHeight / canvas.value.clientWidth)
+      renderer.mapMetres = grid.width_m / 2
+    }
+    renderer.setCells({
+      ...geometry,
+      heights: new Float32Array(geometry.count),
+      biomes: new Uint8Array(geometry.count),
+    })
+    selection.value = null
+    pin.value = null
+    previewContext = context
+  }
+  renderer.heightScale = 0.025 / Math.max(f.stats.max_elevation, 1)
+  renderer.layer = liveLayer.value
+  renderer.style = style.value
+  renderer.uploadFrame(f.pixels, f.w, f.h, f.stats)
+}
 onMounted(async () => {
   try {
     if (!canvas.value) return
@@ -591,28 +686,9 @@ onMounted(async () => {
     renderer.start()
     interaction = bindMapInput(canvas.value, renderer, chooseAt, updatePin)
     store.onFrame((f) => {
-      if (!renderer || !store.generating) return
-      const node = store.maps.find((m) => m.id === store.job?.map_id)
-      if (
-        !node ||
-        node.grid?.type !== 'sphere' ||
-        store.current?.params?.world_shape === 'plane' ||
-        (store.current?.params?.start_level && store.current.params.start_level !== 'world')
-      )
-        return
-      if (!renderer.isPreviewMode()) {
-        const g = buildSphereGrid(32)
-        if (worldProjection.value === 'flat') renderer.setWorldFlatMode()
-        else renderer.setSphereMode()
-        renderer.setCells({
-          centers: g.centers,
-          indices: g.indices,
-          heights: new Float32Array(g.count),
-          biomes: new Uint8Array(g.count),
-          count: g.count,
-        })
-      }
-      renderer.uploadFrame(decodeBase64(f.data), f.w, f.h, f.stats)
+      if (!renderer || !store.generating || store.job?.id !== f.job_id) return
+      liveFrame.value = f
+      renderLiveFrame()
     })
     await store.init()
     ready.value = true
@@ -715,14 +791,17 @@ onBeforeUnmount(() => {
       </div>
       <nav aria-label="工程工具">
         <select
-          v-if="store.currentMap?.kind === 'world'"
+          v-if="sphericalWorld"
           v-model="worldProjection"
           aria-label="世界投影"
-          :disabled="locked"
+          :disabled="store.loading"
+          :title="projectionHint"
           class="projection-select"
         >
           <option value="sphere">球面视图</option>
-          <option value="flat">平面总图</option>
+          <option v-for="projection in projections" :key="projection.id" :value="projection.id">
+            {{ projection.label }}
+          </option>
         </select>
         <button :disabled="!ready || store.generating" @click="startNew">＋ 新建</button>
         <button :disabled="locked" @click="fileInput?.click()">打开工程</button>
@@ -1128,7 +1207,16 @@ onBeforeUnmount(() => {
         <i />
         {{ scaleText }}
       </div>
-      <span>{{ activeLayer.unit }}</span>
+      <span>
+        {{
+          store.generating &&
+          liveFrame?.meta?.month &&
+          liveFrame.meta.detail.includes('本月累计') &&
+          layer === 2
+            ? '本月累计降水（mm；求解中）'
+            : activeLayer.unit
+        }}
+      </span>
       <i :style="{ background: activeLayer.gradient }" />
       <div>
         <span v-for="end in activeLayer.ends" :key="end">{{ end }}</span>
@@ -1137,9 +1225,12 @@ onBeforeUnmount(() => {
         {{
           store.currentMap?.grid?.type === 'patch'
             ? '局部切平面 · 北向上'
-            : worldProjection === 'flat'
-              ? '平面总图 · 等距圆柱投影'
-              : '球面视图 · 拖动旋转'
+            : !sphericalWorld &&
+                (store.currentMap?.grid?.type === 'plane' || liveFrame?.grid?.type === 'plane')
+              ? '平面世界 · 北向上'
+              : worldProjection !== 'sphere'
+                ? `世界展开 · ${projections.find((p) => p.id === worldProjection)?.label}`
+                : '球面视图 · 拖动旋转'
         }}
         · {{ style === 2 ? '纸张地形' : '地理地图' }}
       </small>
@@ -1156,12 +1247,9 @@ onBeforeUnmount(() => {
           <span>{{ store.job?.stage || '等待任务启动' }} · {{ progress }}%</span>
         </div>
         <progress :value="store.job?.progress || 0" max="1" :aria-label="jobState" />
-        <div v-if="store.generating" class="generation-steps">
-          <span>板块</span>
-          <span>地貌</span>
-          <span>水文</span>
-          <span>气候</span>
-          <span>生态</span>
+        <div v-if="store.generating" class="generation-steps live-clock">
+          <span>{{ liveCaption }}</span>
+          <span v-if="liveFrame && layer !== liveLayer">当前图层尚未就绪，显示地形预览</span>
         </div>
       </div>
       <button

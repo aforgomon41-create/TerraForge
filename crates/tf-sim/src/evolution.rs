@@ -801,6 +801,24 @@ pub fn generate<G: GridOps>(
     progress: &mut dyn FnMut(f64),
     cancel: &dyn Fn() -> bool,
 ) -> Option<TectonicState> {
+    generate_observed(
+        fine,
+        params,
+        fields,
+        progress,
+        cancel,
+        &mut crate::preview::NoFrames,
+    )
+}
+
+pub fn generate_observed<G: GridOps>(
+    fine: &G,
+    params: &GenerationParams,
+    fields: &mut WorldFields,
+    progress: &mut dyn FnMut(f64),
+    cancel: &dyn Fn() -> bool,
+    observer: &mut dyn crate::preview::FrameObserver,
+) -> Option<TectonicState> {
     let grid = solver_grid(fine);
     let mut rng = DeterministicRng::derive(params.seed, "tectonics");
     let (mut state, ids) = crate::plates::build_plates(&grid, params, &mut rng);
@@ -873,6 +891,9 @@ pub fn generate<G: GridOps>(
     let mut arc_rng = DeterministicRng::derive(params.seed, "arc-epochs");
     let mut next_event = arc_rng.range_f64(3., 10.);
     let mut elapsed = 0.;
+    evolution_frame(
+        &grid, &material, &state, &history, params, elapsed, observer,
+    );
     while elapsed < params.tectonic_age_myr {
         if history.steps >= 4096 {
             return None;
@@ -937,6 +958,9 @@ pub fn generate<G: GridOps>(
             next_event += arc_rng.range_f64(4., 11.);
         }
         progress(elapsed / params.tectonic_age_myr);
+        evolution_frame(
+            &grid, &material, &state, &history, params, elapsed, observer,
+        );
     }
     history.final_crust_m3 = crust_volume(&grid, &material);
     let expected =
@@ -1008,6 +1032,33 @@ pub fn generate<G: GridOps>(
         plate.oceanic = crust < total * 0.5;
     }
     Some(state)
+}
+
+fn evolution_frame(
+    grid: &MapGrid,
+    material: &WorldFields,
+    state: &TectonicState,
+    history: &History,
+    params: &GenerationParams,
+    elapsed: f64,
+    observer: &mut dyn crate::preview::FrameObserver,
+) {
+    let mut info = crate::preview::FrameInfo::stage(
+        crate::Stage::Tectonics,
+        elapsed / params.tectonic_age_myr.max(1e-12) * crate::Stage::Tectonics.weight(),
+    );
+    info.stage_complete = false;
+    info.step = history.steps;
+    info.elapsed_myr = Some(elapsed);
+    info.detail = "板块运动与岩层增厚";
+    if !observer.wants_frame(info) {
+        return;
+    }
+    let mut displayed = material.clone();
+    let mut snapshot = state.clone();
+    snapshot.history = history.clone();
+    landforms(grid, &mut displayed, &snapshot, params);
+    observer.frame(grid, &displayed, info);
 }
 
 /// End-state terrain uses distributed roots and preserved events, not current-border ribbons.

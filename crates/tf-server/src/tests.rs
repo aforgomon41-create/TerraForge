@@ -124,6 +124,57 @@ fn job(world: &str, map: &str, id: &str) -> JobRecord {
     }
 }
 #[tokio::test]
+async fn terminal_event_reconnects_finish_and_release_the_stream_capacity() {
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let world = f.world(&token).await;
+    for state in ["done", "failed", "cancelled"] {
+        let map_id = format!("map-{state}");
+        let job_id = format!("job-{state}");
+        let mut map = node(&world, &map_id);
+        map.cells = 16;
+        f.state
+            .store
+            .submit_job(&map, &job(&world, &map_id, &job_id))
+            .unwrap();
+        f.state
+            .store
+            .transition_job(&job_id, "running", None)
+            .unwrap();
+        if state == "done" {
+            f.state
+                .store
+                .publish_fields(&map_id, &[(Channel::Elevation, &[1.; 16])], &json!({}))
+                .unwrap();
+        } else {
+            f.state.store.transition_job(&job_id, state, None).unwrap();
+        }
+        // More than the global capacity: every completed body must drop its permit.
+        for _ in 0..33 {
+            let request = Request::builder()
+                .uri(format!("/api/v1/events?job_id={job_id}"))
+                .header("host", "test.local")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = f.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                to_bytes(response.into_body(), 10000),
+            )
+            .await
+            .expect("terminal SSE must close")
+            .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains(&format!(
+                "event: {}",
+                if state == "failed" { "failed" } else { state }
+            )));
+            assert_eq!(f.state.streams.available_permits(), 32);
+        }
+    }
+}
+#[tokio::test]
 async fn capabilities_isolate_world_map_field_job_events_and_delete() {
     let f = Fixture::new(false);
     let a = f.session().await;
@@ -481,6 +532,7 @@ async fn independent_region_plane_child_geometry_and_project_round_trip() {
     crate::generate::run_generation(
         &f.state.store,
         &tx,
+        &Default::default(),
         "root-job",
         &n.id,
         &n,

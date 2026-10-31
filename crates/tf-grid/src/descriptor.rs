@@ -223,6 +223,13 @@ impl MapGrid {
     }
 }
 impl GridOps for MapGrid {
+    fn locate_local(&self, x: f64, y: f64) -> Option<usize> {
+        match self {
+            Self::Sphere(_) => None,
+            Self::Plane(g) => g.locate_local(x, y),
+            Self::Patch(g) => g.locate_local(x, y),
+        }
+    }
     fn field_is_planar(&self) -> bool {
         matches!(self, Self::Plane(_))
     }

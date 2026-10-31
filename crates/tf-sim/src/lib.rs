@@ -21,13 +21,15 @@ pub mod fields;
 pub mod landforms;
 pub mod pipeline;
 pub mod plates;
+pub mod preview;
 pub mod scientific;
 pub mod scopes;
 pub mod seasonal;
 
 pub use fields::{BoundaryCell, BoundaryKind, BoundarySubtype, Plate, WorldFields};
 pub use pipeline::{
-    generate, generate_cancellable, generate_with_frames, FrameFn, GeneratedWorld, ProgressFn,
+    generate, generate_cancellable, generate_observed, generate_with_frames, FrameFn,
+    GeneratedWorld, ProgressFn,
 };
 pub use plates::{build_plates, TectonicState};
 

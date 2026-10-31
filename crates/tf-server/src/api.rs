@@ -20,8 +20,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
 
 use crate::jobs::{now_millis, JobEvent, JobManager};
 use crate::store::{Channel, MapNodeRecord, Store, WorldRecord};
@@ -665,20 +663,114 @@ async fn sse_events(
         .try_acquire_owned()
         .map_err(|_| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "实时连接数量已达上限"))?;
     let rx = st.jobs.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
-        let _keep_permit = &permit;
-        let event = match msg {
-            Ok(ev) if ev.job_id() == id => encode_event(ev),
-            Ok(_) => return None,
-            Err(_) => Event::default().event("resync").data("{}"),
-        };
-        Some(Ok(event))
-    });
+    let gzip = query.get("frame_encoding").is_some_and(|v| v == "gzip");
+    // Subscribe before the second state read: terminal events cannot fall into
+    // the gap between the persisted-state check and joining the live channel.
+    let current = st.store.get_job(&id)?.unwrap_or(job);
+    let terminal = terminal_event(&current);
+    let finished = terminal.is_some();
+    let mut pending = std::collections::VecDeque::new();
+    if let Some(frame) = st.jobs.latest_frame(&id) {
+        pending.push_back(encode_event(frame, gzip));
+    }
+    if let Some(event) = terminal {
+        pending.push_back(event);
+    }
+    let jobs = st.jobs.clone();
+    let store = st.store.clone();
+    let stream = futures::stream::unfold(
+        (rx, permit, pending, finished),
+        move |(mut rx, permit, mut pending, mut finished)| {
+            let id = id.clone();
+            let jobs = jobs.clone();
+            let store = store.clone();
+            async move {
+                let event = if let Some(event) = pending.pop_front() {
+                    event
+                } else {
+                    if finished {
+                        return None;
+                    }
+                    loop {
+                        match rx.recv().await {
+                            Ok(ev) if ev.job_id() == id => {
+                                finished = matches!(
+                                    &ev,
+                                    JobEvent::Done { .. } | JobEvent::Failed { .. }
+                                ) || matches!(&ev, JobEvent::State { state, .. } if matches!(state.as_str(), "done" | "failed" | "cancelled"));
+                                if finished {
+                                    break store
+                                        .get_job(&id)
+                                        .ok()
+                                        .flatten()
+                                        .as_ref()
+                                        .and_then(terminal_event)
+                                        .unwrap_or_else(|| encode_event(ev, gzip));
+                                }
+                                break encode_event(ev, gzip);
+                            }
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                if let Some(event) = store
+                                    .get_job(&id)
+                                    .ok()
+                                    .flatten()
+                                    .as_ref()
+                                    .and_then(terminal_event)
+                                {
+                                    finished = true;
+                                    break event;
+                                }
+                                break jobs
+                                    .latest_frame(&id)
+                                    .map(|ev| encode_event(ev, gzip))
+                                    .unwrap_or_else(|| {
+                                        Event::default().event("resync").data("{}")
+                                    });
+                            }
+                        }
+                    }
+                };
+                Some((Ok(event), (rx, permit, pending, finished)))
+            }
+        },
+    );
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-fn encode_event(ev: JobEvent) -> Event {
+fn terminal_event(job: &crate::store::JobRecord) -> Option<Event> {
+    match job.state.as_str() {
+        "done" => Some(encode_event(
+            JobEvent::Done {
+                job_id: job.id.clone(),
+                map_id: job.map_id.clone(),
+                duration_ms: job
+                    .finished_at
+                    .unwrap_or(0)
+                    .saturating_sub(job.started_at.unwrap_or(0))
+                    .max(0) as u64,
+            },
+            false,
+        )),
+        "failed" => Some(encode_event(
+            JobEvent::Failed {
+                job_id: job.id.clone(),
+                error: job.error.clone().unwrap_or_else(|| "生成失败".into()),
+            },
+            false,
+        )),
+        "cancelled" => Some(
+            Event::default()
+                .event("cancelled")
+                .data(serde_json::json!({"job_id":job.id,"state":"cancelled"}).to_string()),
+        ),
+        _ => None,
+    }
+}
+
+fn encode_event(ev: JobEvent, gzip: bool) -> Event {
     match ev {
         JobEvent::State { job_id, state } => Event::default()
             .event("state")
@@ -707,6 +799,9 @@ fn encode_event(ev: JobEvent) -> Event {
             height,
             data,
             stats,
+            compressed,
+            grid,
+            meta,
         } => {
             use base64_lite::encode;
             Event::default().event("frame").data(
@@ -715,7 +810,9 @@ fn encode_event(ev: JobEvent) -> Event {
                     "tick": tick,
                     "w": width,
                     "h": height,
-                    "fmt": "raw-u16le+u8x3",
+                    "fmt": if gzip { "gzip-u16le+u8x3" } else { "raw-u16le+u8x3" },
+                    "grid": grid,
+                    "meta": meta,
                     "stats": {
                         "land_fraction": stats.land_fraction,
                         "max_elevation": stats.max_elevation,
@@ -723,7 +820,7 @@ fn encode_event(ev: JobEvent) -> Event {
                         "max_temperature": stats.max_temperature,
                         "min_temperature": stats.min_temperature,
                     },
-                    "data": encode(&data),
+                    "data": encode(if gzip { &compressed } else { &data }),
                 })
                 .to_string(),
             )

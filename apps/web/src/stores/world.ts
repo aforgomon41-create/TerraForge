@@ -8,7 +8,7 @@ import {
   type Session,
   type ChildRequest,
 } from '@/api/client'
-import { openEventStream, type FrameEvent } from '@/api/sse'
+import { openEventStream, type DecodedFrameEvent } from '@/api/sse'
 export const useWorldStore = defineStore('world', () => {
   const session = ref<Session | null>(null),
     worlds = ref<World[]>([]),
@@ -30,7 +30,7 @@ export const useWorldStore = defineStore('world', () => {
   let loadController: AbortController | null = null,
     closed = false,
     stopStream: (() => void) | null = null
-  let frameHandler: ((f: FrameEvent) => void) | undefined
+  let frameHandler: ((f: DecodedFrameEvent) => void) | undefined
   async function init() {
     session.value = await api.openSession()
     await refreshWorlds()
@@ -138,7 +138,14 @@ export const useWorldStore = defineStore('world', () => {
     await refreshMaps()
     stopStream?.()
     stopStream = openEventStream(result.job_id, {
-      onFrame: (f) => frameHandler?.(f),
+      onFrame: (f) => {
+        if (closed || job.value?.id !== f.job_id || !generating.value) return
+        if (f.meta) {
+          job.value.progress = Math.max(job.value.progress, f.meta.progress)
+          job.value.stage = f.meta.stage
+        }
+        frameHandler?.(f)
+      },
       onResync: () => {
         void api
           .getJob(result.job_id)
@@ -149,7 +156,7 @@ export const useWorldStore = defineStore('world', () => {
       },
       onProgress: (p) => {
         if (job.value) {
-          job.value.progress = p.progress
+          job.value.progress = Math.max(job.value.progress, p.progress)
           job.value.stage = p.stage
         }
       },
@@ -161,6 +168,7 @@ export const useWorldStore = defineStore('world', () => {
       const deadline = Date.now() + 30 * 60 * 1000
       while (!closed) {
         const j = await api.getJob(result.job_id)
+        if (job.value?.id === j.id) j.progress = Math.max(j.progress, job.value.progress)
         job.value = j
         if (j.state === 'done') {
           await refreshMaps()
@@ -208,7 +216,7 @@ export const useWorldStore = defineStore('world', () => {
     loadController?.abort()
     stopStream?.()
   }
-  function onFrame(fn: (f: FrameEvent) => void) {
+  function onFrame(fn: (f: DecodedFrameEvent) => void) {
     frameHandler = fn
   }
   return {

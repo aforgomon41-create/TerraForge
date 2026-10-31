@@ -145,6 +145,9 @@ impl FlatGrid {
     }
 }
 impl GridOps for FlatGrid {
+    fn locate_local(&self, x: f64, y: f64) -> Option<usize> {
+        self.cell_at_xy(x, y)
+    }
     fn field_is_planar(&self) -> bool {
         true
     }

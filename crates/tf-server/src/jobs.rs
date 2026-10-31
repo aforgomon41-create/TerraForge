@@ -31,9 +31,11 @@ pub enum JobEvent {
         tick: u32,
         width: u32,
         height: u32,
-        /// zstd 压缩后的多通道数据
-        data: Vec<u8>,
+        data: Arc<[u8]>,
+        compressed: Arc<[u8]>,
         stats: FrameStats,
+        grid: tf_grid::GridDescriptor,
+        meta: FrameMeta,
     },
     /// 完成。
     Done {
@@ -44,6 +46,20 @@ pub enum JobEvent {
     /// 失败。
     Failed { job_id: String, error: String },
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FrameMeta {
+    pub stage: String,
+    pub detail: String,
+    pub progress: f64,
+    pub step: u32,
+    pub elapsed_myr: Option<f64>,
+    pub year: Option<u32>,
+    pub month: Option<u8>,
+    pub channels: u8,
+    pub available_channels: u8,
+}
+pub type FrameCache = Arc<parking_lot::Mutex<std::collections::HashMap<String, JobEvent>>>;
 
 /// 帧的统计信息。
 #[derive(Debug, Clone, Default)]
@@ -87,6 +103,7 @@ struct Inner {
     changed: Notify,
     tx: broadcast::Sender<JobEvent>,
     max_queue: usize,
+    frames: FrameCache,
 }
 
 impl JobManager {
@@ -106,6 +123,7 @@ impl JobManager {
                 changed: Notify::new(),
                 tx,
                 max_queue,
+                frames: Default::default(),
             }),
         }
     }
@@ -121,6 +139,9 @@ impl JobManager {
     }
     pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
         self.inner.tx.subscribe()
+    }
+    pub fn latest_frame(&self, id: &str) -> Option<JobEvent> {
+        self.inner.frames.lock().get(id).cloned()
     }
     pub async fn max_concurrent(&self) -> usize {
         self.inner.state.lock().await.limit
@@ -256,11 +277,16 @@ impl JobManager {
         let jid = id.clone();
         let mid = map_id.clone();
         let flag = cancel.clone();
+        let frames = self.inner.frames.clone();
         let result = tokio::task::spawn_blocking(move || {
             if node.parent.is_none() {
-                crate::generate::run_generation(&store, &tx, &jid, &mid, &node, &params, &flag)
+                crate::generate::run_generation(
+                    &store, &tx, &frames, &jid, &mid, &node, &params, &flag,
+                )
             } else {
-                crate::child_gen::run_child_generation(&store, &tx, &jid, &node, &params, &flag)
+                crate::child_gen::run_child_generation(
+                    &store, &tx, &frames, &jid, &node, &params, &flag,
+                )
             }
         })
         .await;
@@ -293,6 +319,7 @@ impl JobManager {
             }
         }
         let mut st = self.inner.state.lock().await;
+        self.inner.frames.lock().remove(&id);
         st.active = st.active.saturating_sub(1);
         st.tickets.remove(&id);
         drop(st);

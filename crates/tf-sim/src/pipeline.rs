@@ -7,11 +7,12 @@ use tf_core::params::GenerationParams;
 use tf_core::DeterministicRng;
 use tf_grid::GridOps;
 
-use crate::climate::{run_climate_cancellable, ClimateParams};
+use crate::climate::ClimateParams;
 use crate::ecology::{find_minerals, run_ecology_with_diversity, EcologyResult, MineralDeposit};
 use crate::erosion::{compute_distance_to_sea, ErosionParams, ErosionState};
 use crate::fields::WorldFields;
 use crate::plates::{find_boundaries, TectonicState};
+use crate::preview::{emit, FrameInfo, FrameObserver};
 use crate::Stage;
 
 /// 一次生成的完整产物。
@@ -63,6 +64,35 @@ pub fn generate_cancellable<G: GridOps>(
     on_frame: FrameFn,
     cancel: &dyn Fn() -> bool,
 ) -> Option<GeneratedWorld> {
+    struct StageFrames<'a>(FrameFn<'a>);
+    impl FrameObserver for StageFrames<'_> {
+        fn enabled(&self) -> bool {
+            false
+        }
+        fn wants_frame(&mut self, info: FrameInfo) -> bool {
+            info.stage_complete
+        }
+        fn frame(&mut self, _: &dyn GridOps, fields: &WorldFields, info: FrameInfo) {
+            (self.0)(info.stage, fields);
+        }
+    }
+    generate_observed(
+        grid,
+        params,
+        on_progress,
+        &mut StageFrames(on_frame),
+        cancel,
+    )
+}
+
+/// Live solver snapshots are observational and never alter final model fields.
+pub fn generate_observed<G: GridOps>(
+    grid: &G,
+    params: &GenerationParams,
+    on_progress: ProgressFn,
+    observer: &mut dyn FrameObserver,
+    cancel: &dyn Fn() -> bool,
+) -> Option<GeneratedWorld> {
     if cancel() {
         return None;
     }
@@ -77,22 +107,33 @@ pub fn generate_cancellable<G: GridOps>(
         let context = crate::scopes::local_terrain(grid, &mut fields, params);
         cumulative = Stage::Tectonics.weight() + Stage::Landforms.weight();
         timings.push((Stage::Landforms, start.elapsed().as_millis()));
-        on_frame(Stage::Landforms, &fields);
+        emit(
+            observer,
+            grid,
+            &fields,
+            FrameInfo::stage(Stage::Landforms, cumulative),
+        );
         on_progress(Stage::Landforms, cumulative);
         context
     } else {
         let start = Instant::now();
         on_progress(Stage::Tectonics, 0.);
-        let tectonic = crate::evolution::generate(
+        let tectonic = crate::evolution::generate_observed(
             grid,
             params,
             &mut fields,
             &mut |p| on_progress(Stage::Tectonics, p * Stage::Tectonics.weight()),
             cancel,
+            observer,
         )?;
         cumulative = Stage::Tectonics.weight();
         timings.push((Stage::Tectonics, start.elapsed().as_millis()));
-        on_frame(Stage::Tectonics, &fields);
+        emit(
+            observer,
+            grid,
+            &fields,
+            FrameInfo::stage(Stage::Tectonics, cumulative),
+        );
         let start = Instant::now();
         on_progress(Stage::Landforms, cumulative);
         crate::evolution::landforms(grid, &mut fields, &tectonic, params);
@@ -101,7 +142,12 @@ pub fn generate_cancellable<G: GridOps>(
         }
         cumulative += Stage::Landforms.weight();
         timings.push((Stage::Landforms, start.elapsed().as_millis()));
-        on_frame(Stage::Landforms, &fields);
+        emit(
+            observer,
+            grid,
+            &fields,
+            FrameInfo::stage(Stage::Landforms, cumulative),
+        );
         on_progress(Stage::Landforms, cumulative);
         tectonic
     };
@@ -115,11 +161,30 @@ pub fn generate_cancellable<G: GridOps>(
     ero_params.iterations =
         (ero_params.iterations as f64 * params.quality.iteration_scale()) as u32;
     ero_params.k_river *= params.erosion_strength;
-    let mut erosion =
-        crate::erosion::run_erosion_cancellable(grid, &mut fields, &ero_params, cancel)?;
+    let mut erosion = crate::erosion::run_erosion_observed(
+        grid,
+        &mut fields,
+        &ero_params,
+        cancel,
+        &mut |step, fields| {
+            let progress = cumulative
+                + Stage::Erosion.weight() * step as f64 / ero_params.iterations.max(1) as f64;
+            on_progress(Stage::Erosion, progress);
+            let mut info = FrameInfo::stage(Stage::Erosion, progress);
+            info.stage_complete = false;
+            info.step = step;
+            info.detail = "河流下切与坡面演化";
+            emit(observer, grid, fields, info);
+        },
+    )?;
     cumulative += Stage::Erosion.weight();
     timings.push((Stage::Erosion, t.elapsed().as_millis()));
-    on_frame(Stage::Erosion, &fields);
+    emit(
+        observer,
+        grid,
+        &fields,
+        FrameInfo::stage(Stage::Erosion, cumulative),
+    );
     on_progress(Stage::Erosion, cumulative);
 
     // The physical elevation remains in metres. Do not remap a completed
@@ -142,32 +207,66 @@ pub fn generate_cancellable<G: GridOps>(
     clim.wind_speed_m_s = params.wind_speed_m_s;
     clim.orographic_strength = params.orographic_strength;
     clim.moisture_recycling = params.moisture_recycling;
-    if !(if local {
-        crate::scopes::local_climate(grid, &mut fields, params, &clim, cancel)
-    } else {
-        run_climate_cancellable(grid, &mut fields, &params.planet, &clim, cancel)
-    }) {
+    let climate_span = Stage::Climate.weight();
+    let feedback_enabled = params.erosion_strength > 0.;
+    if !climate_pass(
+        grid,
+        &mut fields,
+        params,
+        &clim,
+        cancel,
+        observer,
+        on_progress,
+        cumulative,
+        climate_span * if feedback_enabled { 0.45 } else { 1. },
+    ) {
         return None;
     }
-    if params.erosion_strength > 0. {
+    if feedback_enabled {
         let feedback = ErosionParams {
             iterations: 6,
             k_river: ErosionParams::default().k_river * params.erosion_strength,
             ..Default::default()
         };
-        erosion = crate::erosion::run_erosion_cancellable(grid, &mut fields, &feedback, cancel)?;
+        erosion = crate::erosion::run_erosion_observed(
+            grid,
+            &mut fields,
+            &feedback,
+            cancel,
+            &mut |step, fields| {
+                let p = cumulative
+                    + climate_span * (0.45 + 0.10 * step as f64 / feedback.iterations as f64);
+                on_progress(Stage::Climate, p);
+                let mut info = FrameInfo::stage(Stage::Climate, p);
+                info.stage_complete = false;
+                info.step = step;
+                info.detail = "降雨反馈侵蚀";
+                emit(observer, grid, fields, info);
+            },
+        )?;
         compute_distance_to_sea(grid, &mut fields);
-        if !(if local {
-            crate::scopes::local_climate(grid, &mut fields, params, &clim, cancel)
-        } else {
-            run_climate_cancellable(grid, &mut fields, &params.planet, &clim, cancel)
-        }) {
+        if !climate_pass(
+            grid,
+            &mut fields,
+            params,
+            &clim,
+            cancel,
+            observer,
+            on_progress,
+            cumulative + climate_span * 0.55,
+            climate_span * 0.45,
+        ) {
             return None;
         }
     }
     cumulative += Stage::Climate.weight();
     timings.push((Stage::Climate, t.elapsed().as_millis()));
-    on_frame(Stage::Climate, &fields);
+    emit(
+        observer,
+        grid,
+        &fields,
+        FrameInfo::stage(Stage::Climate, cumulative),
+    );
     on_progress(Stage::Climate, cumulative);
 
     // ---- 阶段 5：生态矿藏 ----
@@ -210,7 +309,12 @@ pub fn generate_cancellable<G: GridOps>(
     );
     cumulative += Stage::Ecology.weight();
     timings.push((Stage::Ecology, t.elapsed().as_millis()));
-    on_frame(Stage::Ecology, &fields);
+    emit(
+        observer,
+        grid,
+        &fields,
+        FrameInfo::stage(Stage::Ecology, cumulative),
+    );
     on_progress(Stage::Ecology, cumulative);
 
     if cancel() {
@@ -225,6 +329,57 @@ pub fn generate_cancellable<G: GridOps>(
         erosion,
         stage_timings: timings,
     })
+}
+
+fn climate_pass<G: GridOps>(
+    grid: &G,
+    fields: &mut WorldFields,
+    params: &GenerationParams,
+    climate: &ClimateParams,
+    cancel: &dyn Fn() -> bool,
+    observer: &mut dyn FrameObserver,
+    progress: ProgressFn,
+    start: f64,
+    span: f64,
+) -> bool {
+    struct ClimateFrames<'a> {
+        sink: &'a mut dyn FrameObserver,
+        progress: ProgressFn<'a>,
+        start: f64,
+        span: f64,
+    }
+    impl FrameObserver for ClimateFrames<'_> {
+        fn enabled(&self) -> bool {
+            self.sink.enabled()
+        }
+        fn wants_frame(&mut self, mut info: FrameInfo) -> bool {
+            info.progress = self.start + info.progress * self.span;
+            (self.progress)(info.stage, info.progress);
+            self.sink.wants_frame(info)
+        }
+        fn frame(&mut self, grid: &dyn GridOps, fields: &WorldFields, mut info: FrameInfo) {
+            info.progress = self.start + info.progress * self.span;
+            self.sink.frame(grid, fields, info);
+        }
+    }
+    let mut frames = ClimateFrames {
+        sink: observer,
+        progress,
+        start,
+        span,
+    };
+    if params.is_local() {
+        crate::scopes::local_climate_observed(grid, fields, params, climate, cancel, &mut frames)
+    } else {
+        crate::climate_transport::solve_observed(
+            grid,
+            fields,
+            &params.planet,
+            climate,
+            cancel,
+            &mut frames,
+        )
+    }
 }
 
 #[cfg(test)]

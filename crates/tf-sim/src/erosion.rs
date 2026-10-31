@@ -209,6 +209,16 @@ pub fn run_erosion_cancellable<G: GridOps>(
     params: &ErosionParams,
     cancel: &dyn Fn() -> bool,
 ) -> Option<ErosionState> {
+    run_erosion_observed(grid, fields, params, cancel, &mut |_, _| {})
+}
+
+pub fn run_erosion_observed<G: GridOps>(
+    grid: &G,
+    fields: &mut WorldFields,
+    params: &ErosionParams,
+    cancel: &dyn Fn() -> bool,
+    on_step: &mut dyn FnMut(u32, &WorldFields),
+) -> Option<ErosionState> {
     if cancel() {
         return None;
     }
@@ -274,6 +284,7 @@ pub fn run_erosion_cancellable<G: GridOps>(
                 fields.elevation[i] = (old[i] as f64 + delta / total.max(1.)).max(0.001) as f32;
             }
         }
+        on_step(iteration + 1, fields);
     }
     if cancel() {
         None

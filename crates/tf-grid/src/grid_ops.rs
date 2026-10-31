@@ -21,6 +21,10 @@ pub trait GridOps: Send + Sync {
     fn local_center_m(&self, _i: usize) -> Option<(f64, f64)> {
         None
     }
+    /// Look up a metric map coordinate without a geographic round trip.
+    fn locate_local(&self, _x: f64, _y: f64) -> Option<usize> {
+        None
+    }
 
     fn radius_m(&self) -> f64 {
         6_371_000.0

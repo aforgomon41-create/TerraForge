@@ -1,6 +1,6 @@
 //! Local physical refinement using the actual parent geometry.
 use crate::{
-    jobs::JobEvent,
+    jobs::{FrameCache, JobEvent},
     store::{Channel, MapNodeRecord, Store},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +10,7 @@ use tokio::sync::broadcast;
 pub fn run_child_generation(
     store: &Store,
     tx: &broadcast::Sender<JobEvent>,
+    frames: &FrameCache,
     job_id: &str,
     node: &MapNodeRecord,
     params: &tf_core::params::GenerationParams,
@@ -23,6 +24,7 @@ pub fn run_child_generation(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("地图缺少网格描述"))?;
     let patch = descriptor.build();
+    let mut live = crate::generate::LiveFrames::new(tx, frames, job_id, &patch, descriptor, cancel);
     anyhow::ensure!(patch.extent_m().is_some(), "子图必须使用有限平面域");
     let parent = store
         .get_map_node(
@@ -100,6 +102,10 @@ pub fn run_child_generation(
         });
     };
     progress("父图继承", 0.15);
+    let mut info = tf_sim::preview::FrameInfo::stage(tf_sim::Stage::Landforms, 0.15);
+    info.detail = "父图继承与局部地貌";
+    info.channels = tf_sim::preview::ALL;
+    tf_sim::preview::emit(&mut live, &patch, &fields, info);
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -108,9 +114,21 @@ pub fn run_child_generation(
         k_river: tf_sim::erosion::ErosionParams::default().k_river * params.erosion_strength,
         ..Default::default()
     };
-    if tf_sim::erosion::run_erosion_cancellable(&patch, &mut fields, &erosion, &|| {
-        cancel.load(Ordering::Relaxed)
-    })
+    if tf_sim::erosion::run_erosion_observed(
+        &patch,
+        &mut fields,
+        &erosion,
+        &|| cancel.load(Ordering::Relaxed),
+        &mut |step, fields| {
+            let p = 0.15 + 0.4 * step as f64 / erosion.iterations as f64;
+            progress("水文细化", p);
+            let mut info = tf_sim::preview::FrameInfo::stage(tf_sim::Stage::Erosion, p);
+            info.stage_complete = false;
+            info.step = step;
+            info.detail = "子区域河流与坡面细化";
+            tf_sim::preview::emit(&mut live, &patch, fields, info);
+        },
+    )
     .is_none()
     {
         return Ok(());
@@ -153,6 +171,9 @@ pub fn run_child_generation(
     let ecology =
         tf_sim::ecology::run_ecology_with_diversity(&patch, &fields, params.biome_diversity);
     progress("气候与生态", 0.9);
+    let mut info = tf_sim::preview::FrameInfo::stage(tf_sim::Stage::Ecology, 0.9);
+    info.detail = "父图气候与局部生态";
+    tf_sim::preview::emit(&mut live, &patch, &fields, info);
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }

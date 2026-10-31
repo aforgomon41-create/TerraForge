@@ -69,6 +69,23 @@ pub fn local_climate<G: GridOps>(
     climate: &ClimateParams,
     cancel: &dyn Fn() -> bool,
 ) -> bool {
+    local_climate_observed(
+        grid,
+        fields,
+        params,
+        climate,
+        cancel,
+        &mut crate::preview::NoFrames,
+    )
+}
+pub fn local_climate_observed<G: GridOps>(
+    grid: &G,
+    fields: &mut WorldFields,
+    params: &GenerationParams,
+    climate: &ClimateParams,
+    cancel: &dyn Fn() -> bool,
+    observer: &mut dyn crate::preview::FrameObserver,
+) -> bool {
     for i in 0..grid.cell_count() {
         fields.temperature[i] = (params.regional_temperature_c
             - (fields.elevation[i] as f64 - params.base_elevation_m) * 0.0065)
@@ -76,7 +93,14 @@ pub fn local_climate<G: GridOps>(
     }
     let mut local = climate.clone();
     local.prescribed_temperature = true;
-    if !crate::climate_transport::solve(grid, fields, &params.planet, &local, cancel) {
+    if !crate::climate_transport::solve_observed(
+        grid,
+        fields,
+        &params.planet,
+        &local,
+        cancel,
+        observer,
+    ) {
         return false;
     }
     let area = (0..grid.cell_count()).map(|i| grid.area_m2(i)).sum::<f64>();

@@ -1,8 +1,10 @@
 /** Continuous globe/plane renderer with an independent shared-edge hex overlay. */
 import { FRAG, VERT, LINE_VERT, LINE_FRAG } from './shaders'
-import { atlasSurface, atlasLines } from './surface'
-import { worldMapDirection, worldMapPoint } from './geometry'
+import { atlasSurface, atlasLines, projectAtlasPositions } from './surface'
+import { projectedWorldDirection, projectedWorldPoint } from './geometry'
+import { projectionBounds, projectionIndex, type WorldProjection } from './projections'
 import { lookAt, mat4Mul, perspective, cross, dot, norm, type Vec3 } from './math'
+import { frameTextureChannels } from './frameTexture'
 
 export interface CellData {
   /** 格子中心方向 xyz 交错，长度 = count * 3 */
@@ -40,8 +42,15 @@ export class HexSphereRenderer {
   private lineProgram: WebGLProgram | null = null
   private lineVao: WebGLVertexArrayObject | null = null
   private lineBuf: WebGLBuffer | null = null
+  private lineGeoBuf: WebGLBuffer | null = null
   private lineCount = 0
-  private diagnostics: { vao: WebGLVertexArrayObject; buffer: WebGLBuffer; count: number }[] = []
+  private diagnostics: {
+    vao: WebGLVertexArrayObject
+    buffer: WebGLBuffer
+    geoBuffer: WebGLBuffer
+    count: number
+  }[] = []
+  private instGeoBuf: WebGLBuffer | null = null
   private instPlateBuf: WebGLBuffer | null = null
   public mapMetres = 6371000
   private instCenterBuf: WebGLBuffer | null = null
@@ -73,6 +82,7 @@ export class HexSphereRenderer {
 
   /** 实时预览帧纹理。生成过程中用它覆盖真实数据。 */
   private frameTexture: WebGLTexture | null = null
+  private flowTexture: WebGLTexture | null = null
   private previewMode = false
   private previewMinElev = 0
   private previewMaxElev = 1
@@ -80,6 +90,8 @@ export class HexSphereRenderer {
   /** 平面补丁模式：子图用平面网格渲染而不是整球。 */
   private planarMode = false
   private worldFlatMode = false
+  private worldProjection: WorldProjection = 'equirectangular'
+  public previewHalfHeight = 1
   /** 平面模式的正交相机半高，由网格尺寸决定。 */
   public planarHalfHeight = 1.0
 
@@ -120,6 +132,7 @@ export class HexSphereRenderer {
     this.indexBuf = gl.createBuffer()
     this.lineVao = gl.createVertexArray()
     this.lineBuf = gl.createBuffer()
+    this.lineGeoBuf = gl.createBuffer()
     const lvs = this.compileShader(gl.VERTEX_SHADER, LINE_VERT),
       lfs = this.compileShader(gl.FRAGMENT_SHADER, LINE_FRAG)
     this.lineProgram = gl.createProgram()!
@@ -132,11 +145,14 @@ export class HexSphereRenderer {
     gl.deleteShader(lfs)
 
     this.frameTexture = gl.createTexture()
-    gl.bindTexture(gl.TEXTURE_2D, this.frameTexture)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    this.flowTexture = gl.createTexture()
+    for (const texture of [this.frameTexture, this.flowTexture]) {
+      gl.bindTexture(gl.TEXTURE_2D, texture)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    }
 
     gl.enable(gl.DEPTH_TEST)
     gl.enable(gl.CULL_FACE)
@@ -174,23 +190,28 @@ export class HexSphereRenderer {
     },
   ) {
     const gl = this.gl
-    if (!this.frameTexture) return
-
-    const rgba = new Uint8Array(w * h * 4)
+    if (!this.frameTexture || !this.flowTexture) return
+    const { rgba, flow } = frameTextureChannels(data, w, h)
     const eMin = stats.min_elevation
-    if (data.length !== w * h * 5) throw new Error('预览帧尺寸无效')
-
-    for (let i = 0; i < w * h; i++) {
-      const src = i * 5
-      const e16 = data[src] | (data[src + 1] << 8)
-      rgba[i * 4] = Math.round((e16 / 65535) * 255)
-      rgba[i * 4 + 1] = data[src + 2]
-      rgba[i * 4 + 2] = data[src + 3]
-      rgba[i * 4 + 3] = data[src + 4]
-    }
-
+    gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.frameTexture)
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_WRAP_S,
+      this.planarMode && !this.worldFlatMode ? gl.CLAMP_TO_EDGE : gl.REPEAT,
+    )
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba)
+    gl.activeTexture(gl.TEXTURE1)
+    gl.bindTexture(gl.TEXTURE_2D, this.flowTexture)
+    gl.texParameteri(
+      gl.TEXTURE_2D,
+      gl.TEXTURE_WRAP_S,
+      this.planarMode && !this.worldFlatMode ? gl.CLAMP_TO_EDGE : gl.REPEAT,
+    )
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, flow)
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4)
+    gl.activeTexture(gl.TEXTURE0)
 
     this.previewMode = true
     this.previewMinElev = eMin
@@ -215,11 +236,14 @@ export class HexSphereRenderer {
   }
 
   /** World atlas retains the same cell IDs and geographic picking as the globe. */
-  setWorldFlatMode() {
+  setWorldFlatMode(projection: WorldProjection = 'equirectangular') {
     this.setPlanarMode()
     this.worldFlatMode = true
+    this.worldProjection = projection
+    const bounds = projectionBounds(projection)
     this.planarHalfHeight =
-      1.08 * Math.max(1, (2 * this.canvas.clientHeight) / this.canvas.clientWidth)
+      1.08 *
+      Math.max(bounds.height, (bounds.width * this.canvas.clientHeight) / this.canvas.clientWidth)
   }
 
   /** 切回球面模式。 */
@@ -257,9 +281,11 @@ export class HexSphereRenderer {
     let centers = data.centers,
       indices = data.indices,
       sourceIds: Uint32Array | undefined
+    let geoPositions = centers
     if (this.worldFlatMode) {
       const atlas = atlasSurface(centers, indices)
-      centers = atlas.positions
+      geoPositions = atlas.positions
+      centers = projectAtlasPositions(atlas.positions, this.worldProjection)
       indices = atlas.indices
       sourceIds = atlas.sourceIds
     }
@@ -285,6 +311,12 @@ export class HexSphereRenderer {
           ? values
           : Float32Array.from({ length: data.count }, (_, i) => values?.[i] || 0)
     this.instCenterBuf = upload(0, centers, 3, this.instCenterBuf)
+    if (this.worldFlatMode) this.instGeoBuf = upload(7, geoPositions, 3, this.instGeoBuf)
+    else {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.instCenterBuf)
+      gl.enableVertexAttribArray(7)
+      gl.vertexAttribPointer(7, 3, gl.FLOAT, false, 0, 0)
+    }
     this.instHeightBuf = upload(1, channel(data.heights), 1, this.instHeightBuf)
     this.instBiomeBuf = upload(2, channel(data.biomes), 1, this.instBiomeBuf)
     this.instTempBuf = upload(4, channel(data.temperatures), 1, this.instTempBuf)
@@ -299,12 +331,19 @@ export class HexSphereRenderer {
   setOverlay(lines: Float32Array) {
     const gl = this.gl
     if (this.worldFlatMode) lines = atlasLines(lines)
+    const positions = this.worldFlatMode
+      ? projectAtlasPositions(lines, this.worldProjection)
+      : lines
     this.lineCount = lines.length / 3
     gl.bindVertexArray(this.lineVao)
     gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf)
-    gl.bufferData(gl.ARRAY_BUFFER, lines, gl.STATIC_DRAW)
+    gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW)
     gl.enableVertexAttribArray(0)
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineGeoBuf)
+    gl.bufferData(gl.ARRAY_BUFFER, lines, gl.STATIC_DRAW)
+    gl.enableVertexAttribArray(1)
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0)
     gl.bindVertexArray(null)
   }
 
@@ -313,17 +352,26 @@ export class HexSphereRenderer {
     for (const group of this.diagnostics) {
       gl.deleteVertexArray(group.vao)
       gl.deleteBuffer(group.buffer)
+      gl.deleteBuffer(group.geoBuffer)
     }
     this.diagnostics = groups.map((source) => {
       const values = this.worldFlatMode ? atlasLines(source) : source
+      const positions = this.worldFlatMode
+        ? projectAtlasPositions(values, this.worldProjection)
+        : values
       const vao = gl.createVertexArray()!,
-        buffer = gl.createBuffer()!
+        buffer = gl.createBuffer()!,
+        geoBuffer = gl.createBuffer()!
       gl.bindVertexArray(vao)
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
-      gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW)
+      gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW)
       gl.enableVertexAttribArray(0)
       gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
-      return { vao, buffer, count: values.length / 3 }
+      gl.bindBuffer(gl.ARRAY_BUFFER, geoBuffer)
+      gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW)
+      gl.enableVertexAttribArray(1)
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0)
+      return { vao, buffer, geoBuffer, count: values.length / 3 }
     })
     gl.bindVertexArray(null)
   }
@@ -342,7 +390,11 @@ export class HexSphereRenderer {
     this.planarZoom = 1
   }
   centerAt(p: Vec3) {
-    if (this.worldFlatMode) p = worldMapPoint(p)
+    if (this.worldFlatMode) {
+      const projected = projectedWorldPoint(p, this.worldProjection)
+      if (!projected) return
+      p = projected
+    }
     if (this.planarMode) {
       this.pan = [p[0], p[1], 0]
     } else {
@@ -371,8 +423,7 @@ export class HexSphereRenderer {
       const half = this.planarHalfHeight / this.planarZoom
       const p: Vec3 = [this.pan[0] + x * half * aspect, this.pan[1] + y * half, 0]
       if (!this.worldFlatMode) return p
-      if (Math.abs(p[0]) > 2 || Math.abs(p[1]) > 1) return null
-      return worldMapDirection(p)
+      return projectedWorldDirection(p, this.worldProjection)
     }
     const back = norm(this.eye),
       right = norm(cross([0, 1, 0], back)),
@@ -387,7 +438,11 @@ export class HexSphereRenderer {
     return norm(this.eye.map((v, i) => v + ray[i] * distance) as Vec3)
   }
   project(p: Vec3): { x: number; y: number } | null {
-    if (this.worldFlatMode) p = worldMapPoint(p)
+    if (this.worldFlatMode) {
+      const projected = projectedWorldPoint(p, this.worldProjection)
+      if (!projected) return null
+      p = projected
+    }
     if (!this.planarMode && dot(norm(p), this.eye) < this.radius) return null
     const m = this.matrix,
       w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15]
@@ -425,9 +480,12 @@ export class HexSphereRenderer {
     if (this.lineVao) gl.deleteVertexArray(this.lineVao)
     if (this.lineProgram) gl.deleteProgram(this.lineProgram)
     if (this.frameTexture) gl.deleteTexture(this.frameTexture)
+    if (this.flowTexture) gl.deleteTexture(this.flowTexture)
     for (const b of [
       this.indexBuf,
       this.lineBuf,
+      this.lineGeoBuf,
+      this.instGeoBuf,
       this.instCenterBuf,
       this.instHeightBuf,
       this.instBiomeBuf,
@@ -516,7 +574,10 @@ export class HexSphereRenderer {
     const view = lookAt(eye, this.planarMode ? this.pan : [0, 0, 0], [0, 1, 0])
     const aspect = this.canvas.width / Math.max(this.canvas.height, 1)
     // 平面模式用正交投影：格子大小严格一致，不会因透视产生远近差异
-    if (this.worldFlatMode) this.planarHalfHeight = 1.08 * Math.max(1, 2 / aspect)
+    if (this.worldFlatMode) {
+      const bounds = projectionBounds(this.worldProjection)
+      this.planarHalfHeight = 1.08 * Math.max(bounds.height, bounds.width / aspect)
+    }
     const proj = this.planarMode
       ? orthographic(this.planarHalfHeight / this.planarZoom, aspect, -10, 10)
       : perspective(Math.PI / 4, aspect, 0.01, 100)
@@ -537,6 +598,7 @@ export class HexSphereRenderer {
     gl.uniform1f(u('uMapMetres'), this.mapMetres)
     gl.uniform1i(u('uPlanarMode'), this.planarMode ? 1 : 0)
     gl.uniform1i(u('uWorldFlatMode'), this.worldFlatMode ? 1 : 0)
+    gl.uniform1i(u('uProjection'), projectionIndex(this.worldProjection))
     if (this.planarMode) {
       gl.uniform3f(u('uLightDir'), -0.45, 0.55, 0.7)
     } else {
@@ -551,8 +613,13 @@ export class HexSphereRenderer {
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, this.frameTexture)
       gl.uniform1i(u('uFrameTex'), 0)
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, this.flowTexture)
+      gl.uniform1i(u('uFlowTex'), 1)
+      gl.activeTexture(gl.TEXTURE0)
       gl.uniform1f(u('uPreviewMinElev'), this.previewMinElev)
       gl.uniform1f(u('uPreviewMaxElev'), this.previewMaxElev)
+      gl.uniform1f(u('uPreviewHalfHeight'), this.previewHalfHeight)
     }
 
     // Shared indices prevent the gaps/overlaps of independent regular hexagons.
@@ -569,6 +636,7 @@ export class HexSphereRenderer {
       gl.uniformMatrix4fv(lu('uViewProj'), false, viewProj)
       gl.uniform1i(lu('uSphere'), this.planarMode ? 0 : 1)
       gl.uniform1i(lu('uWorldFlatMode'), this.worldFlatMode ? 1 : 0)
+      gl.uniform1i(lu('uProjection'), projectionIndex(this.worldProjection))
       gl.uniform3fv(lu('uEye'), eye)
       gl.uniform1f(lu('uRadius'), this.radius)
       gl.disable(gl.DEPTH_TEST)

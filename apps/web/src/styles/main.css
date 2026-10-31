@@ -932,6 +932,13 @@ progress::-moz-progress-bar {
   font-size: 8px;
   margin-top: 9px;
 }
+.generation-steps.live-clock {
+  display: block;
+  line-height: 1.5;
+}
+.generation-steps.live-clock span {
+  display: block;
+}
 .generation-bar.settled {
   padding: 12px 16px;
 }

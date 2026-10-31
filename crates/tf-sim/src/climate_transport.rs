@@ -323,6 +323,16 @@ pub fn solve<G: GridOps>(
 ) -> bool {
     solve_at_resolution(fine, fields, planet, params, cancel, 75_000., 32)
 }
+pub fn solve_observed<G: GridOps>(
+    fine: &G,
+    fields: &mut WorldFields,
+    planet: &PlanetParams,
+    params: &ClimateParams,
+    cancel: &dyn Fn() -> bool,
+    observer: &mut dyn crate::preview::FrameObserver,
+) -> bool {
+    solve_observed_at_resolution(fine, fields, planet, params, cancel, 75_000., 32, observer)
+}
 pub(crate) fn solve_at_resolution<G: GridOps>(
     fine: &G,
     fields: &mut WorldFields,
@@ -331,6 +341,27 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
     cancel: &dyn Fn() -> bool,
     spacing_m: f64,
     sphere_frequency: u32,
+) -> bool {
+    solve_observed_at_resolution(
+        fine,
+        fields,
+        planet,
+        params,
+        cancel,
+        spacing_m,
+        sphere_frequency,
+        &mut crate::preview::NoFrames,
+    )
+}
+fn solve_observed_at_resolution<G: GridOps>(
+    fine: &G,
+    fields: &mut WorldFields,
+    planet: &PlanetParams,
+    params: &ClimateParams,
+    cancel: &dyn Fn() -> bool,
+    spacing_m: f64,
+    sphere_frequency: u32,
+    observer: &mut dyn crate::preview::FrameObserver,
 ) -> bool {
     let atmospheric = if let Some((w, h)) = fine.extent_m() {
         let central = (0..fine.cell_count())
@@ -423,7 +454,7 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
         .map(|(i, j)| atmospheric.distance_m(i, j))
         .fold(f64::INFINITY, f64::min);
     let dt = (min_spacing / params.wind_speed_m_s * 0.32).clamp(1., 21600.);
-    let Some(mut atlas) = crate::seasonal::energy(
+    let Some(mut atlas) = crate::seasonal::energy_observed(
         &atmospheric,
         &heights,
         &oceans,
@@ -435,6 +466,7 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
             None
         },
         cancel,
+        observer,
     ) else {
         return false;
     };
@@ -453,6 +485,11 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
             storage_start = water_total(&vapor, &cloud, &soil);
         }
         for month in 0..12 {
+            let mut preview_rain = if observer.enabled() {
+                Some(vec![0_f64; n])
+            } else {
+                None
+            };
             let season = crate::seasonal::solar_longitude(month).sin();
             if cancel() {
                 return false;
@@ -549,6 +586,9 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
                         dt,
                         params,
                     );
+                    if let Some(rain) = &mut preview_rain {
+                        rain[i] += flux.rain * (YEAR / 12.) / (sample as f64 * dt);
+                    }
                     if cycle == 1 {
                         let factor = (YEAR / 12.) / (sample as f64 * dt);
                         atlas.precipitation_mm[month][i] += (flux.rain * factor) as f32;
@@ -560,6 +600,34 @@ pub(crate) fn solve_at_resolution<G: GridOps>(
                 }
                 std::mem::swap(&mut vapor, &mut next_v);
                 std::mem::swap(&mut cloud, &mut next_c);
+                // The current month's accumulated rain is labelled separately
+                // from the completed map's annual rainfall.
+                if step % 8 == 0 || step + 1 == sample {
+                    let mut info = crate::preview::FrameInfo::stage(
+                        crate::Stage::Climate,
+                        0.35 + 0.60
+                            * (cycle as f64 * 12.
+                                + month as f64
+                                + (step + 1) as f64 / sample as f64)
+                            / 24.,
+                    );
+                    info.stage_complete = false;
+                    info.step = (cycle * 12 * sample + month * sample + step + 1) as u32;
+                    info.year = Some(cycle as u32 + 1);
+                    info.month = Some(month as u8 + 1);
+                    info.channels = crate::preview::TEMPERATURE | crate::preview::PRECIPITATION;
+                    info.detail = "水汽输运 · 本月累计降水";
+                    if observer.wants_frame(info) {
+                        let mut preview = WorldFields::with_capacity(n);
+                        preview.temperature.clone_from(&atlas.temperature_c[month]);
+                        if let Some(rain) = &preview_rain {
+                            for i in 0..n {
+                                preview.precipitation[i] = rain[i] as f32;
+                            }
+                        }
+                        observer.frame(&atmospheric, &preview, info);
+                    }
+                }
             }
         }
     }

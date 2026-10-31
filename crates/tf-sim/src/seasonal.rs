@@ -3,6 +3,7 @@
 //! exchange are solved implicitly at a sea-level reference column. Topographic
 //! surface temperatures are lapse-rate diagnostics, not a separate closed surface budget.
 use crate::scientific::{self, DAY};
+use crate::WorldFields;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
 use tf_core::params::PlanetParams;
@@ -166,6 +167,28 @@ pub fn energy(
     prescribed: Option<&[f64]>,
     cancel: &dyn Fn() -> bool,
 ) -> Option<ClimateAtlas> {
+    energy_observed(
+        atmosphere,
+        heights,
+        oceans,
+        planet,
+        greenhouse,
+        prescribed,
+        cancel,
+        &mut crate::preview::NoFrames,
+    )
+}
+
+pub(crate) fn energy_observed(
+    atmosphere: &MapGrid,
+    heights: &[f64],
+    oceans: &[f64],
+    planet: &PlanetParams,
+    greenhouse: f64,
+    prescribed: Option<&[f64]>,
+    cancel: &dyn Fn() -> bool,
+    observer: &mut dyn crate::preview::FrameObserver,
+) -> Option<ClimateAtlas> {
     let grid = energy_grid(atmosphere);
     let n = grid.cell_count();
     let mut area = vec![0.; n];
@@ -276,13 +299,32 @@ pub fn energy(
                 storage_sum += capacity[i] * (temperature[i] - old[i]) / dt * area[i] / 12.;
                 external_sum += (external[i] - boundary_k * temperature[i]) * area[i] / 12.;
             }
+            let mut info = crate::preview::FrameInfo::stage(
+                crate::Stage::Climate,
+                0.35 * (year * 12 + month + 1) as f64 / (32. * 12.),
+            );
+            info.stage_complete = false;
+            info.step = (year * 12 + month + 1) as u32;
+            info.year = Some(year as u32 + 1);
+            info.month = Some(month as u8 + 1);
+            info.channels = crate::preview::TEMPERATURE;
+            info.detail = "温度平衡";
+            if observer.wants_frame(info) {
+                let mut preview = WorldFields::with_capacity(n);
+                for i in 0..n {
+                    preview.elevation[i] = elevation[i] as f32;
+                    preview.temperature[i] =
+                        (temperature[i] - elevation[i].max(0.) * 0.0065) as f32;
+                }
+                observer.frame(&grid, &preview, info);
+            }
         }
         let total_area = area.iter().sum::<f64>();
         budget = EnergyBudget {
             temperature_basis:
                 "sea-level reference column; surface temperature uses a lapse-rate diagnostic"
                     .into(),
-            spinup_years: year + 1,
+            spinup_years: year as u32 + 1,
             annual_cycle_converged: false,
             annual_cycle_change_c: temperature
                 .iter()

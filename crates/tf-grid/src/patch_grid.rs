@@ -197,6 +197,10 @@ impl PatchGrid {
         }
         let (ax, ay) = self.project(dir);
         let (x, y) = (ax * self.radius_m, ay * self.radius_m);
+        self.cell_at_local(x, y)
+    }
+
+    pub fn cell_at_local(&self, x: f64, y: f64) -> Option<usize> {
         let half = (self.size as f64 - 1.) / 2.;
         let rf = half - y / (self.cell_size_m * (3.0_f64).sqrt() / 2.);
         if rf < -0.5 || rf > self.size as f64 - 0.5 {
@@ -230,6 +234,9 @@ impl PatchGrid {
 }
 
 impl crate::GridOps for PatchGrid {
+    fn locate_local(&self, x: f64, y: f64) -> Option<usize> {
+        self.cell_at_local(x, y)
+    }
     fn locate(&self, dir: UnitVec3) -> Option<usize> {
         self.cell_at(dir)
     }

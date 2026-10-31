@@ -1,4 +1,10 @@
 import type { Vec3 } from './math'
+import {
+  projectLonLat,
+  unprojectPoint,
+  MERCATOR_MAX_LAT,
+  type WorldProjection,
+} from './projections.ts'
 export function latLon(dir: ArrayLike<number>) {
   const length = Math.hypot(dir[0], dir[1], dir[2])
   return {
@@ -69,6 +75,17 @@ export function worldMapPoint(p: Vec3): Vec3 {
 }
 export function worldMapDirection(p: Vec3): Vec3 {
   return direction(p[1] * 90, p[0] * 90)
+}
+export function projectedWorldPoint(p: Vec3, projection: WorldProjection): Vec3 | null {
+  const geo = latLon(p),
+    lat = (geo.lat * Math.PI) / 180
+  if (projection === 'mercator' && Math.abs(lat) > MERCATOR_MAX_LAT + 1e-9) return null
+  const xy = projectLonLat((geo.lon * Math.PI) / 180, lat, projection)
+  return [xy[0], xy[1], 0]
+}
+export function projectedWorldDirection(p: Vec3, projection: WorldProjection): Vec3 | null {
+  const geo = unprojectPoint(p[0], p[1], projection)
+  return geo ? direction((geo[1] * 180) / Math.PI, (geo[0] * 180) / Math.PI) : null
 }
 
 export function flatDirection(
