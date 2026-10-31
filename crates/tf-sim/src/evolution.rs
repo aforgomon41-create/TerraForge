@@ -373,6 +373,8 @@ fn remap(
     let rh = reconstruction(grid, &thickness);
     let rr = reconstruction(grid, &reference_height);
     let rc = reconstruction(grid, &continental);
+    let reference_surface: Vec<_> = f.elevation.iter().map(|v| *v as f64).collect();
+    let rb = reconstruction(grid, &reference_surface);
     for i in 0..n {
         let area = grid.area_m2(i);
         let plate = f.plate_id[i] as usize;
@@ -448,8 +450,19 @@ fn remap(
             reference_height[i] * area - rr[i].high * retained_area,
             reference_height[i] * area - rr[i].low * retained_area,
         );
+        let sum_b = shares
+            .iter()
+            .map(|(_, a, d)| rb[i].sample(*d) * a)
+            .sum::<f64>();
+        let lb = flux_limit(
+            reference_surface[i] * outgoing,
+            sum_b,
+            reference_surface[i] * area - rb[i].high * retained_area,
+            reference_surface[i] * area - rb[i].low * retained_area,
+        );
         let hface = |d| thickness[i] + lh * (rh[i].sample(d) - thickness[i]);
         let rface = |d| reference_height[i] + lr * (rr[i].sample(d) - reference_height[i]);
+        let bface = |d| reference_surface[i] + lb * (rb[i].sample(d) - reference_surface[i]);
         let out_h = shares.iter().map(|(_, a, d)| hface(*d) * a).sum::<f64>();
         let retained_h = (thickness[i] * area - out_h).max(0.);
         let fraction_c = f.crust_type[i] as f64;
@@ -465,28 +478,38 @@ fn remap(
         );
         let mut kept_c = continental[i] * area;
         let mut kept_r = reference_height[i] * area;
+        let mut kept_b = reference_surface[i] * area;
         let mut transfers = Vec::with_capacity(shares.len() + 1);
         for (j, a, d) in shares {
             let h = hface(d) * a;
             let r = rface(d) * a;
+            let b = bface(d) * a;
             let c = (fraction_c * hface(d)
                 + lc * (rc[i].sample(d).clamp(0., hface(d)) - fraction_c * hface(d)))
                 * a;
             kept_c -= c;
             kept_r -= r;
+            kept_b -= b;
             if let Some(j) = j {
-                transfers.push((j, a, h, c, r));
+                transfers.push((j, a, h, c, r, b));
             } else {
                 history.exported_crust_m3 += h;
             }
         }
-        transfers.push((i, retained_area, retained_h, kept_c.max(0.), kept_r.max(0.)));
-        for (j, share, h, c, r) in transfers {
+        transfers.push((
+            i,
+            retained_area,
+            retained_h,
+            kept_c.max(0.),
+            kept_r.max(0.),
+            kept_b,
+        ));
+        for (j, share, h, c, r, b) in transfers {
             coverage[j] += share;
             volume[j] += h;
             continental_volume[j] += c;
             reference[j] += r;
-            basement[j] += f.elevation[i] as f64 * share;
+            basement[j] += b;
             age[j] += f.crust_age[i] as f64 * share;
             strain[j] += f.crustal_strain[i] as f64 * share;
             orogen_age[j] += f.orogen_age[i] as f64 * share;
@@ -811,7 +834,7 @@ pub fn generate<G: GridOps>(
     }
     material.orogen_age.fill(150.);
     let mut history = History {
-        model: "muscl-conservative-terrane+episodic-volcanism-v2".into(),
+        model: "muscl-conservative-surface+episodic-volcanism-v3".into(),
         initial_crust_m3: crust_volume(&grid, &material),
         duration_myr: params.tectonic_age_myr,
         ..Default::default()
@@ -1333,6 +1356,7 @@ mod tests {
             } else {
                 0.
             };
+            f.elevation[i] = f.crust_type[i] * 1000.;
         }
         let state = TectonicState {
             plates: vec![crate::Plate {
@@ -1357,6 +1381,13 @@ mod tests {
             assert!(
                 mixed <= 6,
                 "row {row}: translation smeared two sharp coasts across {mixed} cells"
+            );
+            let mixed_basement = (row * 100..(row + 1) * 100)
+                .filter(|&i| f.elevation[i] > 100. && f.elevation[i] < 900.)
+                .count();
+            assert!(
+                mixed_basement <= 6,
+                "row {row}: reference surface smeared across {mixed_basement} cells"
             );
         }
         assert!(f.crust_type.iter().all(|v| *v >= 0. && *v <= 1.));
