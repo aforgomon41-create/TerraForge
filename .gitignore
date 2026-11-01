@@ -15,5 +15,6 @@
 .DS_Store
 Thumbs.db
 /artifacts/
+**/__pycache__/
 /test-results/
 /playwright-report/
