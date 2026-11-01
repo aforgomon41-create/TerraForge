@@ -59,6 +59,9 @@ export class HexSphereRenderer {
   private instTempBuf: WebGLBuffer | null = null
   private instPrecipBuf: WebGLBuffer | null = null
   private instFlowBuf: WebGLBuffer | null = null
+  private geographyBuf: WebGLBuffer | null = null
+  private geographySourceIds: Uint32Array | undefined
+  private geographyActive = false
   private pan: Vec3 = [0, 0, 0]
   private planarZoom = 1
   private matrix: Float32Array = new Float32Array(16)
@@ -290,7 +293,11 @@ export class HexSphereRenderer {
       sourceIds = atlas.sourceIds
     }
     this.indexCount = indices.length
+    this.geographySourceIds = sourceIds
+    this.geographyActive = false
     gl.bindVertexArray(this.vao)
+    gl.disableVertexAttribArray(8)
+    gl.vertexAttrib1f(8, 0)
     const upload = (
       location: number,
       values: Float32Array,
@@ -325,6 +332,26 @@ export class HexSphereRenderer {
     this.instPlateBuf = upload(3, channel(data.plateIds), 1, this.instPlateBuf)
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuf)
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
+    gl.bindVertexArray(null)
+  }
+
+  setGeographyMask(mask: Float32Array | null) {
+    const gl = this.gl
+    this.geographyActive = !!mask
+    gl.bindVertexArray(this.vao)
+    if (mask) {
+      const values = this.geographySourceIds
+        ? Float32Array.from(this.geographySourceIds, (id) => mask[id] || 0)
+        : mask
+      this.geographyBuf ||= gl.createBuffer()
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.geographyBuf)
+      gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW)
+      gl.enableVertexAttribArray(8)
+      gl.vertexAttribPointer(8, 1, gl.FLOAT, false, 0, 0)
+    } else {
+      gl.disableVertexAttribArray(8)
+      gl.vertexAttrib1f(8, 0)
+    }
     gl.bindVertexArray(null)
   }
 
@@ -377,6 +404,7 @@ export class HexSphereRenderer {
   }
 
   clear() {
+    this.geographyActive = false
     this.cellCount = 0
     this.lineCount = 0
     this.setDiagnostics([])
@@ -493,6 +521,7 @@ export class HexSphereRenderer {
       this.instPrecipBuf,
       this.instFlowBuf,
       this.instPlateBuf,
+      this.geographyBuf,
     ]) {
       if (b) gl.deleteBuffer(b)
     }
@@ -606,6 +635,7 @@ export class HexSphereRenderer {
     }
     gl.uniform1i(u('uStyle'), this.style)
     gl.uniform1i(u('uLayer'), this.layer)
+    gl.uniform1i(u('uGeographyActive'), this.geographyActive ? 1 : 0)
 
     // 预览模式：绑定帧纹理
     gl.uniform1i(u('uPreviewMode'), this.previewMode ? 1 : 0)

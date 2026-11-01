@@ -103,7 +103,9 @@ pub fn run_generation(
         return Ok(());
     }
 
-    persist_fields(store, map_id, &world)?;
+    persist_fields(store, map_id, &world, &grid, &|| {
+        cancel.load(Ordering::Relaxed)
+    })?;
 
     info!("生成完成 {}: {} 个矿点", map_id, world.minerals.len());
     Ok(())

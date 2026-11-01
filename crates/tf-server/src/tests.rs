@@ -544,6 +544,39 @@ async fn independent_region_plane_child_geometry_and_project_round_trip() {
         f.state.store.get_map_node(&n.id).unwrap().unwrap().status,
         "done"
     );
+    let payload = |map_id: &str, bearer: &str| {
+        Request::builder()
+            .uri(format!("/api/v1/maps/{map_id}/geography"))
+            .header("host", "test.local")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = f.app.clone().oneshot(payload(&n.id, &token)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let data = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+    let geography = crate::geography::parse(&data, n.cells as usize).unwrap();
+    assert!(geography.features.iter().any(|g| g.level == "region"));
+    assert!(f
+        .state
+        .store
+        .get_metadata(&n.id)
+        .unwrap()
+        .unwrap()
+        .get(crate::geography::KEY)
+        .is_some());
+    let other = f.session().await;
+    let response = f.app.clone().oneshot(payload(&n.id, &other)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let (_, metadata) = f
+        .request(
+            "GET",
+            &format!("/api/v1/maps/{}/metadata", n.id),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert!(metadata.get(crate::geography::KEY).is_none());
     let response = f
         .app
         .clone()
@@ -596,6 +629,31 @@ async fn independent_region_plane_child_geometry_and_project_round_trip() {
     assert!(maps
         .iter()
         .any(|m| m.parent.is_none() && m.kind == "region"));
+    let imported_root = maps.iter().find(|m| m.parent.is_none()).unwrap();
+    assert!(f
+        .state
+        .store
+        .get_metadata(&imported_root.id)
+        .unwrap()
+        .unwrap()
+        .get(crate::geography::KEY)
+        .is_none());
+    // Imported (and legacy) maps rebuild lazily using the saved physical fields.
+    let mut imported_world = f.state.store.get_world(&imported.id).unwrap().unwrap();
+    imported_world.owner_token = f.state.store.get_world(&w).unwrap().unwrap().owner_token;
+    f.state.store.put_world(&imported_world).unwrap();
+    let response = f
+        .app
+        .clone()
+        .oneshot(payload(&imported_root.id, &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let data = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+    let rebuilt = crate::geography::parse(&data, imported_root.cells as usize).unwrap();
+    assert_eq!(geography.landmass, rebuilt.landmass);
+    assert_eq!(geography.region, rebuilt.region);
+    assert_eq!(geography.site, rebuilt.site);
 }
 
 #[tokio::test]

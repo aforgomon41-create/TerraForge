@@ -1,4 +1,5 @@
 /** Same-origin API. Every tab gets a server-issued, temporary capability. */
+import { decodeGeography } from '@/geography/catalog'
 export const API_BASE = import.meta.env.DEV
   ? ''
   : new URL(import.meta.env.BASE_URL, window.location.href).pathname.replace(/\/$/, '')
@@ -117,7 +118,7 @@ async function geometryRequest(path: string, signal?: AbortSignal): Promise<Resp
     try {
       return await authorizedFetch('/api/v1' + path, { signal })
     } catch (e) {
-      if ((e as Error & { status?: number }).status !== 429 || attempt >= 3 || signal?.aborted)
+      if ((e as Error & { status?: number }).status !== 429 || attempt >= 10 || signal?.aborted)
         throw e
       await new Promise<void>((resolve, reject) => {
         const abort = () => {
@@ -137,6 +138,10 @@ async function geometryRequest(path: string, signal?: AbortSignal): Promise<Resp
   }
 }
 export const api = {
+  async getGeography(id: string, cells: number, signal?: AbortSignal) {
+    const response = await geometryRequest(`/maps/${id}/geography`, signal)
+    return decodeGeography(await response.arrayBuffer(), cells)
+  },
   async openSession() {
     const session = await request<Session>('/session', { method: 'POST' })
     token = session.token

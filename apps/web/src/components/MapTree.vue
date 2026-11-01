@@ -79,7 +79,7 @@ function toggle(id: string) {
       >
         <span>
           {{ node.name || names[node.kind] }}
-          <small>{{ names[node.kind] }}</small>
+          <small>{{ node.parent ? '精细图' : names[node.kind] + '范围地图' }}</small>
         </span>
         <span class="tree-meta">
           <i :class="node.status" />

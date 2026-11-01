@@ -9,6 +9,7 @@ import {
   type ChildRequest,
 } from '@/api/client'
 import { openEventStream, type DecodedFrameEvent } from '@/api/sse'
+import type { Geography } from '@/geography/catalog'
 export const useWorldStore = defineStore('world', () => {
   const session = ref<Session | null>(null),
     worlds = ref<World[]>([]),
@@ -27,6 +28,9 @@ export const useWorldStore = defineStore('world', () => {
     flow = shallowRef<Float32Array | null>(null),
     plateIds = shallowRef<Float32Array | null>(null)
   const indices = shallowRef<Uint32Array | null>(null)
+  const geography = shallowRef<Geography | null>(null),
+    geographyLoading = ref(false),
+    geographyError = ref('')
   let loadController: AbortController | null = null,
     closed = false,
     stopStream: (() => void) | null = null
@@ -49,6 +53,9 @@ export const useWorldStore = defineStore('world', () => {
     plateIds.value = null
     biome.value = null
     indices.value = null
+    geography.value = null
+    geographyLoading.value = false
+    geographyError.value = ''
   }
   async function selectWorld(id: string) {
     if (generating.value) throw new Error('请先等待或取消当前生成')
@@ -86,6 +93,9 @@ export const useWorldStore = defineStore('world', () => {
     const controller = new AbortController()
     loadController = controller
     loading.value = true
+    geography.value = null
+    geographyLoading.value = false
+    geographyError.value = ''
     try {
       const node = await api.getMap(id)
       if (node.status !== 'done') throw new Error('这张地图尚未完成')
@@ -120,6 +130,21 @@ export const useWorldStore = defineStore('world', () => {
       flow.value = f
       plateIds.value = ids
       currentMap.value = node
+      // Geography is derived independently: a failed detection cannot hide the map.
+      geographyLoading.value = true
+      void api
+        .getGeography(id, node.cells, controller.signal)
+        .then((g) => {
+          if (!controller.signal.aborted && currentMap.value?.id === id) geography.value = g
+        })
+        .catch((e: Error) => {
+          if (!controller.signal.aborted && currentMap.value?.id === id)
+            geographyError.value = e.message
+        })
+        .finally(() => {
+          if (!controller.signal.aborted && currentMap.value?.id === id)
+            geographyLoading.value = false
+        })
     } catch (e) {
       if ((e as Error).name !== 'AbortError') throw e
     } finally {
@@ -231,6 +256,9 @@ export const useWorldStore = defineStore('world', () => {
     error,
     centers,
     indices,
+    geography,
+    geographyLoading,
+    geographyError,
     elevation,
     biome,
     temperature,

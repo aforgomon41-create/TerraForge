@@ -62,6 +62,10 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::surface::get_overlay),
         )
         .route("/api/v1/maps/{id}/metadata", get(get_metadata))
+        .route(
+            "/api/v1/maps/{id}/geography",
+            get(crate::geography::get_geography),
+        )
         .route("/api/v1/maps/{id}/climate", get(get_monthly_climate))
         .route(
             "/api/v1/maps/{id}/tectonics",
@@ -1054,6 +1058,7 @@ async fn get_metadata(
     let mut metadata = st.store.get_metadata(&id)?.unwrap_or_default();
     if let Some(object) = metadata.as_object_mut() {
         object.remove("climate_atlas");
+        object.remove(crate::geography::KEY);
     }
     if let Some(cell) = query.get("cell") {
         let cell = cell

@@ -457,6 +457,43 @@ impl Store {
             .transpose()
     }
 
+    /// Cache only derived geography; never resurrect a concurrently deleted map.
+    pub fn cache_geography(&self, map_id: &str, value: &serde_json::Value) -> anyhow::Result<()> {
+        let write = self.db.begin_write()?;
+        let node: MapNodeRecord = {
+            let table = write.open_table(MAP_NODES)?;
+            let record = table
+                .get(map_id)?
+                .ok_or_else(|| anyhow::anyhow!("地图已删除"))?;
+            serde_json::from_slice(record.value())?
+        };
+        anyhow::ensure!(
+            node.status == "done"
+                && write
+                    .open_table(WORLDS)?
+                    .get(node.world_id.as_str())?
+                    .is_some(),
+            "地图已删除或尚未完成"
+        );
+        {
+            let mut table = write.open_table(META)?;
+            let mut metadata: serde_json::Value = table
+                .get(map_id)?
+                .map(|v| serde_json::from_slice(v.value()))
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !metadata.is_object() {
+                metadata = serde_json::json!({});
+            }
+            metadata[crate::geography::KEY] = value.clone();
+            metadata.as_object_mut().unwrap().remove("geography_error");
+            let bytes = serde_json::to_vec(&metadata)?;
+            table.insert(map_id, bytes.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     pub fn transition_job(
         &self,
         id: &str,

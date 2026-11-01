@@ -5,6 +5,7 @@ pub mod child_gen;
 pub mod climatology;
 pub mod config;
 pub mod generate;
+pub mod geography;
 pub mod jobs;
 mod project;
 pub mod render;

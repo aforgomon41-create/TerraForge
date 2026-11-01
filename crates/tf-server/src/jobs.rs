@@ -342,10 +342,12 @@ pub fn now_millis() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-pub fn persist_fields(
+pub fn persist_fields<G: tf_grid::GridOps>(
     store: &Store,
     map_id: &str,
     world: &tf_sim::GeneratedWorld,
+    grid: &G,
+    cancel: &dyn Fn() -> bool,
 ) -> anyhow::Result<()> {
     let f = &world.fields;
     let biome: Vec<f32> = world.ecology.biome.iter().map(|&b| b as f32).collect();
@@ -356,6 +358,8 @@ pub fn persist_fields(
         metadata["climate_atlas"] = crate::climatology::encode(atlas)?;
         metadata["climate_model"] = serde_json::json!({"name":atlas.model,"months":12,"cells":atlas.grid.cell_count(),"energy":atlas.energy,"water":atlas.water,"pet":"Thornthwaite temperature/daylength approximation"});
     }
+    crate::geography::attach(&mut metadata, grid, f, &world.erosion, cancel);
+    anyhow::ensure!(!cancel(), "生成已取消");
     store.publish_fields(
         map_id,
         &[

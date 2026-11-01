@@ -18,6 +18,7 @@ pub mod ecology;
 pub mod erosion;
 pub mod evolution;
 pub mod fields;
+pub mod geography;
 pub mod landforms;
 pub mod pipeline;
 pub mod plates;

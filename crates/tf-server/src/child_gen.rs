@@ -141,7 +141,7 @@ pub fn run_child_generation(
     for i in 0..patch.cell_count() {
         fields.temperature[i] -= (fields.elevation[i] - sample.elevation[i]) * 0.0065;
     }
-    tf_sim::erosion::refresh_hydrology(&patch, &mut fields);
+    let water = tf_sim::erosion::refresh_hydrology(&patch, &mut fields);
     tf_sim::erosion::compute_distance_to_sea(&patch, &mut fields);
     if let Some(atlas) = &fields.climate {
         let climate_grid = atlas.grid.build();
@@ -238,7 +238,14 @@ pub fn run_child_generation(
     for (channel, data) in &inherited {
         channels.push((*channel, data.as_slice()));
     }
-    store.publish_fields(&node.id,&channels,&serde_json::json!({"generator_version":"tf-0.4","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")}))?;
+    let mut metadata = serde_json::json!({"generator_version":"tf-0.4","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
+    crate::geography::attach(&mut metadata, &patch, &fields, &water, &|| {
+        cancel.load(Ordering::Relaxed)
+    });
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    store.publish_fields(&node.id, &channels, &metadata)?;
     progress("完成", 1.);
     Ok(())
 }

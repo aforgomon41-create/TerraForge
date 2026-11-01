@@ -14,6 +14,8 @@ import type { ToolContext } from '@/agent/tools'
 import { flatDirection, flatProject } from '@/renderer/geometry'
 import { parseSeed } from '@/generation/seed'
 import MapTree from '@/components/MapTree.vue'
+import FeatureTree from '@/components/FeatureTree.vue'
+import { featureKinds, featureMask, featuresAt } from '@/geography/catalog'
 import AgentPanel from '@/components/AgentPanel.vue'
 const store = useWorldStore(),
   canvas = ref<HTMLCanvasElement | null>(null),
@@ -77,6 +79,11 @@ const manualLat = ref('0'),
   childName = ref(''),
   refine = ref(false),
   ended = ref(false)
+const activeFeatureId = ref<number | null>(null)
+const activeFeature = computed(() =>
+  activeFeatureId.value ? store.geography?.features[activeFeatureId.value - 1] : null,
+)
+const selectedGeography = computed(() => featuresAt(store.geography, selection.value?.cell))
 let renderer: HexSphereRenderer | null = null,
   heartbeat: ReturnType<typeof setInterval> | undefined,
   uiTimer: ReturnType<typeof setInterval> | undefined,
@@ -356,6 +363,7 @@ async function refreshTectonics() {
 function applyMap() {
   const node = store.currentMap
   if (!renderer) return
+  activeFeatureId.value = null
   if (store.generating && liveFrame.value) {
     renderLiveFrame()
     return
@@ -407,9 +415,11 @@ function applyMap() {
 watch(() => store.currentMap, applyMap)
 watch(worldProjection, () => {
   const selected = selection.value
+  const feature = activeFeatureId.value
   applyMap()
   if (!store.generating && selected) {
     selection.value = selected
+    if (feature) selectGeographic(feature)
     updatePin()
   }
 })
@@ -446,7 +456,7 @@ watch(style, (v) => {
 })
 watch(next, () => {
   childWidth.value = (spacing.value * Math.min(256, store.session?.max_patch_side || 512)) / 1000
-  childName.value = next.value ? kinds[next.value] + '选区' : ''
+  childName.value = next.value ? '自定义精细图' : ''
 })
 function chooseAt(p: Vec3) {
   const node = store.currentMap
@@ -479,11 +489,34 @@ function chooseAt(p: Vec3) {
   }
   const i = nearestCell(store.centers, point, g.type === 'sphere')
   if (i < 0) return
+  activeFeatureId.value = null
+  renderer.setGeographyMask(null)
   selection.value = { ...geo, cell: i }
   manualLat.value = geo.lat.toFixed(5)
   manualLon.value = geo.lon.toFixed(5)
   refine.value = false
   if (innerWidth < 760) panel.value = 'layers'
+  updatePin()
+}
+function selectGeographic(id: number) {
+  const geo = store.geography,
+    grid = store.currentMap?.grid
+  if (!geo || !grid || !renderer || !store.centers || locked.value) return
+  const feature = geo.features[id - 1]
+  if (!feature) return
+  activeFeatureId.value = id
+  selection.value = { lat: feature.lat, lon: feature.lon, cell: feature.anchor_cell }
+  manualLat.value = feature.lat.toFixed(5)
+  manualLon.value = feature.lon.toFixed(5)
+  renderer.setGeographyMask(featureMask(geo, feature))
+  const i = feature.anchor_cell * 3
+  const point: Vec3 =
+    grid.type === 'sphere'
+      ? direction(feature.lat, feature.lon)
+      : [(store.centers[i] * 2) / grid.width_m, (store.centers[i + 1] * 2) / grid.width_m, 0]
+  renderer.centerAt(point)
+  if (innerWidth < 760) panel.value = 'layers'
+  refine.value = false
   updatePin()
 }
 function manualSelect() {
@@ -541,7 +574,7 @@ async function generateChild(parentId = store.currentMap?.id, kind = next.value)
     center_lat: selection.value.lat,
     center_lon: selection.value.lon,
     width_m: childWidth.value * 1000,
-    name: childName.value.trim() || kinds[kind] + '选区',
+    name: childName.value.trim() || '自定义精细图',
   })
   tab.value = 'tree'
   refine.value = false
@@ -606,6 +639,8 @@ const toolCtx: ToolContext = {
   elevation: () => store.elevation,
   biome: () => store.biome,
   selection: () => selection.value,
+  geography: () => store.geography,
+  selectFeature: selectGeographic,
   generate: async () => {
     if (!store.current) throw new Error('请先创建世界')
     await store.generate(store.current.id)
@@ -884,6 +919,15 @@ onBeforeUnmount(() => {
             :disabled="locked"
             @select="(id) => guard(() => store.loadMapData(id))"
           />
+          <FeatureTree
+            v-if="hasMap && !store.generating"
+            :geography="store.geography"
+            :loading="store.geographyLoading"
+            :error="store.geographyError"
+            :selected="activeFeatureId"
+            :disabled="locked"
+            @select="selectGeographic"
+          />
           <div v-if="mapStats" class="world-facts">
             <span>
               陆地
@@ -1094,12 +1138,43 @@ onBeforeUnmount(() => {
       </aside>
       <aside class="paper-panel selection-panel" aria-label="选区信息">
         <span class="eyebrow">SELECTED LANDSCAPE</span>
-        <h2>{{ selection ? '此处的地理' : '为探索，选一个落点。' }}</h2>
+        <h2>{{ activeFeature?.name || (selection ? '此处的地理' : '为探索，选一个落点。') }}</h2>
         <template v-if="selectedFacts && selection">
           <p class="coordinates mono">
             {{ Math.abs(selection.lat).toFixed(3) }}° {{ selection.lat >= 0 ? 'N' : 'S' }} ·
             {{ Math.abs(selection.lon).toFixed(3) }}°
             {{ selection.lon >= 0 ? 'E' : 'W' }}
+          </p>
+          <p v-if="store.geographyLoading" class="empty-note">正在读取地理归属…</p>
+          <div v-if="selectedGeography.length" class="geography-breadcrumb">
+            <button
+              v-for="f in selectedGeography"
+              :key="f.id"
+              :disabled="locked"
+              @click="selectGeographic(f.id)"
+            >
+              {{ f.name }} ›
+            </button>
+          </div>
+          <p v-if="activeFeature" class="empty-note">
+            {{ featureKinds[activeFeature.kind] }} ·
+            {{
+              (activeFeature.area_m2 / 1e6).toLocaleString(undefined, { maximumFractionDigits: 1 })
+            }}
+            km²
+            {{ activeFeature.partial ? ' · 当前地图内的部分范围' : '' }}
+            <span v-if="activeFeature.prominence_m != null">
+              · 相对高差 {{ Math.round(activeFeature.prominence_m) }} m
+            </span>
+            <span v-if="activeFeature.drainage_area_m2 != null">
+              · 汇水面积
+              {{
+                (activeFeature.drainage_area_m2 / 1e6).toLocaleString(undefined, {
+                  maximumFractionDigits: 1,
+                })
+              }}
+              km²
+            </span>
           </p>
           <dl class="selection-facts">
             <div>
@@ -1136,7 +1211,7 @@ onBeforeUnmount(() => {
             </div>
           </dl>
           <button v-if="next && !refine" class="primary" :disabled="locked" @click="refine = true">
-            以此为中心，细化地图 →
+            提高此处精度 →
           </button>
           <form
             v-if="refine && next"
@@ -1144,7 +1219,7 @@ onBeforeUnmount(() => {
             @submit.prevent="guard(() => generateChild())"
           >
             <label>
-              {{ kinds[next] }}图名称
+              精细图名称
               <input v-model="childName" maxlength="80" />
             </label>
             <label>
@@ -1170,7 +1245,7 @@ onBeforeUnmount(() => {
                 locked || childSide < 4 || childSide > (store.session?.max_patch_side || 512)
               "
             >
-              生成{{ kinds[next] }}图 ↗
+              生成精细图 ↗
             </button>
           </form>
           <p v-else-if="!next" class="hint">已到地点层，可继续查看各项数据。</p>

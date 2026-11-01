@@ -322,6 +322,9 @@ pub fn import(
             );
         }
         if let Some(obj) = metadata.as_object_mut() {
+            // Derived labels from an untrusted file must match the actual terrain.
+            obj.remove(crate::geography::KEY);
+            obj.remove("geography_error");
             if let Some(parent) = &node.parent {
                 obj.insert("parent".into(), serde_json::json!(parent));
             }
