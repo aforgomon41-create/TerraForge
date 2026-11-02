@@ -413,6 +413,10 @@ pub(crate) fn advance_labels(
     };
     let mut markers = std::mem::take(&mut state.lifecycle.markers);
     let mut buckets = vec![Vec::new(); n];
+    // Buoyant continental pairs cannot subduct. Keep the eligible oceanic
+    // subset in the same order so dense continental overlaps do not cause a
+    // quadratic search through contacts that would always be discarded.
+    let mut ocean_buckets = vec![Vec::new(); n];
     let mut dead = vec![false; markers.len()];
     let mut lost_subduction = vec![0usize; count];
     let mut lost_window = vec![0usize; count];
@@ -428,6 +432,9 @@ pub(crate) fn advance_labels(
         }
         if let Some(i) = locate(m.position) {
             buckets[i].push(k);
+            if m.crust <= 0.65 {
+                ocean_buckets[i].push(k);
+            }
         } else {
             dead[k] = true;
             lost_window[m.slot] += 1;
@@ -441,7 +448,12 @@ pub(crate) fn advance_labels(
             continue;
         };
         for cell in std::iter::once(i).chain(g.neighbors(i).iter().map(|&j| j as usize)) {
-            for &b in &buckets[cell] {
+            let candidates = if markers[a].crust > 0.65 {
+                &ocean_buckets[cell]
+            } else {
+                &buckets[cell]
+            };
+            for &b in candidates {
                 if b <= a || dead[a] || dead[b] || markers[a].slot == markers[b].slot {
                     continue;
                 }
@@ -449,9 +461,6 @@ pub(crate) fn advance_labels(
                 let delta = mb.position - ma.position;
                 if delta.length_squared() > spacing.powi(2) * 0.20 || delta.length_squared() < 1e-12
                 {
-                    continue;
-                }
-                if ma.crust.min(mb.crust) > 0.65 {
                     continue;
                 }
                 let mid = if g.field_is_planar() {
