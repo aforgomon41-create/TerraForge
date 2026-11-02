@@ -418,6 +418,9 @@ pub(crate) fn advance_labels(
     // quadratic search through contacts that would always be discarded.
     let mut ocean_buckets = vec![Vec::new(); n];
     let mut dead = vec![false; markers.len()];
+    // Positions remain fixed during contact resolution. Reuse their exact
+    // spatial lookup for the pair search and the subsequent domain seeding.
+    let mut locations = vec![None; markers.len()];
     let mut lost_subduction = vec![0usize; count];
     let mut lost_window = vec![0usize; count];
     for (k, m) in markers.iter_mut().enumerate() {
@@ -431,6 +434,7 @@ pub(crate) fn advance_labels(
             m.strength = (0.95 - (0.95 - m.strength as f64) * (-dt / 700.).exp()) as f32;
         }
         if let Some(i) = locate(m.position) {
+            locations[k] = Some(i);
             buckets[i].push(k);
             if m.crust <= 0.65 {
                 ocean_buckets[i].push(k);
@@ -444,7 +448,7 @@ pub(crate) fn advance_labels(
         if dead[a] {
             continue;
         }
-        let Some(i) = locate(markers[a].position) else {
+        let Some(i) = locations[a] else {
             continue;
         };
         for cell in std::iter::once(i).chain(g.neighbors(i).iter().map(|&j| j as usize)) {
@@ -482,9 +486,11 @@ pub(crate) fn advance_labels(
         }
     }
     let mut kept = Vec::with_capacity(markers.len());
+    let mut kept_locations = Vec::with_capacity(markers.len());
     for (k, m) in markers.into_iter().enumerate() {
         if !dead[k] {
             kept.push(m);
+            kept_locations.push(locations[k]);
         }
     }
     markers = kept;
@@ -537,8 +543,8 @@ pub(crate) fn advance_labels(
     let mut best = vec![f64::INFINITY; n];
     let mut owners = vec![usize::MAX; n];
     let mut heap = BinaryHeap::new();
-    for (k, m) in markers.iter().enumerate() {
-        if let Some(i) = locate(m.position) {
+    for (k, (m, location)) in markers.iter().zip(kept_locations).enumerate() {
+        if let Some(i) = location {
             let d = g.field_position(i).distance_squared(m.position);
             if d < best[i] {
                 best[i] = d;

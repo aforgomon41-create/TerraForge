@@ -269,6 +269,11 @@ def main():
                 pass
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
+        if 'live_frames' in locals() and live_frames:
+            (out / (args.shape + '-frames.json')).write_text(json.dumps(live_frames, ensure_ascii=False), encoding='utf-8')
+        if report['result'] != 'passed' and 'state' in locals():
+            report['last_job_state'] = state
+            report['elapsed_seconds'] = time.monotonic() - started
         (out / (args.shape + '.json')).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
 
 

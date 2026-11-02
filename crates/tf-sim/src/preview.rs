@@ -44,6 +44,10 @@ pub trait FrameObserver {
     fn enabled(&self) -> bool {
         true
     }
+    /// Visual sampling budget, independent of the physical solver mesh.
+    fn preview_cell_budget(&self) -> usize {
+        usize::MAX
+    }
     /// Called before allocating or computing an expensive preview.
     fn wants_frame(&mut self, info: FrameInfo) -> bool;
     fn frame(&mut self, grid: &dyn GridOps, fields: &WorldFields, info: FrameInfo);
@@ -80,10 +84,14 @@ mod tests {
     struct Observer {
         times: Vec<f64>,
         heights: Vec<Vec<f32>>,
+        cells: Vec<usize>,
         info: Vec<FrameInfo>,
         rain_seen: bool,
     }
     impl FrameObserver for Observer {
+        fn preview_cell_budget(&self) -> usize {
+            6000
+        }
         fn wants_frame(&mut self, info: FrameInfo) -> bool {
             info.stage_complete
                 || (info.elapsed_myr.is_some() && info.step % 4 == 0)
@@ -91,6 +99,7 @@ mod tests {
                 || info.month.is_some_and(|month| month % 6 == 0)
         }
         fn frame(&mut self, _: &dyn GridOps, fields: &WorldFields, info: FrameInfo) {
+            self.cells.push(fields.len());
             self.info.push(info);
             if let Some(time) = info.elapsed_myr {
                 self.times.push(time);
@@ -100,6 +109,38 @@ mod tests {
                 self.rain_seen |= fields.precipitation.iter().any(|p| *p > 0.);
             }
         }
+    }
+    #[test]
+    fn bounded_global_previews_preserve_the_final_solver_state_and_history() {
+        let grid = SphereHexGrid::build(32, 6371000., (DVec3::Z, 0.));
+        let params = GenerationParams {
+            tectonic_age_myr: 1.,
+            ..Default::default()
+        };
+        let mut plain = WorldFields::with_capacity(grid.cell_count());
+        let mut live = plain.clone();
+        let a =
+            crate::evolution::generate(&grid, &params, &mut plain, &mut |_| {}, &|| false).unwrap();
+        let mut observer = Observer::default();
+        let b = crate::evolution::generate_observed(
+            &grid,
+            &params,
+            &mut live,
+            &mut |_| {},
+            &|| false,
+            &mut observer,
+        )
+        .unwrap();
+        assert!(!observer.cells.is_empty());
+        assert!(observer.cells.iter().all(|&n| n <= 6000));
+        assert!(observer.heights.iter().flatten().all(|h| h.is_finite()));
+        assert_eq!(plain.elevation, live.elevation);
+        assert_eq!(plain.crust_thickness, live.crust_thickness);
+        assert_eq!(plain.plate_id, live.plate_id);
+        assert_eq!(
+            serde_json::to_value(a.history).unwrap(),
+            serde_json::to_value(b.history).unwrap()
+        );
     }
     #[test]
     fn real_tectonic_states_change_with_time_without_changing_the_final_rock() {

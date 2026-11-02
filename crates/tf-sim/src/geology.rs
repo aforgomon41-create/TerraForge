@@ -246,6 +246,7 @@ pub(crate) fn ancient_history(
     duration: f64,
     progress: &mut dyn FnMut(f64),
     cancel: &dyn Fn() -> bool,
+    preview_grid: Option<&MapGrid>,
     observer: &mut dyn crate::preview::FrameObserver,
 ) -> Option<(
     Vec<GeologicProvince>,
@@ -358,14 +359,15 @@ pub(crate) fn ancient_history(
         info.stage_complete = false;
         info.detail = "地块迁移、弱带拉张与板块生灭";
         if observer.wants_frame(info) {
-            let mut f = WorldFields::with_capacity(g.cell_count());
-            initialize(g, &mut f, p, &state.provinces);
-            for i in 0..g.cell_count() {
-                if let Some(j) = coarse.cell_at(g.center_dir(i)) {
+            let shown = preview_grid.unwrap_or(g);
+            let mut f = WorldFields::with_capacity(shown.cell_count());
+            initialize(shown, &mut f, p, &state.provinces);
+            for i in 0..shown.cell_count() {
+                if let Some(j) = coarse.cell_at(shown.center_dir(i)) {
                     f.plate_id[i] = material.plate_id[j];
                 }
             }
-            observer.frame(g, &f, info);
+            observer.frame(shown, &f, info);
         }
     }
     let mut ids = Vec::with_capacity(g.cell_count());
@@ -452,6 +454,7 @@ mod tests {
             4480.,
             &mut |t| progress = t,
             &|| false,
+            None,
             &mut crate::preview::NoFrames,
         )
         .unwrap();

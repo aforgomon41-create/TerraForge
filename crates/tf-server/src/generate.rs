@@ -149,6 +149,9 @@ impl<'a> LiveFrames<'a> {
     }
 }
 impl tf_sim::preview::FrameObserver for LiveFrames<'_> {
+    fn preview_cell_budget(&self) -> usize {
+        6000
+    }
     fn wants_frame(&mut self, info: tf_sim::preview::FrameInfo) -> bool {
         if self.cancel.load(Ordering::Relaxed) {
             return false;

@@ -903,6 +903,11 @@ pub fn generate_observed<G: GridOps>(
     observer: &mut dyn crate::preview::FrameObserver,
 ) -> Option<TectonicState> {
     let grid = solver_grid(fine);
+    let live_preview = if observer.enabled() {
+        EvolutionPreview::new(&grid, observer.preview_cell_budget())
+    } else {
+        None
+    };
     let mut rng = DeterministicRng::derive(params.seed, "tectonics");
     let (mut state, mut ids) = crate::plates::build_plates(&grid, params, &mut rng);
     crate::plates::limit_speeds(&mut state, &grid, params);
@@ -917,6 +922,7 @@ pub fn generate_observed<G: GridOps>(
             ancient_duration,
             progress,
             cancel,
+            live_preview.as_ref().map(|p| &p.grid),
             observer,
         )?;
     let mut inherited_damage = None;
@@ -1025,7 +1031,14 @@ pub fn generate_observed<G: GridOps>(
     let mut elapsed = ancient_duration;
     let mut topology_elapsed = elapsed;
     evolution_frame(
-        &grid, &material, &state, &history, params, elapsed, observer,
+        &grid,
+        &material,
+        &state,
+        &history,
+        params,
+        elapsed,
+        live_preview.as_ref(),
+        observer,
     );
     while elapsed < params.tectonic_age_myr {
         if history.steps >= 32768 {
@@ -1139,7 +1152,14 @@ pub fn generate_observed<G: GridOps>(
         }
         progress(elapsed / params.tectonic_age_myr);
         evolution_frame(
-            &grid, &material, &state, &history, params, elapsed, observer,
+            &grid,
+            &material,
+            &state,
+            &history,
+            params,
+            elapsed,
+            live_preview.as_ref(),
+            observer,
         );
     }
     crate::plates::limit_speeds(&mut state, &grid, params);
@@ -1223,6 +1243,56 @@ pub fn generate_observed<G: GridOps>(
     Some(state)
 }
 
+/// Cached interpolation reads the current solver state. Preview fields never
+/// flow back into transport, lifecycle events, or the final full-resolution map.
+struct EvolutionPreview {
+    grid: MapGrid,
+    weights: Vec<[(usize, f64); 3]>,
+}
+impl EvolutionPreview {
+    fn new(source: &MapGrid, budget: usize) -> Option<Self> {
+        if source.field_is_planar() || source.cell_count() <= budget {
+            return None;
+        }
+        let frequency = ((budget.saturating_sub(2) as f64 / 10.).sqrt() as u32).max(2);
+        let grid = tf_grid::GridDescriptor::sphere(frequency, source.radius_m()).build();
+        let weights = (0..grid.cell_count())
+            .map(|i| stencil(source, grid.field_position(i)).expect("global preview coverage"))
+            .collect();
+        Some(Self { grid, weights })
+    }
+    fn sample(&self, material: &WorldFields) -> WorldFields {
+        let mut fields = WorldFields::with_capacity(self.grid.cell_count());
+        for (out, input) in [
+            (&mut fields.elevation, &material.elevation),
+            (&mut fields.crust_thickness, &material.crust_thickness),
+            (
+                &mut fields.reference_crust_thickness,
+                &material.reference_crust_thickness,
+            ),
+            (&mut fields.crust_type, &material.crust_type),
+            (&mut fields.crust_age, &material.crust_age),
+            (&mut fields.crustal_strain, &material.crustal_strain),
+            (&mut fields.orogen_age, &material.orogen_age),
+            (&mut fields.shear_strain, &material.shear_strain),
+            (&mut fields.craton_strength, &material.craton_strength),
+            (&mut fields.rift_damage, &material.rift_damage),
+        ] {
+            for (i, weights) in self.weights.iter().enumerate() {
+                out[i] = weights
+                    .iter()
+                    .map(|&(j, w)| input[j] as f64 * w)
+                    .sum::<f64>() as f32;
+            }
+        }
+        for (i, weights) in self.weights.iter().enumerate() {
+            let nearest = weights.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
+            fields.plate_id[i] = material.plate_id[nearest];
+        }
+        fields
+    }
+}
+
 fn evolution_frame(
     grid: &MapGrid,
     material: &WorldFields,
@@ -1230,6 +1300,7 @@ fn evolution_frame(
     history: &History,
     params: &GenerationParams,
     elapsed: f64,
+    preview: Option<&EvolutionPreview>,
     observer: &mut dyn crate::preview::FrameObserver,
 ) {
     let mut info = crate::preview::FrameInfo::stage(
@@ -1243,11 +1314,17 @@ fn evolution_frame(
     if !observer.wants_frame(info) {
         return;
     }
-    let mut displayed = material.clone();
-    let mut snapshot = state.clone();
-    snapshot.history = history.clone();
-    landforms(grid, &mut displayed, &snapshot, params);
-    observer.frame(grid, &displayed, info);
+    let mut displayed = preview.map_or_else(|| material.clone(), |p| p.sample(material));
+    let shown = preview.map_or(grid, |p| &p.grid);
+    // Terrain rendering reads provinces and preserved events, not the moving
+    // marker cloud or the plate solver's other scratch storage.
+    let snapshot = TectonicState {
+        provinces: state.provinces.clone(),
+        history: history.clone(),
+        ..Default::default()
+    };
+    landforms(shown, &mut displayed, &snapshot, params);
+    observer.frame(shown, &displayed, info);
 }
 
 /// End-state terrain uses distributed roots and preserved events, not current-border ribbons.
