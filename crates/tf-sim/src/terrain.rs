@@ -326,7 +326,13 @@ pub fn init_continents<G: GridOps>(grid: &G, fields: &mut WorldFields, params: &
     for i in 0..grid.cell_count() {
         let inland = (values[i] / threshold.max(1e-12)).max(1e-12).ln() * characteristic_length;
         let p = grid.field_position(i);
-        let continental = smooth(-0.466 * transition, 0.534 * transition, inland);
+        // A shoreline is not the continent/ocean crust boundary: the continental
+        // shelf is submerged continental crust. Keep the entire dry-land seed
+        // on a continental column, then thin that column offshore. Centring the
+        // mixture on the shoreline made c~0.45 land mix with a -6 km ocean floor;
+        // the area target then lowered sea level by kilometres and turned every
+        // stable interior into a plateau even with zero tectonic evolution.
+        let continental = smooth(-transition, -0.05 * transition, inland);
         let basement = fbm(&noise, p / 1_200_000. + DVec3::splat(53.), 1., 3)
             * 1800.
             * smooth(0., transition * 0.6, inland);
@@ -571,6 +577,58 @@ pub fn apply_relief<G: GridOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_submerged_continental_shelf_does_not_raise_the_unstrained_interior() {
+        for seed in [0, 42, 2024] {
+            for descriptor in [
+                tf_grid::GridDescriptor::sphere(32, 6_371_000.),
+                tf_grid::GridDescriptor::plane(0., 0., 32_000_000., 128, 74, 6_371_000.),
+            ] {
+                let grid = descriptor.build();
+                let params = GenerationParams {
+                    seed,
+                    tectonic_age_myr: 0.,
+                    hotspot_count: 0,
+                    ..Default::default()
+                };
+                let mut f = WorldFields::with_capacity(grid.cell_count());
+                init_continents(&grid, &mut f, &params);
+                assert!((0..grid.cell_count())
+                    .filter(|&i| f.elevation[i] > 0.)
+                    .all(|i| f.crust_type[i] > 0.99));
+                assert!(
+                    (0..grid.cell_count()).any(|i| f.elevation[i] < 0. && f.crust_type[i] > 0.95)
+                );
+                for i in 0..grid.cell_count() {
+                    f.crust_age[i] = 70. + 530. * f.crust_type[i];
+                }
+                let material = f.clone();
+                let state = crate::plates::TectonicState::default();
+                crate::evolution::landforms(&grid, &mut f, &state, &params);
+                let mut land: Vec<_> = f.elevation.iter().copied().filter(|&h| h > 0.).collect();
+                land.sort_unstable_by(f32::total_cmp);
+                assert!(
+                    land[land.len() / 2] < 800.,
+                    "seed {seed} {descriptor:?}: median {}",
+                    land[land.len() / 2]
+                );
+                assert!(
+                    land.iter().filter(|&&h| h < 1000.).count() as f64 / land.len() as f64 > 0.95
+                );
+                // A local 20 km crustal root must still generate ~3 km uplift.
+                let peak = (0..grid.cell_count())
+                    .max_by(|&a, &b| material.elevation[a].total_cmp(&material.elevation[b]))
+                    .unwrap();
+                let mut thickened = material;
+                thickened.crust_thickness[peak] += 20_000.;
+                crate::evolution::landforms(&grid, &mut thickened, &state, &params);
+                let expected = 20_000. * (1. - 2800. / 3300.);
+                assert!(
+                    ((thickened.elevation[peak] - f.elevation[peak]) as f64 - expected).abs() < 25.
+                );
+            }
+        }
+    }
     #[test]
     fn closing_a_plane_reserves_ocean_at_every_boundary_without_changing_the_rock_ledger() {
         let g = tf_grid::FlatGrid::new(64, 40, 6_400_000., 25., 0., 6_371_000.);

@@ -16,6 +16,12 @@ import { parseSeed } from '@/generation/seed'
 import MapTree from '@/components/MapTree.vue'
 import FeatureTree from '@/components/FeatureTree.vue'
 import { featureKinds, featureMask, featuresAt } from '@/geography/catalog'
+import {
+  partitionModes,
+  partitionLabels,
+  partitionBoundaries,
+  type PartitionMode,
+} from '@/geography/view'
 import AgentPanel from '@/components/AgentPanel.vue'
 const store = useWorldStore(),
   canvas = ref<HTMLCanvasElement | null>(null),
@@ -39,7 +45,8 @@ const liveLayer = computed(() => {
     (layer.value === 2 && !(flags & 4)) ||
     (layer.value === 5 && !(flags & 8)) ||
     layer.value === 3 ||
-    layer.value === 6
+    layer.value === 6 ||
+    layer.value === 7
   )
     return 0
   return layer.value
@@ -73,6 +80,9 @@ const style = ref(MapStyle.Parchment),
   loadLabel = ref('正在打开工作台…'),
   selection = ref<{ lat: number; lon: number; cell: number } | null>(null),
   pin = ref<{ x: number; y: number } | null>(null)
+const partitionMode = ref<PartitionMode>('region'),
+  partitionTruncated = ref(false)
+const partitionHint = computed(() => partitionModes.find((p) => p.id === partitionMode.value)!.hint)
 const manualLat = ref('0'),
   manualLon = ref('0'),
   childWidth = ref(256),
@@ -136,6 +146,14 @@ const selectedPlate = computed(() => {
   return { id, speed: Math.hypot(...v) * 1e-4 }
 })
 const layers = [
+  {
+    id: 7,
+    name: '自动分区',
+    icon: '▧',
+    unit: '自动地理分区 · 颜色代表类别',
+    ends: [],
+    gradient: '',
+  },
   {
     id: 6,
     name: '板块与运动',
@@ -346,7 +364,13 @@ async function refreshTectonics() {
       tectonicCache?.id === node.id
         ? tectonicCache.data
         : await api.tectonics(node.id, controller.signal)
-    if (controller.signal.aborted || node.id !== store.currentMap?.id) return
+    if (
+      controller.signal.aborted ||
+      node.id !== store.currentMap?.id ||
+      layer.value !== 6 ||
+      store.generating
+    )
+      return
     tectonicCache = { id: node.id, data }
     tectonics.value = data
     const scale = node.grid?.type === 'sphere' ? 1 : 2 / (node.grid?.width_m || 2)
@@ -360,6 +384,35 @@ async function refreshTectonics() {
       tectonics.value = { available: false, reason: (e as Error).message }
   }
 }
+let partitionCache: { key: string; data: ReturnType<typeof partitionBoundaries> } | undefined
+function refreshPartitions() {
+  if (!renderer || layer.value !== 7 || store.generating) return
+  const node = store.currentMap,
+    g = store.geography
+  renderer.setDiagnostics([])
+  partitionTruncated.value = false
+  if (!node?.grid || !g || !store.centers || !store.indices) {
+    renderer.setPartitionLabels(null)
+    return
+  }
+  const labels = partitionLabels(g, partitionMode.value),
+    key = `${node.id}:${partitionMode.value}`
+  if (partitionCache?.key !== key)
+    partitionCache = {
+      key,
+      data: partitionBoundaries(
+        store.centers,
+        store.indices,
+        labels,
+        node.grid.type === 'sphere',
+        node.grid.type === 'sphere' ? 1 : 2 / node.grid.width_m,
+      ),
+    }
+  renderer.setPartitionLabels(labels)
+  renderer.setDiagnostics([partitionCache.data.lines])
+  partitionTruncated.value = partitionCache.data.truncated
+}
+watch([() => store.geography, partitionMode], refreshPartitions)
 function applyMap() {
   const node = store.currentMap
   if (!renderer) return
@@ -403,7 +456,10 @@ function applyMap() {
   renderer.setDiagnostics([])
   tectonics.value = null
   if (layer.value === 6) void refreshTectonics()
-  if (layer.value !== 6) void refreshOverlay()
+  else if (layer.value === 7) {
+    refreshPartitions()
+    void refreshOverlay()
+  } else void refreshOverlay()
   renderer.heightScale = 0.025 / Math.max(mapStats.value?.max || 1, 1)
   renderer.layer = layer.value
   renderer.style = style.value
@@ -447,8 +503,13 @@ watch(layer, (v) => {
     if (renderer) renderer.layer = liveLayer.value
     return
   }
+  tectonicController?.abort()
+  renderer?.setDiagnostics([])
   if (v === 6) void refreshTectonics()
-  else void refreshOverlay()
+  else if (v === 7) {
+    refreshPartitions()
+    void refreshOverlay()
+  } else void refreshOverlay()
   if (renderer) renderer.layer = v
 })
 watch(style, (v) => {
@@ -658,6 +719,7 @@ const toolCtx: ToolContext = {
       biome: 3,
       elevation: 4,
       hydrology: 5,
+      geography: 7,
     }
     if (v[key] === undefined) throw new Error('未知图层')
     layer.value = v[key]
@@ -1093,6 +1155,27 @@ onBeforeUnmount(() => {
               : tectonics?.reason || '正在读取板块记录…'
           }}
         </p>
+        <template v-if="layer === 7">
+          <label class="style-select">
+            分区内容
+            <select v-model="partitionMode" aria-label="自动分区内容">
+              <option v-for="mode in partitionModes" :key="mode.id" :value="mode.id">
+                {{ mode.label }}
+              </option>
+            </select>
+          </label>
+          <p class="layer-help" role="status">
+            {{
+              store.generating
+                ? '生成完成后自动识别分区；当前显示真实地形预览。'
+                : store.geographyError ||
+                  (store.geographyLoading ? '正在读取自动分区…' : partitionHint)
+            }}
+          </p>
+          <p v-if="partitionTruncated" class="layer-help">
+            边界较多，仅显示部分细线；分区颜色完整保留。
+          </p>
+        </template>
         <label class="style-select">
           显示网格
           <select
@@ -1292,8 +1375,12 @@ onBeforeUnmount(() => {
             : activeLayer.unit
         }}
       </span>
-      <i :style="{ background: activeLayer.gradient }" />
-      <div>
+      <p v-if="liveLayer === 7" class="partition-key">
+        <i />
+        相邻区域分色 · 细线为边界
+      </p>
+      <i v-else :style="{ background: activeLayer.gradient }" />
+      <div v-if="liveLayer !== 7">
         <span v-for="end in activeLayer.ends" :key="end">{{ end }}</span>
       </div>
       <small>

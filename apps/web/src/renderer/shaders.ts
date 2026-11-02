@@ -2,6 +2,7 @@
 export const VERT = `#version 300 es
 precision highp float;
 layout(location=8)in float aGeography;out float vGeography;
+layout(location=9)in float aPartition;out vec3 vPartitionColor;out float vPartitionPresent;
 layout(location=0)in vec3 aCenter;layout(location=1)in float aHeight;layout(location=2)in float aBiome;layout(location=3)in float aPlate;layout(location=4)in float aTemperature;layout(location=5)in float aPrecipitation;layout(location=6)in float aFlow;layout(location=7)in vec3 aAtlasPosition;
 uniform mat4 uViewProj;uniform float uRadius,uHeightScale;uniform bool uPlanarMode,uWorldFlatMode,uPreviewMode;uniform sampler2D uFrameTex,uFlowTex;uniform float uPreviewMinElev,uPreviewMaxElev,uPreviewHalfHeight;
 out vec3 vNormal,vPosition,vBiomeColor;out vec3 vPlateColor;out float vHeight,vBiome,vTemp,vPrecip,vFlow;
@@ -11,6 +12,7 @@ if(b==1)return vec3(.91,.93,.90);if(b==2)return vec3(.65,.69,.58);if(b==3)return
 
 void main(){
   vGeography=aGeography;
+  vPartitionColor=.64+.18*cos(vec3(0.,2.094,4.189)+aPartition*2.399963);vPartitionPresent=step(.5,aPartition);
   vPlateColor=.58+.22*cos(vec3(0.,2.094,4.189)+floor(aPlate+.5)*2.399963);
   vHeight=aHeight;vBiome=aBiome;vTemp=aTemperature;vPrecip=aPrecipitation;vFlow=aFlow;
   vec3 n=uPlanarMode?vec3(0.,0.,1.):normalize(aCenter);
@@ -28,6 +30,7 @@ void main(){
 export const FRAG = `#version 300 es
 precision highp float;
 in float vGeography;uniform bool uGeographyActive;
+in vec3 vPartitionColor;in float vPartitionPresent;
 in vec3 vNormal,vPosition,vBiomeColor;in vec3 vPlateColor;in float vHeight,vBiome,vTemp,vPrecip,vFlow;
 in vec2 vAtlasPosition;
 uniform bool uPlanarMode,uWorldFlatMode;uniform float uMapMetres;uniform vec3 uLightDir;uniform int uStyle,uLayer,uProjection;out vec4 fragColor;
@@ -38,7 +41,7 @@ vec3 temperature(float t){float n=clamp((t+40.)/80.,0.,1.);return n<.5?mix(vec3(
 vec3 precipitation(float p){return mix(vec3(.83,.74,.51),vec3(.21,.45,.58),pow(clamp(p/3000.,0.,1.),.6));}
 vec3 elevation(float e){if(e<0.)return ocean(e);if(e<500.)return mix(vec3(.55,.68,.45),vec3(.74,.74,.50),e/500.);if(e<2500.)return mix(vec3(.74,.74,.50),vec3(.62,.53,.42),(e-500.)/2000.);return mix(vec3(.62,.53,.42),vec3(.94,.94,.89),clamp((e-2500.)/4000.,0.,1.));}
 void main(){if(uWorldFlatMode && (abs(vAtlasPosition.x)>2.00001 || abs(vAtlasPosition.y)>1.00001 || (uProjection==1 && abs(vAtlasPosition.y)>.9450125416934075)))discard;vec3 color;
-if(uLayer==6)color=vPlateColor;else if(uLayer==1)color=temperature(vTemp);else if(uLayer==2)color=precipitation(vPrecip);else if(uLayer==3)color=vHeight<=0.?ocean(vHeight):vBiomeColor;else if(uLayer==4)color=elevation(vHeight);else if(uLayer==5){float flow=clamp((log(max(vFlow,1.))-log(1.e9))/(log(1.e12)-log(1.e9)),0.,1.);color=vHeight<=0.?ocean(vHeight):mix(vec3(.84,.84,.71),vec3(.16,.40,.55),flow);}
+if(uLayer==7)color=vHeight<=0.?mix(ocean(vHeight),vec3(.87,.90,.87),.35):mix(vec3(.89,.88,.82),vPartitionColor,smoothstep(.25,.75,vPartitionPresent));else if(uLayer==6)color=vPlateColor;else if(uLayer==1)color=temperature(vTemp);else if(uLayer==2)color=precipitation(vPrecip);else if(uLayer==3)color=vHeight<=0.?ocean(vHeight):vBiomeColor;else if(uLayer==4)color=elevation(vHeight);else if(uLayer==5){float flow=clamp((log(max(vFlow,1.))-log(1.e9))/(log(1.e12)-log(1.e9)),0.,1.);color=vHeight<=0.?ocean(vHeight):mix(vec3(.84,.84,.71),vec3(.16,.40,.55),flow);}
 else{
   color=vHeight<=0.?ocean(vHeight):vBiomeColor;
   if(vBiome<-.5&&vHeight>0.)color=mix(vec3(.79,.72,.52),vec3(.42,.59,.39),clamp(vPrecip/1800.,0.,1.));

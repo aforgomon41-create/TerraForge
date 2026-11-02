@@ -4,6 +4,7 @@ import array
 import collections
 import hashlib
 import json
+import math
 from pathlib import Path
 import struct
 import sys
@@ -16,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base', default='http://127.0.0.1:18795/terraforge')
     parser.add_argument('--shape', choices=['sphere', 'plane'], default='sphere')
+    parser.add_argument('--tectonic-myr', type=float)
     parser.add_argument('--out', default='artifacts/geography-acceptance')
     args = parser.parse_args()
     base = args.base.rstrip('/') + '/api/v1'
@@ -57,9 +59,12 @@ def main():
     try:
         tokens.extend(call('/session', method='POST')['token'] for _ in range(2))
         token, other = tokens
+        params = {'world_shape': args.shape}
+        if args.tectonic_myr is not None:
+            params['tectonic_age_myr'] = args.tectonic_myr
         world = call('/worlds', token, 'POST', {
             'name': 'Geographic recognition acceptance', 'seed': 42,
-            'params': {'world_shape': args.shape},
+            'params': params,
         })
         started = time.monotonic()
         job = call('/worlds/' + world['id'] + '/generate', token, 'POST')
@@ -79,6 +84,30 @@ def main():
         assert catalog['cell_count'] == node['cells']
         elevation_bytes = call('/maps/' + map_id + '/field/elevation', token, binary=True)
         height = struct.unpack('<' + 'f'*node['cells'], elevation_bytes)
+        land_heights = sorted(h for h in height if h > 0)
+        if land_heights:
+            report['land_elevation_m'] = {str(q): land_heights[round((len(land_heights)-1)*q)] for q in [.1,.5,.9,.99]}
+            report['land_cell_share_below_1000m'] = sum(h < 1000 for h in land_heights)/len(land_heights)
+            report['land_cell_share_above_3000m'] = sum(h > 3000 for h in land_heights)/len(land_heights)
+        if args.tectonic_myr == 0:
+            assert report['land_elevation_m']['0.5'] < 800, report
+        biome_bytes = call('/maps/' + map_id + '/field/biome', token, binary=True)
+        biomes = struct.unpack('<' + 'f'*node['cells'], biome_bytes)
+        report['land_biome_counts'] = dict(collections.Counter(int(b) for b,h in zip(biomes,height) if h>0))
+        if node['grid']['type'] == 'sphere':
+            surface = call('/maps/' + map_id + '/surface', token, binary=True)
+            version, cells, _ = struct.unpack_from('<III', surface)
+            assert version == 1 and cells == node['cells']
+            xyz = struct.unpack_from('<' + 'f'*(3*cells), surface, 12)
+            distance = struct.unpack('<' + 'f'*cells, call('/maps/' + map_id + '/field/distance_to_sea', token, binary=True))
+            temperature = struct.unpack('<' + 'f'*cells, call('/maps/' + map_id + '/field/temperature', token, binary=True))
+            inland = [i for i,h in enumerate(height) if h>0 and distance[i]>300_000 and abs(math.degrees(math.asin(max(-1,min(1,xyz[3*i+1])))))<50]
+            if inland:
+                heights = sorted(height[i] for i in inland)
+                report['nonpolar_inland'] = {'definition': 'latitude within 50 degrees; more than 300 km from coast',
+                    'cells': len(inland), 'median_height_m': heights[len(heights)//2],
+                    'mean_temperature_c': sum(temperature[i] for i in inland)/len(inland),
+                    'biome_counts': dict(collections.Counter(int(biomes[i]) for i in inland))}
         for i, h in enumerate(height):
             assert bool(labels[0][i]) == (h > 0)
             assert bool(labels[1][i]) == (h > 0)

@@ -62,6 +62,7 @@ export class HexSphereRenderer {
   private geographyBuf: WebGLBuffer | null = null
   private geographySourceIds: Uint32Array | undefined
   private geographyActive = false
+  private partitionBuf: WebGLBuffer | null = null
   private pan: Vec3 = [0, 0, 0]
   private planarZoom = 1
   private matrix: Float32Array = new Float32Array(16)
@@ -298,6 +299,8 @@ export class HexSphereRenderer {
     gl.bindVertexArray(this.vao)
     gl.disableVertexAttribArray(8)
     gl.vertexAttrib1f(8, 0)
+    gl.disableVertexAttribArray(9)
+    gl.vertexAttrib1f(9, 0)
     const upload = (
       location: number,
       values: Float32Array,
@@ -332,6 +335,26 @@ export class HexSphereRenderer {
     this.instPlateBuf = upload(3, channel(data.plateIds), 1, this.instPlateBuf)
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuf)
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
+    gl.bindVertexArray(null)
+  }
+
+  setPartitionLabels(labels: Uint32Array | null) {
+    const gl = this.gl
+    gl.bindVertexArray(this.vao)
+    if (labels) {
+      if (labels.length !== this.cellCount) throw new Error('分区标签与地图尺寸不一致')
+      const values = this.geographySourceIds
+        ? Float32Array.from(this.geographySourceIds, (id) => labels[id])
+        : Float32Array.from(labels)
+      this.partitionBuf ||= gl.createBuffer()
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.partitionBuf)
+      gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW)
+      gl.enableVertexAttribArray(9)
+      gl.vertexAttribPointer(9, 1, gl.FLOAT, false, 0, 0)
+    } else {
+      gl.disableVertexAttribArray(9)
+      gl.vertexAttrib1f(9, 0)
+    }
     gl.bindVertexArray(null)
   }
 
@@ -522,6 +545,7 @@ export class HexSphereRenderer {
       this.instFlowBuf,
       this.instPlateBuf,
       this.geographyBuf,
+      this.partitionBuf,
     ]) {
       if (b) gl.deleteBuffer(b)
     }
@@ -672,10 +696,15 @@ export class HexSphereRenderer {
       gl.disable(gl.DEPTH_TEST)
       gl.enable(gl.BLEND)
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
-      if (this.layer !== 6) {
+      if (this.layer !== 6 && this.layer !== 7) {
         gl.uniform4f(lu('uColor'), 0.27, 0.36, 0.29, 0.22)
         gl.drawArrays(gl.LINES, 0, this.lineCount)
       } else {
+        if (this.layer === 7 && this.lineCount) {
+          gl.bindVertexArray(this.lineVao)
+          gl.uniform4f(lu('uColor'), 0.27, 0.36, 0.29, 0.1)
+          gl.drawArrays(gl.LINES, 0, this.lineCount)
+        }
         const colors = [
           [0.65, 0.22, 0.16, 1],
           [0.1, 0.44, 0.55, 1],
@@ -684,7 +713,10 @@ export class HexSphereRenderer {
         ]
         this.diagnostics.forEach((group, index) => {
           gl.bindVertexArray(group.vao)
-          gl.uniform4fv(lu('uColor'), colors[index] || colors[3])
+          gl.uniform4fv(
+            lu('uColor'),
+            this.layer === 7 ? [0.22, 0.29, 0.24, 0.8] : colors[index] || colors[3],
+          )
           gl.drawArrays(gl.LINES, 0, group.count)
         })
       }

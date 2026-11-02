@@ -1630,3 +1630,14 @@ progress::-moz-progress-bar {
   padding: 4px 2px;
   text-align: left;
 }
+.partition-key {
+  font-size: 11px;
+  margin: 6px 0;
+}
+.partition-key i {
+  display: inline-block;
+  width: 30px;
+  height: 9px;
+  margin-right: 7px;
+  background: linear-gradient(90deg, #94b3a5 33%, #c5ac91 33%, #c5ac91 66%, #9aa6c4 66%);
+}

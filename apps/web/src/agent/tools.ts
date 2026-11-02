@@ -91,7 +91,15 @@ export function buildTools(ctx: ToolContext): ToolDef[] {
         properties: {
           layer: {
             type: 'string',
-            enum: ['terrain', 'temperature', 'precipitation', 'biome', 'elevation', 'hydrology'],
+            enum: [
+              'terrain',
+              'temperature',
+              'precipitation',
+              'biome',
+              'elevation',
+              'hydrology',
+              'geography',
+            ],
           },
         },
         required: ['layer'],
