@@ -230,6 +230,11 @@ pub struct GenerationParams {
     pub coast_complexity: f64,
     /// Duration of the kinematic reconstruction, in million years.
     pub tectonic_age_myr: f64,
+    /// User-visible history interval. Conservative transport uses smaller substeps.
+    pub tectonic_step_myr: f64,
+    /// Bounds on initial peak linear plate speeds in the fixed mantle frame.
+    pub plate_speed_min_cm_yr: f64,
+    pub plate_speed_max_cm_yr: f64,
     /// Fraction of initial plate seeds reserved for smaller boundary plates.
     pub minor_plate_fraction: f64,
     pub landscape: LandscapeKind,
@@ -311,7 +316,10 @@ impl Default for GenerationParams {
             continent_scale: 1.,
             continent_count: 4,
             coast_complexity: 0.35,
-            tectonic_age_myr: 80.,
+            tectonic_age_myr: 4600.,
+            tectonic_step_myr: 10.,
+            plate_speed_min_cm_yr: 0.5,
+            plate_speed_max_cm_yr: 12.,
             minor_plate_fraction: 0.55,
             landscape: LandscapeKind::Hills,
             base_elevation_m: 500.,
@@ -434,7 +442,10 @@ impl GenerationParams {
             ("生态丰度", self.biome_diversity, 0.3, 2.),
             ("大陆尺度", self.continent_scale, 0.3, 3.),
             ("海岸复杂度", self.coast_complexity, 0., 1.),
-            ("构造演化时间", self.tectonic_age_myr, 0., 250.),
+            ("地质历史时间", self.tectonic_age_myr, 0., 4600.),
+            ("历史推进步长", self.tectonic_step_myr, 0.1, 50.),
+            ("板速下限", self.plate_speed_min_cm_yr, 0., 20.),
+            ("板速上限", self.plate_speed_max_cm_yr, 0.1, 20.),
             ("小板块比例", self.minor_plate_fraction, 0.2, 0.8),
             ("局部基准海拔", self.base_elevation_m, -1000., 8000.),
             ("局部起伏", self.terrain_relief_m, 0., 6000.),
@@ -457,13 +468,16 @@ impl GenerationParams {
                 return Err(format!("{name} 超出范围 {min}～{max}"));
             }
         }
+        if self.plate_speed_min_cm_yr > self.plate_speed_max_cm_yr {
+            return Err("板速下限不能高于上限".into());
+        }
         if !self.is_local() && self.world_shape == WorldShape::Plane && self.tectonic_age_myr > 0. {
             if self.map_width_m.min(self.map_height_m) < 500_000. {
                 return Err("板块演化需要至少 500 km 的范围；较小地图请选择区域或地点".into());
             }
             let cols = (self.map_width_m / 80000.).round().clamp(16., 160.);
             let spacing = self.map_width_m / cols;
-            let steps = self.tectonic_age_myr
+            let steps = self.tectonic_age_myr.min(120.)
                 * 3.
                 * 75000.
                 * self.tectonic_activity
@@ -511,6 +525,25 @@ mod tests {
     #[test]
     fn default_params_are_valid() {
         assert!(GenerationParams::default().validate().is_ok());
+    }
+
+    #[test]
+    fn timeline_defaults_preserve_old_explicit_durations_and_validate_steps_and_speeds() {
+        let p: GenerationParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.tectonic_age_myr, 4600.);
+        assert_eq!(p.tectonic_step_myr, 10.);
+        let mut old: GenerationParams =
+            serde_json::from_str(r#"{"tectonic_age_myr":80.0}"#).unwrap();
+        assert_eq!(old.tectonic_age_myr, 80.);
+        assert!(old.validate().is_ok());
+        old.tectonic_step_myr = 0.;
+        assert!(old.validate().is_err());
+        old.tectonic_step_myr = 10.;
+        old.plate_speed_min_cm_yr = 13.;
+        assert!(old.validate().is_err());
+        old.plate_speed_min_cm_yr = 0.5;
+        old.tectonic_age_myr = 4601.;
+        assert!(old.validate().is_err());
     }
 
     #[test]

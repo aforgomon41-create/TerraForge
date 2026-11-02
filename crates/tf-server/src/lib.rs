@@ -2,6 +2,7 @@
 pub mod api;
 pub mod auth;
 pub mod child_gen;
+pub mod circulation;
 pub mod climatology;
 pub mod config;
 pub mod generate;

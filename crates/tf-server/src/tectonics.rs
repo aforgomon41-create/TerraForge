@@ -31,6 +31,14 @@ pub async fn get_tectonics(
         if plates.is_empty() { return Ok(json!({"available":false,"reason":"此地图没有板块运动记录"})); }
         anyhow::ensure!(plates.len()<=64 && plates.iter().enumerate().all(|(i,p)|p.id as usize==i && p.omega.is_finite() && p.omega.abs()<=1. && (DVec3::from_array(p.euler_pole).length()-1.).abs()<0.001),"板块运动记录无效");
         let descriptor=node.grid.as_ref().ok_or_else(||anyhow::anyhow!("缺少网格"))?;
+        let mut root=node.clone();
+        let mut depth=0;
+        while let Some(parent)=&root.parent {
+            depth+=1;anyhow::ensure!(depth<=4,"运动继承层级无效");
+            root=st.store.get_map_node(parent)?.ok_or_else(||anyhow::anyhow!("缺少运动父图"))?;
+            anyhow::ensure!(root.world_id==node.world_id,"运动父图不属于此工程");
+        }
+        let motion_grid=root.grid.as_ref().ok_or_else(||anyhow::anyhow!("缺少原始运动网格"))?;
         let fine=descriptor.build();
         let coarse=match descriptor.clone() {
             GridDescriptor::Sphere{radius_m,..}=>GridDescriptor::sphere(48,radius_m).build(),
@@ -45,6 +53,9 @@ pub async fn get_tectonics(
         anyhow::ensure!(ids.len()==fine.cell_count()&&crust.len()==fine.cell_count(),"板块字段长度无效");
         let planar:Option<Vec<DVec3>>=metadata.get("planar_velocities").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?;
         if let Some(v)=&planar {anyhow::ensure!(v.len()==plates.len()&&v.iter().all(|p|p.is_finite()&&p.length()<=2e6),"平面运动速度无效");}
+        let spins:Option<Vec<f64>>=metadata.get("planar_spin_rad_myr").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?;
+        let centers:Vec<DVec3>=metadata.get("plate_centers_m").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
+        if let Some(s)=&spins {anyhow::ensure!(planar.is_some()&&s.len()==plates.len()&&s.iter().all(|s|s.is_finite()&&s.abs()<=1.)&&centers.len()==plates.len()&&centers.iter().all(|p|p.is_finite()&&p.length()<=2e9),"平面转动记录无效");}
         if (metadata.get("motion_domain").and_then(Value::as_str)==Some("plane") || (node.parent.is_none() && matches!(descriptor,GridDescriptor::Plane{..}))) && planar.is_none() {
             return Ok(json!({"available":false,"reason":"旧平面地图没有平移速度记录"}));
         }
@@ -55,16 +66,17 @@ pub async fn get_tectonics(
             anyhow::ensure!(ids[j].is_finite()&&ids[j]>=0.&&ids[j].fract()==0.&&plate<plates.len(),"板块编号无效");
             f.plate_id.push(plate as u16);f.crust_type.push(crust[j]);
         }
-        let root_motion=tf_sim::TectonicState{plates:plates.clone(),planar_velocities:planar.clone(),..Default::default()};
+        let root_motion=tf_sim::TectonicState{plates:plates.clone(),planar_velocities:planar.clone(),planar_spin_rad_myr:spins.clone(),centers:centers.clone(),..Default::default()};
         // In inherited local charts, project spherical velocities into the chart's
         // metric axes at its centre. Arrows below retain each point's exact speed.
         let mut boundary_motion=root_motion.clone();
-        if coarse.field_is_planar() && planar.is_none() {
+        if coarse.field_is_planar() && (planar.is_none() || node.parent.is_some()) {
             let centre=coarse.center_dir(coarse.cell_count()/2);let (east,north)=centre.tangent_frame();
             boundary_motion.planar_velocities=Some((0..plates.len()).map(|p|{
-                let v=tf_sim::evolution::velocity(&root_motion,p,centre.as_vec()*coarse.radius_m());
-                DVec3::new(v.dot(east),v.dot(north),0.)
+                let v=tf_sim::evolution::velocity(&root_motion,p,if planar.is_some(){plane_position(motion_grid,centre)}else{centre.as_vec()*coarse.radius_m()});
+                if planar.is_some(){v}else{DVec3::new(v.dot(east),v.dot(north),0.)}
             }).collect());
+            boundary_motion.planar_spin_rad_myr=None;
         }
         let boundaries=tf_sim::plates::find_boundaries(&coarse,&f.plate_id,&boundary_motion,&f);
         let mut groups:[Vec<f32>;4]=std::array::from_fn(|_|Vec::new());
@@ -90,11 +102,12 @@ pub async fn get_tectonics(
             let physical=if chart{position(i)}else{coarse.field_position(i)};
             if chosen.iter().any(|q|physical.distance(*q)<spacing){continue;}
             let spherical=coarse.center_dir(i);
-            let v=if planar.is_some(){tf_sim::evolution::velocity(&root_motion,plate,physical)}else{tf_sim::evolution::velocity(&root_motion,plate,spherical.as_vec()*coarse.radius_m())};
+            let v=if planar.is_some(){tf_sim::evolution::velocity(&root_motion,plate,plane_position(motion_grid,spherical))}else{tf_sim::evolution::velocity(&root_motion,plate,spherical.as_vec()*coarse.radius_m())};
             let speed=v.length()*1e-4; // m/Myr to cm/year
             if speed<0.001 {continue;}
             let p=position(i);
-            let direction=if chart && planar.is_none() {
+            let direction=if chart && (planar.is_none() || node.parent.is_some()) {
+                let v=if planar.is_some(){let(e,n)=spherical.tangent_frame();e*v.x+n*v.y}else{v};
                 match &coarse {
                     MapGrid::Patch(g)=>{
                         let next=tf_core::geo::UnitVec3::from_vec(spherical.as_vec()+v/coarse.radius_m()*0.01).unwrap();
@@ -114,7 +127,33 @@ pub async fn get_tectonics(
             arrows.push(json!({"plate_id":plate,"latitude":lat,"longitude":lon,"speed_cm_year":speed}));
             chosen.push(physical);per_plate[plate]+=1;
         }
-        Ok(json!({"available":true,"groups":groups,"plates":plates,"planar_velocities":planar,"arrows":arrows,"reference_frame":"生成器固定地幔参考系；箭头长度统一，速度请查看数值","diagnostic_cells":coarse.cell_count()}))
+        Ok(json!({"available":true,"groups":groups,"plates":plates,"planar_velocities":planar,"planar_spin_rad_myr":spins,"plate_centers_m":centers,"motion_grid":motion_grid,"arrows":arrows,"reference_frame":"生成器固定地幔参考系；箭头长度统一，速度请查看数值；局部图边界类型按图心运动近似","diagnostic_cells":coarse.cell_count()}))
     }).await??;
     Ok(Json(result))
+}
+
+fn plane_position(grid: &GridDescriptor, dir: tf_core::geo::UnitVec3) -> DVec3 {
+    let GridDescriptor::Plane {
+        center_lat,
+        center_lon,
+        reference_lat,
+        radius_m,
+        ..
+    } = grid
+    else {
+        return DVec3::ZERO;
+    };
+    let (lat, lon) = dir.to_lat_lon_deg();
+    let delta = (lon - center_lon + 180.).rem_euclid(360.) - 180.;
+    DVec3::new(
+        delta.to_radians()
+            * radius_m
+            * reference_lat
+                .unwrap_or(*center_lat)
+                .to_radians()
+                .cos()
+                .max(0.05),
+        (lat - center_lat).to_radians() * radius_m,
+        0.,
+    )
 }

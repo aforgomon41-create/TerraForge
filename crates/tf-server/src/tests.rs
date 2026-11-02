@@ -174,6 +174,117 @@ async fn terminal_event_reconnects_finish_and_release_the_stream_capacity() {
         }
     }
 }
+
+#[tokio::test]
+async fn circulation_months_use_saved_vectors_and_remain_private_and_bounded() {
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let world = f.world(&token).await;
+    let grid = tf_grid::GridDescriptor::sphere(8, 6371000.);
+    let count = grid.cell_count();
+    let mut map = node(&world, "circulation-map");
+    map.grid = Some(grid.clone());
+    map.cells = count as u32;
+    f.state
+        .store
+        .submit_job(&map, &job(&world, &map.id, "circulation-job"))
+        .unwrap();
+    f.state
+        .store
+        .transition_job("circulation-job", "running", None)
+        .unwrap();
+    let east: Vec<Vec<f32>> = (0..12)
+        .map(|m| vec![if m < 6 { 2. } else { -2. }; count])
+        .collect();
+    let atlas = tf_sim::seasonal::ClimateAtlas {
+        grid,
+        model: "fixture".into(),
+        axial_tilt_deg: 23.44,
+        temperature_c: vec![vec![15.; count]; 12],
+        precipitation_mm: vec![vec![60.; count]; 12],
+        pet_mm: vec![vec![40.; count]; 12],
+        energy: Default::default(),
+        water: Default::default(),
+        circulation: Some(tf_sim::circulation::CirculationAtlas {
+            model: "fixture".into(),
+            wind_east_m_s: east.clone(),
+            wind_north_m_s: vec![vec![0.; count]; 12],
+            current_east_m_s: east,
+            current_north_m_s: vec![vec![0.; count]; 12],
+            ocean_fraction: vec![1.; count],
+            relative_solver_residual: vec![0.; 12],
+            solver_iterations: vec![1; 12],
+            heat_coupled: true,
+        }),
+    };
+    let encoded = climatology::encode(&atlas).unwrap();
+    let restored = climatology::decode(&encoded).unwrap();
+    assert_eq!(
+        restored.circulation.as_ref().unwrap().wind_east_m_s[6][0],
+        -2.
+    );
+    f.state
+        .store
+        .publish_fields(
+            &map.id,
+            &[(Channel::Elevation, &vec![-1000.; count])],
+            &json!({"climate_atlas":encoded}),
+        )
+        .unwrap();
+    let path = format!("/api/v1/maps/{}/vectors/wind", map.id);
+    let (status, jan) = f
+        .request("GET", &format!("{path}?month=1"), Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{jan}");
+    assert_eq!(jan["units"], "m/s");
+    assert_eq!(jan["maximum_speed_m_s"], 2.);
+    let samples = jan["samples"].as_array().unwrap();
+    assert!(!samples.is_empty() && samples.len() <= 700);
+    assert!(samples.iter().all(|s| s["east_m_s"] == 2.));
+    let (_, jul) = f
+        .request("GET", &format!("{path}?month=7"), Some(&token), None)
+        .await;
+    assert!(jul["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["east_m_s"] == -2.));
+    let (_, year) = f.request("GET", &path, Some(&token), None).await;
+    assert_eq!(year["maximum_speed_m_s"], 0.);
+    assert!(year["samples"].as_array().unwrap().is_empty());
+    let (status, _) = f
+        .request("GET", &format!("{path}?month=13"), Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let stranger = f.session().await;
+    let (status, _) = f.request("GET", &path, Some(&stranger), None).await;
+    assert!(matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::FORBIDDEN
+    ));
+    let mut legacy = map.clone();
+    legacy.id = "legacy-circulation-map".into();
+    f.state
+        .store
+        .submit_job(&legacy, &job(&world, &legacy.id, "legacy-circulation-job"))
+        .unwrap();
+    f.state
+        .store
+        .transition_job("legacy-circulation-job", "running", None)
+        .unwrap();
+    f.state
+        .store
+        .publish_fields(
+            &legacy.id,
+            &[(Channel::Elevation, &vec![-1000.; count])],
+            &json!({}),
+        )
+        .unwrap();
+    let path = format!("/api/v1/maps/{}/vectors/wind", legacy.id);
+    let (status, old) = f.request("GET", &path, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(old["available"], false);
+}
 #[tokio::test]
 async fn capabilities_isolate_world_map_field_job_events_and_delete() {
     let f = Fixture::new(false);

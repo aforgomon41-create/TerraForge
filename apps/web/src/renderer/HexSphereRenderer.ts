@@ -696,7 +696,7 @@ export class HexSphereRenderer {
       gl.disable(gl.DEPTH_TEST)
       gl.enable(gl.BLEND)
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
-      if (this.layer !== 6 && this.layer !== 7) {
+      if (![6, 7, 8, 9].includes(this.layer)) {
         gl.uniform4f(lu('uColor'), 0.27, 0.36, 0.29, 0.22)
         gl.drawArrays(gl.LINES, 0, this.lineCount)
       } else {
@@ -705,12 +705,20 @@ export class HexSphereRenderer {
           gl.uniform4f(lu('uColor'), 0.27, 0.36, 0.29, 0.1)
           gl.drawArrays(gl.LINES, 0, this.lineCount)
         }
-        const colors = [
-          [0.65, 0.22, 0.16, 1],
-          [0.1, 0.44, 0.55, 1],
-          [0.55, 0.4, 0.65, 1],
-          [0.15, 0.23, 0.2, 1],
-        ]
+        const colors =
+          this.layer === 8 || this.layer === 9
+            ? [
+                [0.15, 0.38, 0.55, 0.9],
+                [0.12, 0.51, 0.52, 0.95],
+                [0.73, 0.44, 0.15, 1],
+                [0.67, 0.2, 0.15, 1],
+              ]
+            : [
+                [0.65, 0.22, 0.16, 1],
+                [0.1, 0.44, 0.55, 1],
+                [0.55, 0.4, 0.65, 1],
+                [0.15, 0.23, 0.2, 1],
+              ]
         this.diagnostics.forEach((group, index) => {
           gl.bindVertexArray(group.vao)
           gl.uniform4fv(

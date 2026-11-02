@@ -76,14 +76,21 @@ pub fn apply_planar_coast_constraint<G: GridOps>(
 }
 
 /// Assembled irregular crustal blocks, rather than buffered lines with round caps.
-struct CrustProvince {
-    center: DVec3,
-    east: DVec3,
-    north: DVec3,
-    vertices: Vec<glam::DVec2>,
+#[derive(Debug, Clone)]
+pub struct CrustProvince {
+    pub center: DVec3,
+    pub east: DVec3,
+    pub north: DVec3,
+    pub vertices: Vec<glam::DVec2>,
+    pub group: u32,
 }
 impl CrustProvince {
-    fn radial_extent(&self, p: DVec3, planetary_radius: f64, planar: bool) -> (f64, f64) {
+    pub(crate) fn radial_extent(
+        &self,
+        p: DVec3,
+        planetary_radius: f64,
+        planar: bool,
+    ) -> (f64, f64) {
         let delta = if planar {
             p - self.center
         } else {
@@ -122,7 +129,10 @@ impl CrustProvince {
         (radius, boundary)
     }
 }
-fn continental_provinces<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec<CrustProvince> {
+pub(crate) fn continental_provinces<G: GridOps>(
+    grid: &G,
+    params: &GenerationParams,
+) -> Vec<CrustProvince> {
     use tf_core::{geo::UnitVec3, params::LevelKind, DeterministicRng};
     let mut rng = DeterministicRng::derive(params.seed, "continental-terrane-assembly-v2");
     let count = if params.start_level == LevelKind::Continent {
@@ -143,7 +153,7 @@ fn continental_provinces<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec
         * params.continent_scale.sqrt();
     let mut anchors: Vec<DVec3> = Vec::new();
     let mut provinces = Vec::new();
-    let block = |center: DVec3, size: f64, bearing: f64, rng: &mut DeterministicRng| {
+    let block = |center: DVec3, size: f64, bearing: f64, group: u32, rng: &mut DeterministicRng| {
         let (east, north) = if planar {
             (DVec3::X, DVec3::Y)
         } else {
@@ -169,9 +179,10 @@ fn continental_provinces<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec
             east,
             north,
             vertices,
+            group,
         }
     };
-    for _group in 0..count {
+    for group in 0..count {
         let mut center = DVec3::ZERO;
         let mut best = -1.;
         for _ in 0..32 {
@@ -243,10 +254,17 @@ fn continental_provinces<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec
                     b - side * pair[1].1 * 0.6,
                     a - side * pair[0].1 * 0.6,
                 ],
+                group: group as u32,
             });
         }
         for &(p, size) in &nodes {
-            provinces.push(block(p, size, bearing + rng.range_f64(-1., 1.), &mut rng));
+            provinces.push(block(
+                p,
+                size,
+                bearing + rng.range_f64(-1., 1.),
+                group as u32,
+                &mut rng,
+            ));
         }
         // Asymmetric branches leave large embayments between terranes. Their
         // positions and sizes vary independently instead of tracing one arc.
@@ -264,7 +282,7 @@ fn continental_provinces<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec
                     * radius
             };
             let size = scale * rng.range_f64(0.35, 0.8);
-            provinces.push(block(tip, size, angle, &mut rng));
+            provinces.push(block(tip, size, angle, group as u32, &mut rng));
         }
         // Initial continental terranes are not all joined to the same spine.
         // Their subsequent movement and collision are handled by the crust solver.
@@ -281,14 +299,23 @@ fn continental_provinces<G: GridOps>(grid: &G, params: &GenerationParams) -> Vec
                     * radius
             };
             let r = scale * rng.range_f64(0.13, 0.40);
-            provinces.push(block(a, r, angle, &mut rng));
+            provinces.push(block(a, r, angle, group as u32, &mut rng));
         }
     }
     provinces
 }
 pub fn init_continents<G: GridOps>(grid: &G, fields: &mut WorldFields, params: &GenerationParams) {
-    let noise = SimplexNoise::new(params.seed ^ 0xC071_1E17);
     let provinces = continental_provinces(grid, params);
+    init_from_provinces(grid, fields, params, &provinces);
+}
+
+pub(crate) fn init_from_provinces<G: GridOps>(
+    grid: &G,
+    fields: &mut WorldFields,
+    params: &GenerationParams,
+    provinces: &[CrustProvince],
+) {
+    let noise = SimplexNoise::new(params.seed ^ 0xC071_1E17);
     let radius = grid.radius_m();
     let characteristic_length = provinces
         .iter()
@@ -713,6 +740,7 @@ mod tests {
     #[test]
     fn increasing_a_crustal_block_does_not_fill_its_large_embayment() {
         let province = CrustProvince {
+            group: 0,
             center: DVec3::ZERO,
             east: DVec3::X,
             north: DVec3::Y,

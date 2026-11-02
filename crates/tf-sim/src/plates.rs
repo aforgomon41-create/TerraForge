@@ -33,6 +33,8 @@ pub struct TectonicState {
     pub plates: Vec<Plate>,
     pub convection: Vec<ConvectionCell>,
     pub planar_velocities: Option<Vec<DVec3>>,
+    pub planar_spin_rad_myr: Option<Vec<f64>>,
+    pub provinces: Vec<crate::geology::GeologicProvince>,
     pub centers: Vec<DVec3>,
     pub partition_scale: f64,
     pub partition_seed: u64,
@@ -185,8 +187,9 @@ pub fn build_plates<G: GridOps>(
             .map(|_| {
                 let a = rng.range_f64(0., std::f64::consts::TAU);
                 DVec3::new(a.cos(), a.sin(), 0.)
-                    * rng.range_f64(25000., 75000.)
-                    * params.tectonic_activity
+                    * (rng.range_f64(2.5, 7.5) * params.tectonic_activity)
+                        .clamp(params.plate_speed_min_cm_yr, params.plate_speed_max_cm_yr)
+                    * 10_000.
             })
             .collect::<Vec<_>>()
     });
@@ -281,10 +284,13 @@ pub fn build_plates<G: GridOps>(
                 id: k as u16,
                 euler_pole: [axis.x, axis.y, axis.z],
                 // 5 cm/year = 50 km/Myr; omega = v/R is about 0.0078 rad/Myr.
-                omega: (if oceanic { 1.2 } else { 0.7 })
+                omega: ((if oceanic { 1.2 } else { 0.7 })
                     * params.tectonic_activity
                     * (0.4 + strength).clamp(0.5, 1.6)
-                    * 7.8e-3,
+                    * 5.)
+                    .clamp(params.plate_speed_min_cm_yr, params.plate_speed_max_cm_yr)
+                    * 10_000.
+                    / grid.radius_m(),
                 oceanic,
             }
         })
@@ -305,9 +311,43 @@ pub fn build_plates<G: GridOps>(
             partition_seed: params.seed ^ 0xB0A7D,
             partition_weights,
             history: Default::default(),
+            planar_spin_rad_myr: grid.field_is_planar().then(|| {
+                (0..plate_count)
+                    .map(|_| rng.range_f64(-0.001, 0.001))
+                    .collect()
+            }),
+            provinces: Vec::new(),
         },
         plate_id,
     )
+}
+
+/// Bound peak speed over the entire domain, including planar block rotation.
+/// Collision slowing may go below the initial minimum; it is never sped back up.
+pub(crate) fn limit_speeds<G: GridOps>(
+    state: &mut TectonicState,
+    grid: &G,
+    params: &GenerationParams,
+) {
+    let maximum = params.plate_speed_max_cm_yr * 10_000.;
+    for i in 0..state.plates.len() {
+        if let Some(v) = &mut state.planar_velocities {
+            let center = state.centers.get(i).copied().unwrap_or_default();
+            let (w, h) = grid.extent_m().unwrap();
+            let arm = (w * 0.5 + center.x.abs()).hypot(h * 0.5 + center.y.abs());
+            let spin = state.planar_spin_rad_myr.as_ref().map_or(0., |s| s[i]);
+            let peak = v[i].length() + spin.abs() * arm;
+            let scale = (maximum / peak.max(maximum)).min(1.);
+            v[i] *= scale;
+            if let Some(s) = &mut state.planar_spin_rad_myr {
+                s[i] *= scale;
+            }
+        } else {
+            state.plates[i].omega = state.plates[i]
+                .omega
+                .clamp(-maximum / grid.radius_m(), maximum / grid.radius_m());
+        }
+    }
 }
 
 /// 初始化地壳场。
@@ -409,8 +449,10 @@ pub fn find_boundaries<G: GridOps>(
                 plate_id[i] as usize,
                 plate_id[j] as usize,
             );
-            let relative = if let Some(velocities) = &state.planar_velocities {
-                velocities[plate_id[i] as usize] - velocities[plate_id[j] as usize]
+            let relative = if state.planar_velocities.is_some() {
+                let mid = (grid.field_position(i) + grid.field_position(j)) * 0.5;
+                crate::evolution::velocity(state, plate_id[i] as usize, mid)
+                    - crate::evolution::velocity(state, plate_id[j] as usize, mid)
             } else {
                 // Both velocities must be evaluated at the same boundary point.
                 let mid = (p + q).normalize();
@@ -633,6 +675,46 @@ pub fn apply_seafloor_age<G: GridOps>(
 #[cfg(test)]
 mod continuity_tests {
     use super::*;
+    #[test]
+    fn initial_linear_speeds_are_radius_independent_and_planar_rotation_is_capped() {
+        let p = GenerationParams {
+            plate_speed_max_cm_yr: 6.,
+            ..Default::default()
+        };
+        let mut speeds = Vec::new();
+        for radius in [3_000_000., 12_000_000.] {
+            let g = tf_grid::SphereHexGrid::build(4, radius, (DVec3::Z, 0.));
+            let (mut state, _) =
+                build_plates(&g, &p, &mut DeterministicRng::derive(42, "test-motion"));
+            limit_speeds(&mut state, &g, &p);
+            let v: Vec<_> = state
+                .plates
+                .iter()
+                .map(|plate| plate.omega * radius * 1e-4)
+                .collect();
+            assert!(v.iter().all(|&v| v >= 0.5 && v <= 6. + 1e-9));
+            speeds.push(v);
+        }
+        for (a, b) in speeds[0].iter().zip(&speeds[1]) {
+            assert!((a - b).abs() < 1e-10);
+        }
+        let g = tf_grid::FlatGrid::new(8, 8, 6e6, 30., 0., 6371000.);
+        let (mut state, _) = build_plates(&g, &p, &mut DeterministicRng::derive(42, "test-motion"));
+        state.planar_spin_rad_myr.as_mut().unwrap().fill(0.2);
+        limit_speeds(&mut state, &g, &p);
+        for plate in 0..state.plates.len() {
+            for i in 0..g.cell_count() {
+                let v = crate::evolution::velocity(&state, plate, g.field_position(i));
+                assert!(v.length() * 1e-4 <= 6. + 1e-9);
+            }
+            let center = state.centers[plate];
+            let point = center + DVec3::X * 100_000.;
+            let next = crate::evolution::move_point(&state, plate, point, 10.);
+            let moved_center = crate::evolution::move_point(&state, plate, center, 10.);
+            assert!((next.distance(moved_center) - 100_000.).abs() < 1e-6);
+            assert!((next - moved_center).y.abs() > 1.);
+        }
+    }
     #[test]
     fn initial_partition_has_major_and_minor_plate_area_scales() {
         let g = tf_grid::SphereHexGrid::build(32, 6371000., (DVec3::Z, 0.));

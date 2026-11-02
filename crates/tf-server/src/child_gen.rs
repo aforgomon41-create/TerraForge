@@ -239,6 +239,14 @@ pub fn run_child_generation(
         channels.push((*channel, data.as_slice()));
     }
     let mut metadata = serde_json::json!({"generator_version":"tf-0.4","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
+    metadata["planar_spin_rad_myr"] = parent_meta
+        .get("planar_spin_rad_myr")
+        .cloned()
+        .unwrap_or_default();
+    metadata["plate_centers_m"] = parent_meta
+        .get("plate_centers_m")
+        .cloned()
+        .unwrap_or_default();
     crate::geography::attach(&mut metadata, &patch, &fields, &water, &|| {
         cancel.load(Ordering::Relaxed)
     });

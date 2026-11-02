@@ -23,6 +23,18 @@ pub struct History {
     pub output_crust_m3: f64,
     pub output_projection_error: Option<f64>,
     pub volcanoes: Vec<Volcano>,
+    #[serde(default)]
+    pub ancient_duration_myr: f64,
+    #[serde(default)]
+    pub detailed_duration_myr: f64,
+    #[serde(default)]
+    pub output_step_myr: f64,
+    #[serde(default)]
+    pub ancient_steps: u32,
+    #[serde(default)]
+    pub plate_reorganizations: u32,
+    #[serde(default)]
+    pub geologic_provinces: Vec<crate::geology::ProvinceRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,15 +126,19 @@ pub fn rotate(point: DVec3, axis: DVec3, radians: f64) -> DVec3 {
 
 pub fn velocity(state: &TectonicState, plate: usize, position_m: DVec3) -> DVec3 {
     if let Some(v) = &state.planar_velocities {
-        return v[plate];
+        let spin = state.planar_spin_rad_myr.as_ref().map_or(0., |s| s[plate]);
+        let center = state.centers.get(plate).copied().unwrap_or_default();
+        return v[plate] + DVec3::Z.cross(position_m - center) * spin;
     }
     let p = &state.plates[plate];
     DVec3::from_array(p.euler_pole).cross(position_m) * p.omega
 }
 
-fn move_point(state: &TectonicState, plate: usize, p: DVec3, dt: f64) -> DVec3 {
+pub(crate) fn move_point(state: &TectonicState, plate: usize, p: DVec3, dt: f64) -> DVec3 {
     if let Some(v) = &state.planar_velocities {
-        p + v[plate] * dt
+        let spin = state.planar_spin_rad_myr.as_ref().map_or(0., |s| s[plate]);
+        let center = state.centers.get(plate).copied().unwrap_or_default();
+        center + rotate(p - center, DVec3::Z, spin * dt) + v[plate] * dt
     } else {
         let plate = &state.plates[plate];
         rotate(p, DVec3::from_array(plate.euler_pole), plate.omega * dt)
@@ -358,6 +374,7 @@ fn remap(
     let mut strain = vec![0.; n];
     let mut orogen_age = vec![0.; n];
     let mut shear_strain = vec![0.; n];
+    let mut craton_strength = vec![0.; n];
     let mut votes = vec![0_f64; n * count];
     let thickness: Vec<_> = f.crust_thickness.iter().map(|v| *v as f64).collect();
     let reference_height: Vec<_> = f
@@ -388,7 +405,13 @@ fn remap(
             .map(|&(j, metric)| {
                 (
                     Some(j),
-                    motion.dot(metric).max(0.) * dt,
+                    (if grid.field_is_planar() {
+                        velocity(state, plate, (p + grid.field_position(j)) * 0.5).dot(metric)
+                    } else {
+                        motion.dot(metric)
+                    })
+                    .max(0.)
+                        * dt,
                     (grid.field_position(j) - p) * 0.5 - predictor,
                 )
             })
@@ -410,7 +433,11 @@ fn remap(
                 if !geometry[i].iter().any(|&(j, _)| {
                     (grid.field_position(j) - p - direction * spacing).length() < spacing * 0.1
                 }) {
-                    let flux = motion.dot(direction) * area * 2. / (3. * spacing) * dt;
+                    let flux = velocity(state, plate, p + direction * spacing * 0.5).dot(direction)
+                        * area
+                        * 2.
+                        / (3. * spacing)
+                        * dt;
                     if flux > 0. {
                         shares.push((None, flux, direction * spacing * 0.5 - predictor));
                     }
@@ -514,6 +541,7 @@ fn remap(
             strain[j] += f.crustal_strain[i] as f64 * share;
             orogen_age[j] += f.orogen_age[i] as f64 * share;
             shear_strain[j] += f.shear_strain[i] as f64 * share;
+            craton_strength[j] += f.craton_strength[i] as f64 * share;
             votes[j * count + plate] += share;
         }
     }
@@ -538,6 +566,7 @@ fn remap(
         f.elevation[i] = (basement[i] / total_area.max(1.)) as f32;
         f.crust_type[i] = (continental_volume[i] / volume[i].max(1.)).clamp(0., 1.) as f32;
         f.shear_strain[i] = (shear_strain[i] / total_area.max(1.)) as f32;
+        f.craton_strength[i] = (craton_strength[i] / total_area.max(1.)).clamp(0., 1.) as f32;
         f.crust_age[i] = (age[i] / total_area.max(1.) + dt * fraction.min(1.)) as f32;
         f.crustal_strain[i] = (strain[i] / total_area.max(1.)
             + fraction.max(1.).ln() * f.crust_type[i] as f64) as f32;
@@ -584,12 +613,12 @@ fn remap(
                 let difference = excess_i - excess_j;
                 let (donor, receiver) = if difference >= 0. { (i, j) } else { (j, i) };
                 let mobility = (f.crust_type[donor] as f64).powi(2)
-                    * (f.crust_thickness[donor] as f64 / 35000.).max(1.).powi(3);
+                    * (f.crust_thickness[donor] as f64 / 35000.).max(1.).powi(3)
+                    * (0.05 + 0.95 * (1. - f.craton_strength[donor] as f64).powi(2));
                 let transport = 1.5e10 * mobility * dt / 8. * grid.area_m2(i).min(grid.area_m2(j))
                     / grid.distance_m(i, j).powi(2)
                     * difference.abs();
-                let available = (f.crust_thickness[donor]
-                    - f.reference_crust_thickness[donor] * 0.5)
+                let available = (f.crust_thickness[donor] - f.reference_crust_thickness[donor])
                     .max(0.) as f64
                     * grid.area_m2(donor)
                     * 0.025;
@@ -830,17 +859,41 @@ pub fn generate_observed<G: GridOps>(
 ) -> Option<TectonicState> {
     let grid = solver_grid(fine);
     let mut rng = DeterministicRng::derive(params.seed, "tectonics");
-    let (mut state, ids) = crate::plates::build_plates(&grid, params, &mut rng);
+    let (mut state, mut ids) = crate::plates::build_plates(&grid, params, &mut rng);
+    crate::plates::limit_speeds(&mut state, &grid, params);
+    let recent_duration = params.tectonic_age_myr.min(120.);
+    let ancient_duration = (params.tectonic_age_myr - recent_duration).max(0.);
+    let (mut provinces, ancient_steps, reorganizations, latest_ids) =
+        crate::geology::ancient_history(
+            &grid,
+            params,
+            &mut state,
+            ancient_duration,
+            progress,
+            cancel,
+            observer,
+        )?;
+    if let Some(latest) = latest_ids {
+        ids = latest;
+    }
+    for province in &mut provinces {
+        if let Some(cell) = locate(&grid, province.shape.center) {
+            province.plate = ids[cell] as usize;
+        }
+    }
     let mut material = WorldFields::with_capacity(grid.cell_count());
-    crate::plates::init_crust(&grid, &ids, &state, &mut material, &mut rng, params);
+    crate::geology::initialize(&grid, &mut material, params, &provinces);
+    material.plate_id.copy_from_slice(&ids);
+    state.provinces = provinces;
     let age_noise = tf_core::noise::SimplexNoise::new(params.seed ^ 0xA6E0_0410);
     for i in 0..grid.cell_count() {
         let p = grid.field_position(i) / 1_800_000.;
         let ocean_age = 70. + 50. * age_noise.fbm(p.x, p.y, p.z, 3, 2., 0.5);
-        material.crust_age[i] = (600. * material.crust_type[i] as f64
+        material.crust_age[i] = (ancient_duration.max(600.) * material.crust_type[i] as f64
             + ocean_age * (1. - material.crust_type[i] as f64))
             as f32;
     }
+    crate::plates::limit_speeds(&mut state, &grid, params);
     for plate in &mut state.plates {
         let mut crust = 0.;
         let mut area = 0.;
@@ -859,11 +912,17 @@ pub fn generate_observed<G: GridOps>(
             }
         }
     }
+    crate::plates::limit_speeds(&mut state, &grid, params);
     material.orogen_age.fill(150.);
     let mut history = History {
-        model: "muscl-conservative-surface+episodic-volcanism-v4-buoyant-collision".into(),
+        model: "staged-terrane-history+recent-conservative-crust-v5".into(),
         initial_crust_m3: crust_volume(&grid, &material),
         duration_myr: params.tectonic_age_myr,
+        ancient_duration_myr: ancient_duration,
+        detailed_duration_myr: recent_duration,
+        output_step_myr: params.tectonic_step_myr,
+        ancient_steps,
+        plate_reorganizations: reorganizations,
         ..Default::default()
     };
     let geometry = faces(&grid);
@@ -891,28 +950,46 @@ pub fn generate_observed<G: GridOps>(
             };
             Hotspot {
                 position,
-                next_eruption: hot_rng.range_f64(0.5, 10.),
+                next_eruption: ancient_duration + hot_rng.range_f64(0.5, 10.),
                 episode: 1,
                 seed: params.seed ^ (id as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15),
             }
         })
         .collect();
     let mut arc_rng = DeterministicRng::derive(params.seed, "arc-epochs");
-    let mut next_event = arc_rng.range_f64(3., 10.);
-    let mut elapsed = 0.;
+    let mut next_event = ancient_duration + arc_rng.range_f64(3., 10.);
+    let mut elapsed = ancient_duration;
     evolution_frame(
         &grid, &material, &state, &history, params, elapsed, observer,
     );
     while elapsed < params.tectonic_age_myr {
-        if history.steps >= 4096 {
+        if history.steps >= 32768 {
             return None;
         }
-        let rate = (0..state.plates.len())
-            .map(|id| transport_parameter(&state, id).length())
-            .fold(0., f64::max)
-            * geometry_rate;
+        crate::plates::limit_speeds(&mut state, &grid, params);
+        let peak = (0..state.plates.len())
+            .map(|id| {
+                if let Some((w, h)) = grid.extent_m() {
+                    let center = state.centers[id];
+                    let spin = state
+                        .planar_spin_rad_myr
+                        .as_ref()
+                        .map_or(0., |s| s[id])
+                        .abs();
+                    state.planar_velocities.as_ref().unwrap()[id].length()
+                        + spin * (w * 0.5 + center.x.abs()).hypot(h * 0.5 + center.y.abs())
+                } else {
+                    transport_parameter(&state, id).length()
+                }
+            })
+            .fold(0., f64::max);
+        let rate = peak * geometry_rate;
+        let next_output =
+            ((elapsed / params.tectonic_step_myr + 1e-8).floor() + 1.) * params.tectonic_step_myr;
         let dt = (0.32 / rate.max(1e-12))
             .min(1.5)
+            .min(params.tectonic_step_myr)
+            .min(next_output - elapsed)
             .min(params.tectonic_age_myr - elapsed);
         if cancel() {
             return None;
@@ -942,6 +1019,9 @@ pub fn generate_observed<G: GridOps>(
         }
         remap(&grid, &geometry, &mut material, &state, dt, &mut history);
         collision_resistance(&grid, &mut material, &mut state, dt);
+        let mut provinces = std::mem::take(&mut state.provinces);
+        crate::geology::advance(&grid, &mut provinces, &state, dt);
+        state.provinces = provinces;
         for i in 0..state.centers.len() {
             state.centers[i] = move_point(&state, i, state.centers[i], dt);
         }
@@ -971,6 +1051,7 @@ pub fn generate_observed<G: GridOps>(
             &grid, &material, &state, &history, params, elapsed, observer,
         );
     }
+    crate::plates::limit_speeds(&mut state, &grid, params);
     history.final_crust_m3 = crust_volume(&grid, &material);
     let expected =
         history.initial_crust_m3 + history.imported_crust_m3 + history.new_ocean_crust_m3
@@ -997,6 +1078,7 @@ pub fn generate_observed<G: GridOps>(
         fields.crustal_strain[i] = interpolate(&material.crustal_strain);
         fields.orogen_age[i] = interpolate(&material.orogen_age);
         fields.shear_strain[i] = interpolate(&material.shear_strain);
+        fields.craton_strength[i] = interpolate(&material.craton_strength);
         let nearest = weights.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
         fields.plate_id[i] = material.plate_id[nearest];
     }
@@ -1028,6 +1110,7 @@ pub fn generate_observed<G: GridOps>(
         );
     }
     history.output_crust_m3 = crust_volume(fine, fields);
+    history.geologic_provinces = crate::geology::records(&state.provinces);
     state.history = history;
     for plate in &mut state.plates {
         let mut crust = 0.;
@@ -1121,7 +1204,14 @@ pub fn landforms<G: GridOps>(
         let uplift = excess.max(0.) * (1. - 2800. / 3300.) * params.orogeny_strength;
         let rift = excess.min(0.) * (1. - 2800. / 3300.) * params.rift_strength;
         let ocean = -2700. - 330. * age.max(0.).min(180.).sqrt();
-        let basement = fields.elevation[i] as f64;
+        let transported_basement = fields.elevation[i] as f64;
+        let (inherited, stability, province_support) =
+            crate::geology::sample(&state.provinces, p, grid.radius_m(), grid.field_is_planar());
+        // Analytic terrane geometry retains sub-grid inherited relief without
+        // repeatedly diffusing that scalar through a 120 km transport mesh.
+        let inherited_weight = province_support * (transported_basement / 450.).clamp(0., 1.);
+        let basement = transported_basement * (1. - inherited_weight)
+            + (450. + (inherited - 350.) * params.interior_relief) * inherited_weight;
         let strain = fields.crustal_strain[i] as f64;
         let detail = crate::terrain::interior_detail(&noise, p, sampling) * params.interior_relief;
         let mut gradient = DVec3::ZERO;
@@ -1143,7 +1233,7 @@ pub fn landforms<G: GridOps>(
         // Old orogens lose relief gradually. Width emerges from transported material
         // and lateral crustal redistribution; local folds have no global fixed wavelength.
         let old_decay = (-fields.orogen_age[i] as f64 / 180.).exp();
-        let folds = detail * 0.35
+        let folds = detail * (0.15 + 0.60 * (1. - stability))
             + folded
                 * ((strain * 2.).min(1.5) * old_decay
                     + (fields.shear_strain[i] as f64).min(1.) * 0.35 * params.shear_strength);
@@ -1569,11 +1659,17 @@ mod tests {
         let g = MapGrid::Sphere(SphereHexGrid::build(8, 6371000., (DVec3::Z, 0.)));
         let mut p = GenerationParams::default();
         p.tectonic_age_myr = 0.;
+        p.spreading_rate = 3.;
+        p.plate_speed_max_cm_yr = 5.;
         let mut f = WorldFields::with_capacity(g.cell_count());
         let s = generate(&g, &p, &mut f, &mut |_| {}, &|| false).unwrap();
         assert_eq!(s.history.steps, 0);
         assert!(s.history.volcanoes.is_empty());
         assert_eq!(s.history.new_ocean_crust_m3, 0.);
+        assert!(s
+            .plates
+            .iter()
+            .all(|plate| plate.omega.abs() * g.radius_m() * 1e-4 <= 5. + 1e-9));
     }
     #[test]
     fn open_plane_accounts_for_export_and_new_ocean_crust() {

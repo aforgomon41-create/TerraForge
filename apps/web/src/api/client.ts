@@ -46,7 +46,20 @@ export interface TectonicDiagnostic {
   groups?: number[][]
   plates?: { id: number; euler_pole: number[]; omega: number }[]
   planar_velocities?: number[][] | null
+  planar_spin_rad_myr?: number[] | null
+  plate_centers_m?: number[][]
+  motion_grid?: GridDescriptor
   reference_frame?: string
+}
+export interface CirculationDiagnostic {
+  available: boolean
+  reason?: string
+  kind?: 'wind' | 'current'
+  month?: number
+  groups?: number[][]
+  maximum_speed_m_s?: number
+  heat_coupled?: boolean
+  relative_solver_residual?: number[]
 }
 export interface Surface {
   centers: Float32Array
@@ -138,6 +151,14 @@ async function geometryRequest(path: string, signal?: AbortSignal): Promise<Resp
   }
 }
 export const api = {
+  async vectors(
+    id: string,
+    kind: 'wind' | 'current',
+    month: number,
+    signal?: AbortSignal,
+  ): Promise<CirculationDiagnostic> {
+    return request(`/maps/${id}/vectors/${kind}?month=${month}`, { signal })
+  },
   async getGeography(id: string, cells: number, signal?: AbortSignal) {
     const response = await geometryRequest(`/maps/${id}/geography`, signal)
     return decodeGeography(await response.arrayBuffer(), cells)

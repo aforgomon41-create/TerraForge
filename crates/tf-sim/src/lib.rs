@@ -12,6 +12,7 @@
 //!
 //! 所有阶段都作用在同一个 WorldFields 上，按顺序推进。
 
+pub mod circulation;
 pub mod climate;
 pub mod downscale;
 pub mod ecology;
@@ -19,6 +20,7 @@ pub mod erosion;
 pub mod evolution;
 pub mod fields;
 pub mod geography;
+pub mod geology;
 pub mod landforms;
 pub mod pipeline;
 pub mod plates;

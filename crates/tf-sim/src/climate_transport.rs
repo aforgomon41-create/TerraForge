@@ -96,7 +96,9 @@ fn thermal_wind<G: GridOps>(
     if anomaly.length() > speed * 0.7 {
         anomaly *= speed * 0.7 / anomaly.length();
     }
-    let v = (base.0 * speed + anomaly).normalize_or_zero();
+    // Keep the thermal anomaly's speed as well as its direction. Normalising
+    // here silently gave every column the same speed in transport and display.
+    let v = (base.0 * speed + anomaly) / speed;
     (v, v.dot(east), v.dot(north))
 }
 
@@ -453,7 +455,7 @@ fn solve_observed_at_resolution<G: GridOps>(
         })
         .map(|(i, j)| atmospheric.distance_m(i, j))
         .fold(f64::INFINITY, f64::min);
-    let dt = (min_spacing / params.wind_speed_m_s * 0.32).clamp(1., 21600.);
+    let dt = (min_spacing / (params.wind_speed_m_s * 1.7) * 0.32).clamp(1., 21600.);
     let Some(mut atlas) = crate::seasonal::energy_observed(
         &atmospheric,
         &heights,
@@ -466,10 +468,63 @@ fn solve_observed_at_resolution<G: GridOps>(
             None
         },
         cancel,
-        observer,
+        &mut crate::preview::NoFrames,
     ) else {
         return false;
     };
+    let monthly_winds: Vec<Vec<_>> = (0..12)
+        .map(|month| {
+            let season = crate::seasonal::solar_longitude(month).sin();
+            (0..n)
+                .map(|i| {
+                    thermal_wind(
+                        &atmospheric,
+                        i,
+                        wind(
+                            &atmospheric,
+                            i,
+                            season,
+                            planet,
+                            1. - oceans[i],
+                            params.monsoon,
+                        ),
+                        &atlas.temperature_c[month],
+                        &heights,
+                        planet,
+                        params.wind_speed_m_s,
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let Some(mut circulation) = crate::circulation::solve(
+        &atmospheric,
+        &oceans,
+        &monthly_winds,
+        params.wind_speed_m_s,
+        planet,
+        cancel,
+    ) else {
+        return false;
+    };
+    if !params.prescribed_temperature {
+        let Some(coupled) = crate::seasonal::energy_with_currents(
+            &atmospheric,
+            &heights,
+            &oceans,
+            planet,
+            params.greenhouse,
+            None,
+            Some(&circulation),
+            cancel,
+            observer,
+        ) else {
+            return false;
+        };
+        atlas = coupled;
+        circulation.heat_coupled = true;
+    }
+    atlas.circulation = Some(circulation);
     let sample = (YEAR / 12. / dt).ceil() as usize;
     let mut soil = vec![30_f64; n];
     let mut vapor = vec![0.; n];
@@ -516,6 +571,18 @@ fn solve_observed_at_resolution<G: GridOps>(
                 })
                 .collect();
             let transport = transfer_mesh(&atmospheric, &winds, params.wind_speed_m_s, dt);
+            if cycle == 1 {
+                if let Some(c) = &mut atlas.circulation {
+                    c.wind_east_m_s[month] = winds
+                        .iter()
+                        .map(|v| (v.1 * params.wind_speed_m_s) as f32)
+                        .collect();
+                    c.wind_north_m_s[month] = winds
+                        .iter()
+                        .map(|v| (v.2 * params.wind_speed_m_s) as f32)
+                        .collect();
+                }
+            }
             let capacity: Vec<_> = (0..n)
                 .map(|i| {
                     (30. * (0.055 * (atlas.temperature_c[month][i] as f64 - 20.)).exp()

@@ -38,6 +38,8 @@ pub struct ClimateAtlas {
     pub pet_mm: Vec<Vec<f32>>,
     pub energy: EnergyBudget,
     pub water: WaterBudget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circulation: Option<crate::circulation::CirculationAtlas>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -189,6 +191,22 @@ pub(crate) fn energy_observed(
     cancel: &dyn Fn() -> bool,
     observer: &mut dyn crate::preview::FrameObserver,
 ) -> Option<ClimateAtlas> {
+    energy_with_currents(
+        atmosphere, heights, oceans, planet, greenhouse, prescribed, None, cancel, observer,
+    )
+}
+
+pub(crate) fn energy_with_currents(
+    atmosphere: &MapGrid,
+    heights: &[f64],
+    oceans: &[f64],
+    planet: &PlanetParams,
+    greenhouse: f64,
+    prescribed: Option<&[f64]>,
+    circulation: Option<&crate::circulation::CirculationAtlas>,
+    cancel: &dyn Fn() -> bool,
+    observer: &mut dyn crate::preview::FrameObserver,
+) -> Option<ClimateAtlas> {
     let grid = energy_grid(atmosphere);
     let n = grid.cell_count();
     let mut area = vec![0.; n];
@@ -225,6 +243,37 @@ pub(crate) fn energy_observed(
         .map(|&o| scientific::ocean_heat_capacity(2. + o * 48.) + 1.0e7)
         .collect();
     let dt = DAY * scientific::DAYS_PER_YEAR / 12.;
+    let ocean_transport: Option<Vec<_>> = circulation.map(|c| {
+        (0..12)
+            .map(|m| {
+                let currents: Vec<_> = (0..n)
+                    .map(|i| {
+                        let p = if atmosphere.field_is_planar() {
+                            grid.field_position(i)
+                        } else {
+                            grid.center_dir(i).as_vec() * atmosphere.radius_m()
+                        };
+                        let weights =
+                            crate::evolution::stencil(atmosphere, p).unwrap_or_else(|| {
+                                let j = atmosphere.cell_at(grid.center_dir(i)).unwrap_or(0);
+                                [(j, 1.), (j, 0.), (j, 0.)]
+                            });
+                        (
+                            weights
+                                .iter()
+                                .map(|&(j, w)| c.current_east_m_s[m][j] as f64 * w)
+                                .sum(),
+                            weights
+                                .iter()
+                                .map(|&(j, w)| c.current_north_m_s[m][j] as f64 * w)
+                                .sum(),
+                        )
+                    })
+                    .collect();
+                crate::circulation::HeatTransport::new(&grid, &ocean, &currents, &capacity)
+            })
+            .collect()
+    });
     let mut edges = Vec::new();
     let mut conductance = vec![0.; n];
     for i in 0..n {
@@ -263,6 +312,10 @@ pub(crate) fn energy_observed(
                 return None;
             }
             let old = temperature.clone();
+            let mut advected = old.clone();
+            if let Some(transport) = &ocean_transport {
+                transport[month].advect(&mut advected, dt);
+            }
             let mut absorbed = vec![0.; n];
             let mut external = vec![0.; n];
             for i in 0..n {
@@ -282,7 +335,7 @@ pub(crate) fn energy_observed(
                 let background = 28. - 42. * grid.latitude_deg(i).to_radians().sin().powi(2);
                 diagonal[i] = area[i] * (capacity[i] / dt + b + boundary_k) + conductance[i];
                 rhs[i] = area[i]
-                    * (capacity[i] / dt * old[i] + absorbed[i] - a + boundary_k * background);
+                    * (capacity[i] / dt * advected[i] + absorbed[i] - a + boundary_k * background);
                 external[i] = boundary_k * background;
             }
             if !implicit_heat(&diagonal, &edges, &rhs, &mut temperature) {
@@ -379,6 +432,7 @@ pub(crate) fn energy_observed(
         pet_mm: vec![vec![0.; m]; 12],
         energy: budget,
         water: WaterBudget::default(),
+        circulation: None,
     })
 }
 
@@ -477,6 +531,34 @@ impl ClimateAtlas {
         {
             return Err("月降水和蒸散不能为负".into());
         }
+        if let Some(c) = &self.circulation {
+            if c.ocean_fraction.len() != n
+                || c.ocean_fraction
+                    .iter()
+                    .any(|v| !v.is_finite() || !(0. ..=1.).contains(v))
+                || c.relative_solver_residual.len() != 12
+                || c.relative_solver_residual
+                    .iter()
+                    .any(|v| !v.is_finite() || *v < 0.)
+                || c.solver_iterations.len() != 12
+            {
+                return Err("环流诊断资料无效".into());
+            }
+            for (values, limit) in [
+                (&c.wind_east_m_s, 100.),
+                (&c.wind_north_m_s, 100.),
+                (&c.current_east_m_s, 10.),
+                (&c.current_north_m_s, 10.),
+            ] {
+                if values.len() != 12
+                    || values.iter().any(|v| {
+                        v.len() != n || v.iter().any(|x| !x.is_finite() || x.abs() > limit)
+                    })
+                {
+                    return Err("风场或洋流资料尺寸或数值无效".into());
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -484,6 +566,62 @@ impl ClimateAtlas {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ocean_gyres_change_monthly_temperature_without_creating_global_heat() {
+        let grid = MapGrid::Plane(FlatGrid::new(24, 18, 6e6, 30., 0., 6371000.));
+        let n = grid.cell_count();
+        let ocean = vec![1.; n];
+        let height = vec![0.; n];
+        let wind: Vec<_> = (0..n)
+            .map(|i| {
+                let u = (grid.local_center_m(i).unwrap().1 / 1e6).cos();
+                (DVec3::X * u, u, 0.)
+            })
+            .collect();
+        let c = crate::circulation::solve(
+            &grid,
+            &ocean,
+            &vec![wind; 12],
+            10.,
+            &PlanetParams::default(),
+            &|| false,
+        )
+        .unwrap();
+        let base = energy(
+            &grid,
+            &height,
+            &ocean,
+            &PlanetParams::default(),
+            1.,
+            None,
+            &|| false,
+        )
+        .unwrap();
+        let coupled = energy_with_currents(
+            &grid,
+            &height,
+            &ocean,
+            &PlanetParams::default(),
+            1.,
+            None,
+            Some(&c),
+            &|| false,
+            &mut crate::preview::NoFrames,
+        )
+        .unwrap();
+        let difference = base
+            .temperature_c
+            .iter()
+            .flatten()
+            .zip(coupled.temperature_c.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0_f32, f32::max);
+        assert!(
+            difference > 0.002,
+            "ocean transport had no thermal effect: {difference}"
+        );
+        assert!(coupled.energy.residual_w_m2 < 1e-4, "{:?}", coupled.energy);
+    }
     #[test]
     fn homogeneous_ocean_agrees_with_complete_climlab_ebm() {
         // This oracle is actual climlab.EBM_seasonal output, not values produced

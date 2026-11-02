@@ -95,7 +95,9 @@ pub fn import(
             <= if config.desktop {
                 32 * 1024 * 1024
             } else {
-                4 * 1024 * 1024
+                // Includes bounded, compressed monthly wind/current atlases in
+                // addition to geological events. The whole request remains 64 MiB.
+                16 * 1024 * 1024
             },
         "地质元数据超过当前模式限制"
     );

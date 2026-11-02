@@ -29,7 +29,41 @@ fn report(grid: &impl GridOps, f: &WorldFields) -> serde_json::Value {
                 && f.crustal_strain[i] < 0.1
         })
         .collect();
-    serde_json::json!({"land_fraction":area/sum(&|_|true),"p10":p(0.1),"p50":p(0.5),"p90":p(0.9),"max":p(1.),
+    let mut roughness = serde_json::Map::new();
+    for spacing in [250_000., 500_000., 1_000_000.] {
+        let (mut count, mut square, mut absolute) = (0, 0., 0.);
+        for i in 0..grid.cell_count() {
+            if f.elevation[i] <= 0.
+                || f.distance_to_sea[i] < 300_000.
+                || grid.latitude_deg(i).abs() > 50.
+            {
+                continue;
+            }
+            for bearing in [0., std::f64::consts::FRAC_PI_2] {
+                let j = if grid.field_is_planar() {
+                    let q = grid.field_position(i);
+                    grid.locate_local(q.x + spacing * bearing.sin(), q.y + spacing * bearing.cos())
+                } else {
+                    grid.locate(
+                        grid.center_dir(i)
+                            .offset(bearing, spacing / grid.radius_m()),
+                    )
+                };
+                let Some(j) = j else {
+                    continue;
+                };
+                if j == i || f.elevation[j] <= 0. || f.distance_to_sea[j] < 300_000. {
+                    continue;
+                }
+                let delta = (f.elevation[i] - f.elevation[j]) as f64;
+                count += 1;
+                square += delta * delta;
+                absolute += delta.abs();
+            }
+        }
+        roughness.insert(format!("{:.0}_km",spacing/1000.),serde_json::json!({"pairs":count,"rms_height_difference_m":(square/count.max(1) as f64).sqrt(),"mean_absolute_height_difference_m":absolute/count.max(1) as f64}));
+    }
+    serde_json::json!({"interior_nonpolar_roughness":roughness,"land_fraction":area/sum(&|_|true),"p10":p(0.1),"p50":p(0.5),"p90":p(0.9),"max":p(1.),
         "below_1000_share":sum(&|i|f.elevation[i]>0. && f.elevation[i]<1000.)/area.max(1.),
         "above_3000_share":sum(&|i|f.elevation[i]>3000.)/area.max(1.),"stable_cells":stable.len(),
         "stable_mean_height":stable.iter().map(|&i|f.elevation[i] as f64).sum::<f64>()/stable.len().max(1) as f64,
@@ -87,9 +121,10 @@ fn main() {
             tf_sim::evolution::generate(&grid, &params, &mut f, &mut |_| {}, &|| false).unwrap();
         let before = report(&grid, &f);
         tf_sim::evolution::landforms(&grid, &mut f, &state, &params);
+        tf_sim::erosion::compute_distance_to_sea(&grid, &mut f);
         println!(
             "{}",
-            serde_json::json!({"seed":params.seed,"plane":plane,"material":before,"terrain":report(&grid,&f)})
+            serde_json::json!({"seed":params.seed,"plane":plane,"duration_myr":params.tectonic_age_myr,"ancient_steps":state.history.ancient_steps,"recent_steps":state.history.steps,"budget_error":state.history.relative_budget_error,"material":before,"terrain":report(&grid,&f)})
         );
     }
 }

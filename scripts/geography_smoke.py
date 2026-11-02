@@ -27,6 +27,7 @@ def main():
     parser.add_argument('--base', default='http://127.0.0.1:18795/terraforge')
     parser.add_argument('--shape', choices=['sphere', 'plane'], default='sphere')
     parser.add_argument('--tectonic-myr', type=float)
+    parser.add_argument('--vectors', action='store_true', help='Verify saved monthly wind/current fields and project round trip')
     parser.add_argument('--out', default='artifacts/geography-acceptance')
     args = parser.parse_args()
     base = args.base.rstrip('/') + '/api/v1'
@@ -142,11 +143,39 @@ def main():
         assert cached == catalog and repeated == labels
         metadata = call('/maps/' + map_id + '/metadata', token)
         assert 'geography_v1' not in metadata
+        vector_fields = {}
+        if args.vectors:
+            assert 'climate_atlas' not in metadata
+            for kind, month in [('wind', 1), ('current', 7), ('wind', 0)]:
+                suffix = f'/vectors/{kind}?month={month}'
+                data = call('/maps/' + map_id + suffix, token)
+                assert data['available'] and data['units'] == 'm/s', data
+                assert 0 < len(data['samples']) <= 700
+                assert len(data['groups']) == 4
+                assert all(len(g) % 18 == 0 for g in data['groups'])
+                assert all(math.isfinite(v) for g in data['groups'] for v in g)
+                assert data['maximum_speed_m_s'] > 0
+                call('/maps/' + map_id + suffix, other, expected=404)
+                vector_fields[suffix] = data
+            report['circulation'] = {suffix: {'peak_m_s': data['maximum_speed_m_s'],
+                'samples': len(data['samples']), 'heat_coupled': data['heat_coupled'],
+                'relative_solver_residual': data['relative_solver_residual']}
+                for suffix, data in vector_fields.items()}
+            history = metadata.get('tectonic_history', {})
+            report['history'] = {key: history.get(key) for key in [
+                'duration_myr', 'output_step_myr', 'ancient_duration_myr', 'detailed_duration_myr',
+                'ancient_steps', 'steps', 'relative_budget_error']}
         assert len(call('/worlds/' + world['id'] + '/maps', token)) == 1
         project = call('/maps/' + map_id + '/export.json', token, binary=True)
+        if args.vectors:
+            saved = Path(args.out)
+            saved.mkdir(parents=True, exist_ok=True)
+            (saved / (args.shape + '.terraforge.json')).write_bytes(project)
         imported = call('/projects/import', token, 'POST', project)
         imported_maps = call('/worlds/' + imported['id'] + '/maps', token)
         assert len(imported_maps) == 1
+        for suffix, data in vector_fields.items():
+            assert call('/maps/' + imported_maps[0]['id'] + suffix, token) == data
         rebuilt, rebuilt_labels, _, rebuild_secs = geography(imported_maps[0]['id'], token)
         assert rebuilt_labels == labels
         assert [(f['id'], f['kind'], f['parent'], f['anchor_cell']) for f in rebuilt['features']] == [

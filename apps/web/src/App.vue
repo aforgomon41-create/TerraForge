@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { ref, shallowRef, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useWorldStore } from '@/stores/world'
-import { api, type MapNode, type TectonicDiagnostic } from '@/api/client'
+import {
+  api,
+  type MapNode,
+  type TectonicDiagnostic,
+  type CirculationDiagnostic,
+} from '@/api/client'
 import { HexSphereRenderer, MapStyle } from '@/renderer/HexSphereRenderer'
 import { buildSphereGrid } from '@/renderer/sphereGrid'
 import { direction, latLon, patchDirection, patchProject, nearestCell } from '@/renderer/geometry'
@@ -46,7 +51,9 @@ const liveLayer = computed(() => {
     (layer.value === 5 && !(flags & 8)) ||
     layer.value === 3 ||
     layer.value === 6 ||
-    layer.value === 7
+    layer.value === 7 ||
+    layer.value === 8 ||
+    layer.value === 9
   )
     return 0
   return layer.value
@@ -70,6 +77,10 @@ const name = ref('Aetheria'),
   land = ref(29),
   plates = ref(14),
   erosion = ref(1),
+  evolutionMyr = ref(4600),
+  evolutionStepMyr = ref(10),
+  minPlateSpeed = ref(0.5),
+  maxPlateSpeed = ref(12),
   worldShape = ref<'sphere' | 'plane'>('sphere'),
   allowLandAtEdge = ref(true)
 const style = ref(MapStyle.Parchment),
@@ -125,6 +136,20 @@ const biomes = [
   '湿地',
 ]
 const tectonics = ref<TectonicDiagnostic | null>(null)
+const circulation = ref<CirculationDiagnostic | null>(null)
+const circulationMonth = ref(0)
+let circulationController: AbortController | undefined
+let circulationCache: { key: string; data: CirculationDiagnostic } | undefined
+const circulationStatus = computed(() => {
+  if (store.generating) return '生成完成并保存环流后显示；当前显示真实地形预览。'
+  const data = circulation.value
+  if (!data) return '正在读取环流资料…'
+  if (!data.available) return data.reason || '此工程没有环流记录，请重新生成。'
+  const current = layer.value === 9
+  const peak = (data.maximum_speed_m_s || 0) * (current ? 100 : 1)
+  const residual = Math.max(0, ...(data.relative_solver_residual || []))
+  return `箭头等长，表示流向；颜色由慢到快，最高约 ${peak.toFixed(1)} ${current ? 'cm/s' : 'm/s'}。${circulationMonth.value === 0 ? '年平均是矢量平均，季节反向流可能抵消。' : ''}${residual > 0.02 ? '环流尚未充分收敛，结果仅供参考。' : ''}`
+})
 let tectonicController: AbortController | undefined
 let tectonicCache: { id: string; data: TectonicDiagnostic } | undefined
 const selectedPlate = computed(() => {
@@ -136,6 +161,19 @@ const selectedPlate = computed(() => {
     plate = data.plates?.find((p) => p.id === id)
   if (!plate) return null
   let v = data.planar_velocities?.[id]
+  if (v && data.motion_grid?.type === 'plane') {
+    const root = data.motion_grid
+    const point = flatProject(
+      root.center_lat,
+      root.center_lon,
+      direction(selection.value!.lat, selection.value!.lon),
+      root.radius_m,
+      root.reference_lat ?? root.center_lat,
+    )
+    const center = data.plate_centers_m?.[id] ?? [0, 0, 0]
+    const spin = data.planar_spin_rad_myr?.[id] ?? 0
+    v = [v[0] - spin * (point[1] - center[1]), v[1] + spin * (point[0] - center[0]), 0]
+  }
   if (!v) {
     const p = direction(selection.value!.lat, selection.value!.lon).map((x) => x * grid.radius_m)
     const a = plate.euler_pole
@@ -146,6 +184,22 @@ const selectedPlate = computed(() => {
   return { id, speed: Math.hypot(...v) * 1e-4 }
 })
 const layers = [
+  {
+    id: 8,
+    name: '风场',
+    icon: '↝',
+    unit: '箭头方向 · 颜色表示相对风速',
+    ends: ['慢', '快'],
+    gradient: 'linear-gradient(90deg,#447dab,#478b79,#b18d45,#ad4f40)',
+  },
+  {
+    id: 9,
+    name: '洋流',
+    icon: '≈',
+    unit: '表层海流 · 颜色表示相对流速',
+    ends: ['慢', '快'],
+    gradient: 'linear-gradient(90deg,#447dab,#478b79,#b18d45,#ad4f40)',
+  },
   {
     id: 7,
     name: '自动分区',
@@ -302,6 +356,10 @@ async function generate() {
       land_fraction: land.value / 100,
       plate_count: plates.value,
       erosion_strength: erosion.value,
+      tectonic_age_myr: evolutionMyr.value,
+      tectonic_step_myr: evolutionStepMyr.value,
+      plate_speed_min_cm_yr: minPlateSpeed.value,
+      plate_speed_max_cm_yr: maxPlateSpeed.value,
       world_shape: worldShape.value,
       allow_land_at_edge: allowLandAtEdge.value,
     })
@@ -384,6 +442,49 @@ async function refreshTectonics() {
       tectonics.value = { available: false, reason: (e as Error).message }
   }
 }
+async function refreshCirculation() {
+  circulationController?.abort()
+  const node = store.currentMap
+  if (!node || !renderer || store.generating || ![8, 9].includes(layer.value)) return
+  const requestedLayer = layer.value
+  const key = `${node.id}:${requestedLayer}:${circulationMonth.value}`
+  const controller = new AbortController()
+  circulationController = controller
+  circulation.value = null
+  renderer.setDiagnostics([])
+  try {
+    const data =
+      circulationCache?.key === key
+        ? circulationCache.data
+        : await api.vectors(
+            node.id,
+            requestedLayer === 8 ? 'wind' : 'current',
+            circulationMonth.value,
+            controller.signal,
+          )
+    if (
+      controller.signal.aborted ||
+      node.id !== store.currentMap?.id ||
+      requestedLayer !== layer.value ||
+      store.generating
+    )
+      return
+    circulationCache = { key, data }
+    circulation.value = data
+    const scale = node.grid?.type === 'sphere' ? 1 : 2 / (node.grid?.width_m || 2)
+    renderer.setDiagnostics((data.groups || []).map((g) => Float32Array.from(g, (v) => v * scale)))
+  } catch (e) {
+    if (
+      !controller.signal.aborted &&
+      node.id === store.currentMap?.id &&
+      requestedLayer === layer.value
+    )
+      circulation.value = { available: false, reason: (e as Error).message }
+  }
+}
+watch(circulationMonth, () => {
+  void refreshCirculation()
+})
 let partitionCache: { key: string; data: ReturnType<typeof partitionBoundaries> } | undefined
 function refreshPartitions() {
   if (!renderer || layer.value !== 7 || store.generating) return
@@ -456,6 +557,7 @@ function applyMap() {
   renderer.setDiagnostics([])
   tectonics.value = null
   if (layer.value === 6) void refreshTectonics()
+  if (layer.value === 8 || layer.value === 9) void refreshCirculation()
   else if (layer.value === 7) {
     refreshPartitions()
     void refreshOverlay()
@@ -504,8 +606,10 @@ watch(layer, (v) => {
     return
   }
   tectonicController?.abort()
+  circulationController?.abort()
   renderer?.setDiagnostics([])
   if (v === 6) void refreshTectonics()
+  else if (v === 8 || v === 9) void refreshCirculation()
   else if (v === 7) {
     refreshPartitions()
     void refreshOverlay()
@@ -720,6 +824,9 @@ const toolCtx: ToolContext = {
       elevation: 4,
       hydrology: 5,
       geography: 7,
+      tectonics: 6,
+      wind: 8,
+      current: 9,
     }
     if (v[key] === undefined) throw new Error('未知图层')
     layer.value = v[key]
@@ -817,6 +924,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   tectonicController?.abort()
+  circulationController?.abort()
   store.dispose()
   renderer?.dispose()
   interaction?.abort()
@@ -1061,8 +1169,59 @@ onBeforeUnmount(() => {
               <p class="muted">关闭后会保留海洋边缘，让大陆海岸完整留在图内。</p>
             </template>
             <label>
-              构造板块数量
+              初始板块数量
               <input v-model.number="plates" type="number" min="8" max="30" required />
+            </label>
+            <label>
+              总演化时间 · 百万年
+              <input
+                v-model.number="evolutionMyr"
+                type="number"
+                min="0"
+                max="4600"
+                step="1"
+                required
+              />
+              <small>4600 百万年 = 46 亿年；长期块体历史与近期精细计算分别记录。</small>
+            </label>
+            <label>
+              历史推进步长 · 百万年
+              <input
+                v-model.number="evolutionStepMyr"
+                type="number"
+                min="0.1"
+                max="50"
+                step="0.1"
+                required
+              />
+              <small>
+                约
+                {{ Math.ceil(evolutionMyr / Math.max(0.1, evolutionStepMyr)) }}
+                个历史间隔；内部自动细分，实时预览保留实际计算时刻。
+              </small>
+            </label>
+            <label>
+              初始板速下限 · 厘米/年
+              <input
+                v-model.number="minPlateSpeed"
+                type="number"
+                min="0"
+                :max="maxPlateSpeed"
+                step="0.1"
+                required
+              />
+            </label>
+            <label>
+              板速上限 · 厘米/年
+              <input
+                v-model.number="maxPlateSpeed"
+                type="number"
+                :min="Math.max(0.1, minPlateSpeed)"
+                max="20"
+                step="0.1"
+                required
+              />
+              <small>相对生成器的固定地幔参考系；旋转板块不同位置的速度不同。</small>
             </label>
             <label>
               侵蚀强度
@@ -1174,6 +1333,21 @@ onBeforeUnmount(() => {
           </p>
           <p v-if="partitionTruncated" class="layer-help">
             边界较多，仅显示部分细线；分区颜色完整保留。
+          </p>
+        </template>
+        <template v-if="layer === 8 || layer === 9">
+          <label class="style-select">
+            时段
+            <select v-model.number="circulationMonth" aria-label="环流月份">
+              <option :value="0">年平均</option>
+              <option v-for="month in 12" :key="month" :value="month">{{ month }} 月</option>
+            </select>
+          </label>
+          <p class="layer-help" role="status">{{ circulationStatus }}</p>
+          <p v-if="layer === 9 && circulation?.available" class="layer-help">
+            风驱表层流近似；{{
+              circulation.heat_coupled ? '已参与海洋热量搬运。' : '局部气候仍以预设值为准。'
+            }}
           </p>
         </template>
         <label class="style-select">

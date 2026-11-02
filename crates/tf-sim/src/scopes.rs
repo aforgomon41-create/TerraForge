@@ -60,6 +60,8 @@ pub fn local_terrain<G: GridOps>(
         partition_seed: params.seed,
         partition_weights: vec![],
         history: Default::default(),
+        planar_spin_rad_myr: None,
+        provinces: Vec::new(),
     }
 }
 pub fn local_climate<G: GridOps>(

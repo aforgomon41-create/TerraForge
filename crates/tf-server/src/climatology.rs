@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use std::io::Read;
 use tf_sim::seasonal::ClimateAtlas;
 
-const MAX_RAW: usize = 16 * 1024 * 1024;
+const MAX_RAW: usize = 32 * 1024 * 1024;
 
 pub fn encode(atlas: &ClimateAtlas) -> anyhow::Result<serde_json::Value> {
     atlas.validate().map_err(anyhow::Error::msg)?;
@@ -70,6 +70,7 @@ mod tests {
             pet_mm: vec![vec![40.; n]; 12],
             energy: Default::default(),
             water: Default::default(),
+            circulation: None,
         }
     }
     #[test]

@@ -353,7 +353,7 @@ pub fn persist_fields<G: tf_grid::GridOps>(
     let biome: Vec<f32> = world.ecology.biome.iter().map(|&b| b as f32).collect();
     let plate: Vec<f32> = f.plate_id.iter().map(|&v| v as f32).collect();
     let soil: Vec<f32> = world.ecology.soil.iter().map(|&b| b as f32).collect();
-    let mut metadata = serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"planar_velocities":world.tectonic.planar_velocities,"motion_domain":if world.tectonic.planar_velocities.is_some() {"plane"} else {"sphere"},"tectonic_history":world.tectonic.history,"generator_version":"tf-0.4"});
+    let mut metadata = serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"planar_velocities":world.tectonic.planar_velocities,"planar_spin_rad_myr":world.tectonic.planar_spin_rad_myr,"plate_centers_m":world.tectonic.centers,"motion_domain":if world.tectonic.planar_velocities.is_some() {"plane"} else {"sphere"},"tectonic_history":world.tectonic.history,"generator_version":"tf-0.5"});
     if let Some(atlas) = &f.climate {
         metadata["climate_atlas"] = crate::climatology::encode(atlas)?;
         metadata["climate_model"] = serde_json::json!({"name":atlas.model,"months":12,"cells":atlas.grid.cell_count(),"energy":atlas.energy,"water":atlas.water,"pet":"Thornthwaite temperature/daylength approximation"});

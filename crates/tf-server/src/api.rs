@@ -51,6 +51,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/worlds/{id}/generate", post(generate_world))
         .route("/api/v1/maps/{id}", get(get_map))
         .route("/api/v1/maps/{id}/field/{channel}", get(get_field))
+        .route(
+            "/api/v1/maps/{id}/vectors/{kind}",
+            get(crate::circulation::get_vectors),
+        )
         .route("/api/v1/maps/{id}/preview", get(get_preview))
         .route("/api/v1/maps/{id}/grid", get(get_grid))
         .route(
