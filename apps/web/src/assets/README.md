@@ -7,5 +7,10 @@
 生成提示词原文：
 
 ```text
-undefined
+Use case: stylized-concept
+Asset type: seamless tileable neutral material texture for a real-time painted atlas shader, square 1024 by 1024.
+Primary request: an evenly lit top-down close-up swatch of fine cold-pressed watercolor paper covered in subtle dry gouache pigment. Soft overlapping short organic brush dabs and very fine paper fibers, beautifully handmade, restrained and uniform rather than blotchy.
+Color palette: monochrome neutral middle gray, average around RGB 128, low contrast mostly RGB 105 to 150, no tinted color.
+Composition: flat material fills entire square, same density to every edge, seamless repeating opposite edges, no focal point, no directional lighting, no vignette, no border.
+Constraints: ONLY an abstract painterly surface swatch. No geography, maps, mountains, trees, rivers, islands, clouds, icons, letters, text, objects, shadows or watermark. Fine detail only, no large dark stains. This is a multiplicative pigment material; geography and lighting are supplied separately by a scientific renderer.
 ```
