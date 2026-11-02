@@ -85,13 +85,15 @@ export function buildTools(ctx: ToolContext): ToolDef[] {
     },
     {
       name: 'set_layer',
-      description: '切换地图图层。',
+      description:
+        '切换地图图层。rendered是自然彩绘总览，terrain是基础地形；其他值是对应的科学图层。',
       parameters: {
         type: 'object',
         properties: {
           layer: {
             type: 'string',
             enum: [
+              'rendered',
               'terrain',
               'temperature',
               'precipitation',

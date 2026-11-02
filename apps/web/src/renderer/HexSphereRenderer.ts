@@ -5,6 +5,9 @@ import { projectedWorldDirection, projectedWorldPoint } from './geometry'
 import { projectionBounds, projectionIndex, type WorldProjection } from './projections'
 import { lookAt, mat4Mul, perspective, cross, dot, norm, type Vec3 } from './math'
 import { frameTextureChannels } from './frameTexture'
+import { createPigmentTexture } from './pigmentTexture'
+import pigmentUrl from '../assets/atlas-pigment.png'
+import { heightGradients } from './relief'
 
 export interface CellData {
   /** 格子中心方向 xyz 交错，长度 = count * 3 */
@@ -61,6 +64,7 @@ export class HexSphereRenderer {
   private instPrecipBuf: WebGLBuffer | null = null
   private instFlowBuf: WebGLBuffer | null = null
   private instLakeBuf: WebGLBuffer | null = null
+  private gradientBuf: WebGLBuffer | null = null
   private geographyBuf: WebGLBuffer | null = null
   private geographySourceIds: Uint32Array | undefined
   private geographyActive = false
@@ -81,14 +85,15 @@ export class HexSphereRenderer {
 
   // 渲染参数
   public style = MapStyle.Parchment
-  /** 当前图层：0=地形 1=温度 2=降水 3=生物群系 4=高程 */
-  public layer = 0
+  /** 默认自然彩绘总览；科学图层可在原图层面板切换。 */
+  public layer = 10
   public radius = 1.0
   public heightScale = 0.00006
 
   /** 实时预览帧纹理。生成过程中用它覆盖真实数据。 */
   private frameTexture: WebGLTexture | null = null
   private flowTexture: WebGLTexture | null = null
+  private pigment: ReturnType<typeof createPigmentTexture> | null = null
   private previewMode = false
   private previewMinElev = 0
   private previewMaxElev = 1
@@ -152,6 +157,7 @@ export class HexSphereRenderer {
 
     this.frameTexture = gl.createTexture()
     this.flowTexture = gl.createTexture()
+    this.pigment = createPigmentTexture(gl, pigmentUrl)
     for (const texture of [this.frameTexture, this.flowTexture]) {
       gl.bindTexture(gl.TEXTURE_2D, texture)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
@@ -346,6 +352,14 @@ export class HexSphereRenderer {
       gl.vertexAttribPointer(7, 3, gl.FLOAT, false, 0, 0)
     }
     this.instHeightBuf = upload(1, channel(data.heights), 1, this.instHeightBuf)
+    const gradient = heightGradients(data.centers, data.indices, data.heights)
+    const remappedGradient = sourceIds
+      ? Float32Array.from(
+          { length: sourceIds.length * 3 },
+          (_, i) => gradient[sourceIds[Math.floor(i / 3)] * 3 + (i % 3)],
+        )
+      : gradient
+    this.gradientBuf = upload(11, remappedGradient, 3, this.gradientBuf)
     this.instBiomeBuf = upload(2, channel(data.biomes), 1, this.instBiomeBuf)
     this.instTempBuf = upload(4, channel(data.temperatures), 1, this.instTempBuf)
     this.instPrecipBuf = upload(5, channel(data.precipitations), 1, this.instPrecipBuf)
@@ -551,6 +565,8 @@ export class HexSphereRenderer {
     if (this.lineProgram) gl.deleteProgram(this.lineProgram)
     if (this.frameTexture) gl.deleteTexture(this.frameTexture)
     if (this.flowTexture) gl.deleteTexture(this.flowTexture)
+    this.pigment?.dispose()
+    this.pigment = null
     for (const b of [
       this.indexBuf,
       this.lineBuf,
@@ -563,6 +579,7 @@ export class HexSphereRenderer {
       this.instPrecipBuf,
       this.instFlowBuf,
       this.instLakeBuf,
+      this.gradientBuf,
       this.instPlateBuf,
       this.geographyBuf,
       this.partitionBuf,
@@ -680,6 +697,10 @@ export class HexSphereRenderer {
     gl.uniform1i(u('uStyle'), this.style)
     gl.uniform1i(u('uLayer'), this.layer)
     gl.uniform1i(u('uGeographyActive'), this.geographyActive ? 1 : 0)
+    gl.activeTexture(gl.TEXTURE2)
+    gl.bindTexture(gl.TEXTURE_2D, this.pigment?.texture || null)
+    gl.uniform1i(u('uPigmentTex'), 2)
+    gl.activeTexture(gl.TEXTURE0)
 
     // 预览模式：绑定帧纹理
     gl.uniform1i(u('uPreviewMode'), this.previewMode ? 1 : 0)
@@ -744,7 +765,7 @@ export class HexSphereRenderer {
           gl.uniform4fv(
             lu('uColor'),
             this.layer === 10
-              ? [0.19, 0.43, 0.49, 0.82]
+              ? [0.18, 0.46, 0.57, 0.84]
               : this.layer === 7
                 ? [0.22, 0.29, 0.24, 0.8]
                 : colors[index] || colors[3],

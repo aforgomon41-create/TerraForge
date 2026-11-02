@@ -107,7 +107,7 @@ watch(startScope, (scope) => {
   erosion.value = 1
 })
 const style = ref(MapStyle.Parchment),
-  layer = ref(0),
+  layer = ref(10),
   notice = ref(''),
   ready = ref(false),
   busy = ref(false),
@@ -227,7 +227,7 @@ const layers = [
     id: 10,
     name: '渲染地图',
     icon: '▰',
-    unit: '高度 · 地貌 · 生态 · 河流湖泊',
+    unit: '自然彩绘 · 高度 · 生态 · 水系',
     ends: ['海洋', '低地', '山地'],
     gradient: 'linear-gradient(90deg,#315e70,#9ebdb0,#7d9966,#d7ccad)',
   },
@@ -927,6 +927,7 @@ const toolCtx: ToolContext = {
       tectonics: 6,
       wind: 8,
       current: 9,
+      rendered: 10,
     }
     if (v[key] === undefined) throw new Error('未知图层')
     layer.value = v[key]
@@ -940,6 +941,7 @@ const toolCtx: ToolContext = {
     }
     if (v[key] === undefined) throw new Error('未知风格')
     style.value = v[key]
+    layer.value = 0
   },
 }
 function leave(e: PageTransitionEvent) {
@@ -1605,8 +1607,8 @@ onBeforeUnmount(() => {
               : actualDisplaySpacing.toFixed(1) + ' m'
           }}
         </small>
-        <label class="style-select">
-          地图笔触
+        <label v-if="layer === 0" class="style-select">
+          地形图笔触
           <select v-model.number="style" aria-label="地图视觉风格">
             <option :value="MapStyle.Parchment">纸张地形</option>
             <option :value="MapStyle.Realistic">自然设色</option>
@@ -1805,7 +1807,7 @@ onBeforeUnmount(() => {
                 ? `世界展开 · ${projections.find((p) => p.id === worldProjection)?.label}`
                 : '球面视图 · 拖动旋转'
         }}
-        · {{ style === 2 ? '纸张地形' : '地理地图' }}
+        · {{ layer === 10 ? '自然彩绘' : layer === 0 && style === 2 ? '纸张地形' : '地理地图' }}
       </small>
     </div>
     <section

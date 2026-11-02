@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -27,7 +28,14 @@ def main():
     parser.add_argument('--base', default='http://127.0.0.1:18798/terraforge')
     parser.add_argument('--project', required=True)
     parser.add_argument('--out', required=True)
+    parser.add_argument('--view', default='equirectangular', choices=['globe','equirectangular','mercator','mollweide','equal-earth'])
+    parser.add_argument('--width', type=int, default=2048)
+    parser.add_argument('--zoom', type=float, default=1.)
+    parser.add_argument('--center', nargs=2, type=float, default=[0.,0.])
+    parser.add_argument('--material-fallback', action='store_true')
     args = parser.parse_args()
+    if not 64 <= args.width <= 8192 or not 0.5 <= args.zoom <= 30:
+        parser.error('width must be 64..8192 and zoom must be 0.5..30')
     root = Path(__file__).resolve().parent.parent
     out = Path(args.out).resolve(); out.mkdir(parents=True, exist_ok=True)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -54,6 +62,10 @@ def main():
         maps = call('/worlds/'+imported['id']+'/maps')
         node = next(m for m in maps if m['parent'] is None)
         source_map = next(m for m in project['maps'] if m['node']['parent'] is None)
+        decoder = zstandard.ZstdDecompressor()
+        field = source_map['channels']['elevation']
+        elevation_bytes = decoder.decompress(base64.b64decode(field['data']),max_output_size=field['count']*4)
+        (out/'elevation.bin').write_bytes(elevation_bytes)
         surface = call('/maps/'+node['id']+'/surface', binary=True)
         (out/'surface.bin').write_bytes(surface)
         water = call('/maps/'+node['id']+'/hydrology')
@@ -62,32 +74,48 @@ def main():
         bundle="""import {createRequire} from 'node:module';
 const [root,out]=process.argv.slice(1);const req=createRequire(root+'/apps/web/package.json');
 const local=createRequire(req.resolve('vite/package.json'));const {build}=local('esbuild');
-await build({entryPoints:[root+'/apps/web/src/renderer/surface.ts'],bundle:true,platform:'node',format:'esm',outfile:out+'/surface.mjs'});"""
+await build({stdin:{contents:"export * from './surface.ts'; export * from './math.ts'; export * from './projections.ts'; export * from './relief.ts';",resolveDir:root+'/apps/web/src/renderer'},bundle:true,platform:'node',format:'esm',outfile:out+'/surface.mjs'});"""
         subprocess.run([node_exe,'--input-type=module','-e',bundle,str(root),str(out)],check=True)
         javascript = """
 import fs from 'node:fs'; import {pathToFileURL} from 'node:url';
-const [directory,spherical]=process.argv.slice(1);
+const [directory,spherical,view,normalization]=process.argv.slice(1);
 const geometry=await import(pathToFileURL(directory+'/surface.mjs').href);
 const bytes=fs.readFileSync(directory+'/surface.bin');
-const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
-const n=view.getUint32(4,true),tri=view.getUint32(8,true);
+const surfaceView=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+const n=surfaceView.getUint32(4,true);
 const centers=new Float32Array(bytes.buffer.slice(bytes.byteOffset+12,bytes.byteOffset+12+12*n));
 const indices=new Uint32Array(bytes.buffer.slice(bytes.byteOffset+12+12*n));
-const atlas=spherical==='true'?geometry.atlasSurface(centers,indices):{positions:centers,indices,sourceIds:Uint32Array.from({length:n},(_,i)=>i)};
+const flat=spherical==='true'&&view!=='globe';
+const atlas=flat?geometry.atlasSurface(centers,indices):{positions:centers,indices,sourceIds:Uint32Array.from({length:n},(_,i)=>i)};
+const h=fs.readFileSync(directory+'/elevation.bin');
+const heights=new Float32Array(h.buffer.slice(h.byteOffset,h.byteOffset+h.byteLength));
+const gradient=geometry.heightGradients(Float32Array.from(centers,v=>v*Number(normalization)),indices,heights);
+const mappedGradient=Float32Array.from({length:atlas.sourceIds.length*3},(_,i)=>gradient[atlas.sourceIds[Math.floor(i/3)]*3+i%3]);
+fs.writeFileSync(directory+'/gradients.bin',Buffer.from(mappedGradient.buffer));
+fs.writeFileSync(directory+'/geoPositions.bin',Buffer.from(atlas.positions.buffer));
+if(flat)atlas.positions=geometry.projectAtlasPositions(atlas.positions,view);
 for(const name of ['positions','indices','sourceIds'])fs.writeFileSync(directory+'/'+name+'.bin',Buffer.from(atlas[name].buffer));
 const water=JSON.parse(fs.readFileSync(directory+'/water.json','utf8'));
 const lines=Float32Array.from(water.groups?.[0]||[]);
-fs.writeFileSync(directory+'/rivers.bin',Buffer.from((spherical==='true'?geometry.atlasLines(lines):lines).buffer));
+const riverGeo=flat?geometry.atlasLines(lines):lines;
+fs.writeFileSync(directory+'/riverGeo.bin',Buffer.from(riverGeo.buffer));
+fs.writeFileSync(directory+'/rivers.bin',Buffer.from((flat?geometry.projectAtlasPositions(riverGeo,view):riverGeo).buffer));
+const eye=[0,Math.sin(.35)*3.2,Math.cos(.35)*3.2];
+fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.projectionBounds(view),projection:geometry.projectionIndex(view),matrix:Array.from(geometry.mat4Mul(geometry.perspective(Math.PI/4,1,.01,100),geometry.lookAt(eye,[0,0,0],[0,1,0])))}));
 """
         sphere = node['grid']['type']=='sphere'
-        subprocess.run([node_exe,'--input-type=module','-e',javascript,str(out),str(sphere).lower()],check=True)
+        globe = sphere and args.view == 'globe'
+        atlas = sphere and not globe
+        subprocess.run([node_exe,'--input-type=module','-e',javascript,str(out),str(sphere).lower(),args.view,str(1 if sphere else 2/node['grid']['width_m'])],check=True)
         positions = np.fromfile(out/'positions.bin',dtype='<f4').reshape(-1,3)
         source_ids = np.fromfile(out/'sourceIds.bin',dtype='<u4')
         indices = np.fromfile(out/'indices.bin',dtype='<u4')
         rivers = np.fromfile(out/'rivers.bin',dtype='<f4').reshape(-1,3)
+        river_geo = np.fromfile(out/'riverGeo.bin',dtype='<f4').reshape(-1,3)
+        geo_positions = np.fromfile(out/'geoPositions.bin',dtype='<f4').reshape(-1,3)
+        camera = json.loads((out/'camera.json').read_text())
         if not sphere:
             positions *= 2/node['grid']['width_m']; rivers *= 2/node['grid']['width_m']
-        decoder = zstandard.ZstdDecompressor()
         def channel(name):
             field = source_map['channels'].get(name)
             if field is None: return np.zeros(len(source_ids),dtype='f4')
@@ -99,21 +127,39 @@ fs.writeFileSync(directory+'/rivers.bin',Buffer.from((spherical==='true'?geometr
         ctx = moderngl.create_standalone_context(require=330)
         program = ctx.program(vertex_shader=shaders['VERT'],fragment_shader=shaders['FRAG'])
         line = ctx.program(vertex_shader=shaders['LINE_VERT'],fragment_shader=shaders['LINE_FRAG'])
-        width,height=2048,(1024 if sphere else round(2048*node['grid']['rows']/node['grid']['size']*3**.5/2))
+        pigment_path = root/'apps/web/src/assets/atlas-pigment.png'
+        pigment_image = Image.new('RGB',(1,1),(141,141,141)) if args.material_fallback else Image.open(pigment_path).convert('RGB')
+        pigment = ctx.texture(pigment_image.size,3,pigment_image.tobytes(),alignment=1)
+        pigment.build_mipmaps(); pigment.filter=(moderngl.LINEAR_MIPMAP_LINEAR,moderngl.LINEAR)
+        # Desktop GL sampler mirrored repeat, matching WebGL2's material loader.
+        # ModernGL's public repeat flags expose REPEAT only; use ctypes for MIRRORED_REPEAT.
+        import ctypes
+        import ctypes.util
+        native_gl=ctypes.WinDLL('opengl32') if sys.platform=='win32' else ctypes.CDLL(ctypes.util.find_library('GL'))
+        native_gl.glBindTexture(0x0DE1,pigment.glo)
+        native_gl.glTexParameteri(0x0DE1,0x2802,0x8370);native_gl.glTexParameteri(0x0DE1,0x2803,0x8370)
+        pigment.use(2);program['uPigmentTex'].value=2
+        width=args.width
+        height=width if globe else (round(width*camera['bounds']['height']/2) if atlas else round(width*node['grid']['rows']/node['grid']['size']*3**.5/2))
         frame = ctx.simple_framebuffer((width,height),components=3); frame.use()
         aspect=width/height
-        matrix=np.diag([.5 if sphere else 1.,1. if sphere else aspect,1.,1.]).astype('f4')
+        matrix=np.array(camera['matrix'],dtype='f4') if globe else np.diag([.5 if atlas else 1.,1./camera['bounds']['height'] if atlas else aspect,1.,1.]).astype('f4')
+        if not globe:
+            matrix[0,0]*=args.zoom;matrix[1,1]*=args.zoom
+            matrix[3,0]=-args.center[0]*matrix[0,0];matrix[3,1]=-args.center[1]*matrix[1,1]
         program['uViewProj'].write(matrix.tobytes())
         uniforms={'uRadius':1.,'uHeightScale':.00001,'uMapMetres':node['grid'].get('radius_m') if sphere else node['grid']['width_m']/2,
-                  'uPlanarMode':True,'uWorldFlatMode':sphere,'uProjection':0,'uPreviewMode':False,'uStyle':2,'uGeographyActive':False,
+                  'uPlanarMode':not globe,'uWorldFlatMode':atlas,'uProjection':camera['projection'],'uPreviewMode':False,'uStyle':2,'uGeographyActive':False,
                   'uLightDir':(-.45,.55,.7)}
         for name,value in uniforms.items():
             if name in program: program[name].value=value
         buffers=[]; content=[]
-        attributes={'aCenter':positions,'aAtlasPosition':positions,'aHeight':channel('elevation'),'aBiome':channel('biome'),
+        attributes={'aCenter':positions,'aAtlasPosition':geo_positions,'aHeight':channel('elevation'),'aBiome':channel('biome'),
+                    'aHeightGradient':np.fromfile(out/'gradients.bin',dtype='<f4').reshape(-1,3),
                     'aPlate':channel('plate_id'),'aTemperature':channel('temperature'),'aPrecipitation':channel('precipitation'),
                     'aFlow':channel('flow_accumulation'),'aLake':channel('lake_depth'),
                     'aGeography':np.zeros(len(source_ids),dtype='f4'),'aPartition':np.zeros(len(source_ids),dtype='f4')}
+        program['uHeightScale'].value=.025/max(float(attributes['aHeight'].max()),1.)
         for name,values in attributes.items():
             if name not in program: continue
             buffer=ctx.buffer(values.astype('f4').tobytes());buffers.append(buffer)
@@ -123,18 +169,26 @@ fs.writeFileSync(directory+'/rivers.bin',Buffer.from((spherical==='true'?geometr
         river_vao=None
         if len(rivers):
             river_buffer=ctx.buffer(rivers.astype('f4').tobytes())
-            river_vao=ctx.vertex_array(line,[(river_buffer,'3f','aPosition'),(river_buffer,'3f','aAtlasPosition')])
+            river_geo_buffer=ctx.buffer(river_geo.astype('f4').tobytes())
+            river_vao=ctx.vertex_array(line,[(river_buffer,'3f','aPosition'),(river_geo_buffer,'3f','aAtlasPosition')])
             line['uViewProj'].write(matrix.tobytes())
-            for name,value in {'uSphere':False,'uWorldFlatMode':sphere,'uProjection':0,'uEye':(0.,0.,3.),'uRadius':1.,'uColor':(.19,.43,.49,.82)}.items():
+            for name,value in {'uSphere':globe,'uWorldFlatMode':atlas,'uProjection':camera['projection'],'uEye':tuple(camera['eye']),'uRadius':1.,'uColor':(.18,.46,.57,.84)}.items():
                 if name in line: line[name].value=value
         for layer,label in [(0,'terrain'),(4,'elevation'),(10,'game')]:
             frame.clear(.96,.95,.91)
+            ctx.enable(moderngl.DEPTH_TEST)
             program['uLayer'].value=layer;vao.render(moderngl.TRIANGLES)
             if layer==10 and river_vao:
+                ctx.disable(moderngl.DEPTH_TEST)
                 ctx.enable(moderngl.BLEND);river_vao.render(moderngl.LINES);ctx.disable(moderngl.BLEND)
             image=Image.frombytes('RGB',(width,height),frame.read(components=3)).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
             image.save(out/(label+'.png'))
+        gl_error = ctx.error
+        if gl_error != 'GL_NO_ERROR': raise RuntimeError(gl_error)
         report={'result':'passed','exact_es300_sources':True,'browser_ui_checked':False,'renderer':ctx.info['GL_RENDERER'],
+                'view':args.view if sphere else 'plane','pixels':[width,height],'material_fallback':args.material_fallback,
+                'zoom':args.zoom,'center':args.center,
+                'material_sha256':hashlib.sha256(pigment_path.read_bytes()).hexdigest(),'gl_error':gl_error,
                 'cells':node['cells'],'river_segments':len(rivers)//2,'shader_sha256':hashlib.sha256(shader_source.encode()).hexdigest(),
                 'project_sha256':hashlib.sha256(project_bytes).hexdigest()}
         (out/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf8')
