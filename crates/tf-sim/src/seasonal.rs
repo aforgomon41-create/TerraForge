@@ -541,6 +541,16 @@ impl ClimateAtlas {
                     .iter()
                     .any(|v| !v.is_finite() || *v < 0.)
                 || c.solver_iterations.len() != 12
+                || (!c.current_velocity_scale.is_empty()
+                    && (c.current_velocity_scale.len() != 12
+                        || c.current_velocity_scale
+                            .iter()
+                            .any(|x| !x.is_finite() || *x <= 0. || *x > 1.)))
+                || (!c.forcing_wind_rms_difference_m_s.is_empty()
+                    && (c.forcing_wind_rms_difference_m_s.len() != 12
+                        || c.forcing_wind_rms_difference_m_s
+                            .iter()
+                            .any(|x| !x.is_finite() || *x < 0.)))
             {
                 return Err("环流诊断资料无效".into());
             }

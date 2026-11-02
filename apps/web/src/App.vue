@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ref, shallowRef, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, shallowRef, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useWorldStore } from '@/stores/world'
 import {
   api,
   type MapNode,
   type TectonicDiagnostic,
   type CirculationDiagnostic,
+  type HydrologyDiagnostic,
 } from '@/api/client'
 import { HexSphereRenderer, MapStyle } from '@/renderer/HexSphereRenderer'
 import { buildSphereGrid } from '@/renderer/sphereGrid'
@@ -18,6 +19,17 @@ import { projections, type WorldProjection } from '@/renderer/projections'
 import type { ToolContext } from '@/agent/tools'
 import { flatDirection, flatProject } from '@/renderer/geometry'
 import { parseSeed } from '@/generation/seed'
+import {
+  defaults,
+  scopeDefaults,
+  scopeParameters,
+  extentFields,
+  terrainFields,
+  weatherFields,
+  localFields,
+  planetFields,
+  type StartScope,
+} from '@/generation/options'
 import MapTree from '@/components/MapTree.vue'
 import FeatureTree from '@/components/FeatureTree.vue'
 import { featureKinds, featureMask, featuresAt } from '@/geography/catalog'
@@ -83,6 +95,17 @@ const name = ref('Aetheria'),
   maxPlateSpeed = ref(12),
   worldShape = ref<'sphere' | 'plane'>('sphere'),
   allowLandAtEdge = ref(true)
+const startScope = ref<StartScope>('world'),
+  options = reactive({ ...defaults }),
+  landscape = ref('hills'),
+  monsoon = ref(true),
+  glacier = ref(true)
+const localScope = computed(() => startScope.value === 'region' || startScope.value === 'site')
+watch(startScope, (scope) => {
+  Object.assign(options, scopeDefaults(scope))
+  land.value = scope === 'continent' ? 65 : 29
+  erosion.value = 1
+})
 const style = ref(MapStyle.Parchment),
   layer = ref(0),
   notice = ref(''),
@@ -137,6 +160,9 @@ const biomes = [
 ]
 const tectonics = ref<TectonicDiagnostic | null>(null)
 const circulation = ref<CirculationDiagnostic | null>(null)
+const hydrology = ref<HydrologyDiagnostic | null>(null)
+let hydrologyController: AbortController | undefined
+let hydrologyCache: { id: string; data: HydrologyDiagnostic } | undefined
 const circulationMonth = ref(0)
 let circulationController: AbortController | undefined
 let circulationCache: { key: string; data: CirculationDiagnostic } | undefined
@@ -148,7 +174,8 @@ const circulationStatus = computed(() => {
   const current = layer.value === 9
   const peak = (data.maximum_speed_m_s || 0) * (current ? 100 : 1)
   const residual = Math.max(0, ...(data.relative_solver_residual || []))
-  return `箭头等长，表示流向；颜色由慢到快，最高约 ${peak.toFixed(1)} ${current ? 'cm/s' : 'm/s'}。${circulationMonth.value === 0 ? '年平均是矢量平均，季节反向流可能抵消。' : ''}${residual > 0.02 ? '环流尚未充分收敛，结果仅供参考。' : ''}`
+  const scale = Math.min(1, ...(data.current_velocity_scale || []))
+  return `箭头等长，表示流向；颜色由慢到快，最高约 ${peak.toFixed(1)} ${current ? 'cm/s' : 'm/s'}。${circulationMonth.value === 0 ? '年平均是矢量平均，季节反向流可能抵消。' : ''}${residual > 0.02 ? '环流尚未充分收敛，结果仅供参考。' : ''}${current ? '风驱表层流近似，采用一次滞后热量反馈。' : ''}${current && scale < 0.999 ? `部分月份速度整体缩放至 ${(scale * 100).toFixed(0)}%，残差对应缩放前方程。` : ''}`
 })
 let tectonicController: AbortController | undefined
 let tectonicCache: { id: string; data: TectonicDiagnostic } | undefined
@@ -181,9 +208,29 @@ const selectedPlate = computed(() => {
       (x) => x * plate.omega,
     )
   }
-  return { id, speed: Math.hypot(...v) * 1e-4 }
+  const uid = data.lifecycle?.slot_uids[id] ?? id
+  const identity = data.lifecycle?.identities.find((item) => item.uid === uid)
+  return { id: uid, speed: Math.hypot(...v) * 1e-4, identity }
+})
+const plateStatus = computed(() => {
+  if (!tectonics.value?.available) return tectonics.value?.reason || '正在读取板块记录…'
+  const life = tectonics.value.lifecycle
+  if (!life?.identities.length)
+    return '箭头等长，仅表示方向；点击地图查看 cm/年。旧工程没有板块生灭记录。'
+  const active = life.identities.filter((p) => p.status === 'active').length
+  const births = life.identities.filter((p) => p.parent_uid !== null).length
+  const ended = life.identities.filter((p) => p.ended_myr !== null).length
+  return `当前 ${active} 块；演化中新生 ${births} 块，终止 ${ended} 块。箭头等长；点击查看速度、身份与面积。${life.capacity_limited_events ? '板块计算容量达到上限，部分细小分裂未解析。' : ''}`
 })
 const layers = [
+  {
+    id: 10,
+    name: '渲染地图',
+    icon: '▰',
+    unit: '高度 · 地貌 · 生态 · 河流湖泊',
+    ends: ['海洋', '低地', '山地'],
+    gradient: 'linear-gradient(90deg,#315e70,#9ebdb0,#7d9966,#d7ccad)',
+  },
   {
     id: 8,
     name: '风场',
@@ -351,18 +398,28 @@ function randomSeed() {
 async function generate() {
   await guard(async () => {
     const n = parseSeed(seed.value)
-    if (!name.value.trim()) throw new Error('请填写世界名称')
-    await store.createWorld(name.value.trim(), n, {
-      land_fraction: land.value / 100,
-      plate_count: plates.value,
-      erosion_strength: erosion.value,
-      tectonic_age_myr: evolutionMyr.value,
-      tectonic_step_myr: evolutionStepMyr.value,
-      plate_speed_min_cm_yr: minPlateSpeed.value,
-      plate_speed_max_cm_yr: maxPlateSpeed.value,
-      world_shape: worldShape.value,
-      allow_land_at_edge: allowLandAtEdge.value,
-    })
+    if (!name.value.trim()) throw new Error('请填写地图名称')
+    const parameters = scopeParameters(
+      startScope.value,
+      worldShape.value,
+      options,
+      landscape.value,
+      monsoon.value,
+      glacier.value,
+    )
+    Object.assign(parameters, { erosion_strength: erosion.value })
+    if (!localScope.value)
+      Object.assign(parameters, {
+        land_fraction: land.value / 100,
+        plate_count: plates.value,
+        erosion_strength: erosion.value,
+        tectonic_age_myr: evolutionMyr.value,
+        tectonic_step_myr: evolutionStepMyr.value,
+        plate_speed_min_cm_yr: minPlateSpeed.value,
+        plate_speed_max_cm_yr: maxPlateSpeed.value,
+        allow_land_at_edge: allowLandAtEdge.value,
+      })
+    await store.createWorld(name.value.trim(), n, parameters)
     tab.value = 'tree'
     await store.generate(store.current!.id)
   })
@@ -440,6 +497,33 @@ async function refreshTectonics() {
       (e as Error).name !== 'AbortError'
     )
       tectonics.value = { available: false, reason: (e as Error).message }
+  }
+}
+async function refreshHydrology() {
+  hydrologyController?.abort()
+  const node = store.currentMap
+  if (!node || !renderer) return
+  const controller = new AbortController()
+  hydrologyController = controller
+  try {
+    const data =
+      hydrologyCache?.id === node.id
+        ? hydrologyCache.data
+        : await api.hydrology(node.id, controller.signal)
+    if (
+      controller.signal.aborted ||
+      store.generating ||
+      layer.value !== 10 ||
+      store.currentMap?.id !== node.id
+    )
+      return
+    hydrologyCache = { id: node.id, data }
+    hydrology.value = data
+    const scale = node.grid?.type === 'sphere' ? 1 : 2 / (node.grid?.width_m || 2)
+    renderer.setDiagnostics((data.groups || []).map((g) => Float32Array.from(g, (v) => v * scale)))
+  } catch (e) {
+    if (!controller.signal.aborted && (e as Error).name !== 'AbortError')
+      hydrology.value = { available: false, reason: (e as Error).message }
   }
 }
 async function refreshCirculation() {
@@ -548,6 +632,7 @@ function applyMap() {
     temperatures: store.temperature || undefined,
     precipitations: store.precipitation || undefined,
     flows: store.flow || undefined,
+    lakeDepths: store.lakeDepth || undefined,
     plateIds: store.plateIds || undefined,
     count: node.cells,
   })
@@ -556,6 +641,8 @@ function applyMap() {
   renderer.setOverlay(new Float32Array())
   renderer.setDiagnostics([])
   tectonics.value = null
+  hydrology.value = null
+  if (layer.value === 10) void refreshHydrology()
   if (layer.value === 6) void refreshTectonics()
   if (layer.value === 8 || layer.value === 9) void refreshCirculation()
   else if (layer.value === 7) {
@@ -607,8 +694,10 @@ watch(layer, (v) => {
   }
   tectonicController?.abort()
   circulationController?.abort()
+  hydrologyController?.abort()
   renderer?.setDiagnostics([])
   if (v === 6) void refreshTectonics()
+  else if (v === 10) void refreshHydrology()
   else if (v === 8 || v === 9) void refreshCirculation()
   else if (v === 7) {
     refreshPartitions()
@@ -749,6 +838,17 @@ async function exportFile(format: 'png' | 'json') {
   busy.value = true
   loadLabel.value = format === 'png' ? '正在绘制地图…' : '正在保存完整工程…'
   try {
+    if (format === 'png' && layer.value === 10 && renderer) {
+      if (!hydrology.value) await refreshHydrology()
+      const blob = await renderer.capturePng(),
+        url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = (store.current?.name || 'TerraForge') + '-渲染视图.png'
+      link.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      return
+    }
     await api.download(
       store.currentMap.id,
       format,
@@ -923,6 +1023,7 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
+  hydrologyController?.abort()
   tectonicController?.abort()
   circulationController?.abort()
   store.dispose()
@@ -1014,7 +1115,7 @@ onBeforeUnmount(() => {
           保存工程
         </button>
         <button :disabled="locked || !hasMap" @click="guard(() => exportFile('png'))">
-          导出地图 ↗
+          {{ layer === 10 ? '导出渲染视图 ↗' : '导出地图 ↗' }}
         </button>
         <button
           class="ai-button"
@@ -1124,7 +1225,25 @@ onBeforeUnmount(() => {
             <p>设定起点，观察地形与气候如何成形。</p>
           </div>
           <label>
-            世界名称
+            起始范围
+            <select v-model="startScope">
+              <option value="world">世界</option>
+              <option value="continent">独立大陆</option>
+              <option value="region">独立区域</option>
+              <option value="site">独立地点</option>
+            </select>
+            <small>
+              {{
+                localScope
+                  ? '直接生成局部地貌，使用指定的温度和降雨背景。'
+                  : startScope === 'continent'
+                    ? '以一块主要大陆为目标，设置海岸、内陆与构造。'
+                    : '生成完整星球或独立平面世界。'
+              }}
+            </small>
+          </label>
+          <label>
+            地图名称
             <input v-model="name" maxlength="80" required placeholder="给这颗世界起个名字" />
           </label>
           <label>
@@ -1143,7 +1262,7 @@ onBeforeUnmount(() => {
               <template v-if="store.current">当前工程种子：{{ store.current.seed }}</template>
             </small>
           </label>
-          <label class="range-label">
+          <label v-if="!localScope" class="range-label">
             目标陆地占比
             <b>{{ land }}%</b>
             <input v-model.number="land" type="range" min="5" max="90" step="1" />
@@ -1152,80 +1271,178 @@ onBeforeUnmount(() => {
               <small>辽阔大陆</small>
             </span>
           </label>
-          <details>
+          <details :open="localScope">
             <summary>更多生成参数</summary>
-            <label>
+            <label v-if="startScope === 'world'">
               世界形态
               <select v-model="worldShape">
                 <option value="sphere">球形世界</option>
                 <option value="plane">平面世界</option>
               </select>
             </label>
-            <template v-if="worldShape === 'plane'">
+            <template v-if="!localScope && (startScope === 'continent' || worldShape === 'plane')">
               <label class="check-label">
                 <input v-model="allowLandAtEdge" type="checkbox" />
                 允许陆地被地图边缘截断
               </label>
               <p class="muted">关闭后会保留海洋边缘，让大陆海岸完整留在图内。</p>
             </template>
-            <label>
-              初始板块数量
-              <input v-model.number="plates" type="number" min="8" max="30" required />
-            </label>
-            <label>
-              总演化时间 · 百万年
-              <input
-                v-model.number="evolutionMyr"
-                type="number"
-                min="0"
-                max="4600"
-                step="1"
-                required
-              />
-              <small>4600 百万年 = 46 亿年；长期块体历史与近期精细计算分别记录。</small>
-            </label>
-            <label>
-              历史推进步长 · 百万年
-              <input
-                v-model.number="evolutionStepMyr"
-                type="number"
-                min="0.1"
-                max="50"
-                step="0.1"
-                required
-              />
-              <small>
-                约
-                {{ Math.ceil(evolutionMyr / Math.max(0.1, evolutionStepMyr)) }}
-                个历史间隔；内部自动细分，实时预览保留实际计算时刻。
-              </small>
-            </label>
-            <label>
-              初始板速下限 · 厘米/年
-              <input
-                v-model.number="minPlateSpeed"
-                type="number"
-                min="0"
-                :max="maxPlateSpeed"
-                step="0.1"
-                required
-              />
-            </label>
-            <label>
-              板速上限 · 厘米/年
-              <input
-                v-model.number="maxPlateSpeed"
-                type="number"
-                :min="Math.max(0.1, minPlateSpeed)"
-                max="20"
-                step="0.1"
-                required
-              />
-              <small>相对生成器的固定地幔参考系；旋转板块不同位置的速度不同。</small>
-            </label>
+            <template v-if="startScope !== 'world' || worldShape === 'plane'">
+              <label v-for="field in extentFields" :key="field.key">
+                {{ field.label }}
+                <input
+                  v-model.number="options[field.key]"
+                  type="number"
+                  :min="field.min"
+                  :max="field.max"
+                  :step="field.step"
+                  required
+                />
+              </label>
+            </template>
+            <template v-if="localScope">
+              <label>
+                主要地貌
+                <select v-model="landscape">
+                  <option value="hills">丘陵</option>
+                  <option value="mountains">山地</option>
+                  <option value="plains">平原</option>
+                  <option value="valley">河谷</option>
+                  <option value="coast">海岸</option>
+                </select>
+              </label>
+              <label v-for="field in localFields" :key="field.key">
+                {{ field.label }}
+                <input
+                  v-model.number="options[field.key]"
+                  type="number"
+                  :min="field.min"
+                  :max="field.max"
+                  :step="field.step"
+                  required
+                />
+              </label>
+              <p class="muted">
+                {{
+                  startScope === 'site'
+                    ? '地点采用更小的默认范围与起伏；适合河谷、营地等局部场景。'
+                    : '区域会形成局部山谷与流域；更改基准温度不会生成另一颗星球。'
+                }}
+              </p>
+            </template>
+            <template v-if="!localScope">
+              <label>
+                初始板块数量
+                <input v-model.number="plates" type="number" min="8" max="30" required />
+              </label>
+              <label>
+                总演化时间 · 百万年
+                <input
+                  v-model.number="evolutionMyr"
+                  type="number"
+                  min="0"
+                  max="4600"
+                  step="1"
+                  required
+                />
+                <small>4600 百万年 = 46 亿年；长期块体历史与近期精细计算分别记录。</small>
+              </label>
+              <label>
+                历史推进步长 · 百万年
+                <input
+                  v-model.number="evolutionStepMyr"
+                  type="number"
+                  min="0.1"
+                  max="50"
+                  step="0.1"
+                  required
+                />
+                <small>
+                  约
+                  {{ Math.ceil(evolutionMyr / Math.max(0.1, evolutionStepMyr)) }}
+                  个历史间隔；内部自动细分，实时预览保留实际计算时刻。
+                </small>
+              </label>
+              <label>
+                初始板速下限 · 厘米/年
+                <input
+                  v-model.number="minPlateSpeed"
+                  type="number"
+                  min="0"
+                  :max="maxPlateSpeed"
+                  step="0.1"
+                  required
+                />
+              </label>
+              <label>
+                板速上限 · 厘米/年
+                <input
+                  v-model.number="maxPlateSpeed"
+                  type="number"
+                  :min="Math.max(0.1, minPlateSpeed)"
+                  max="20"
+                  step="0.1"
+                  required
+                />
+                <small>相对生成器的固定地幔参考系；旋转板块不同位置的速度不同。</small>
+              </label>
+              <label v-for="field in terrainFields" :key="field.key">
+                {{ field.label }}
+                <input
+                  v-model.number="options[field.key]"
+                  type="number"
+                  :min="field.min"
+                  :max="field.max"
+                  :step="field.step"
+                  required
+                />
+              </label>
+              <label v-for="field in weatherFields" :key="field.key">
+                {{ field.label }}
+                <input
+                  v-model.number="options[field.key]"
+                  type="number"
+                  :min="field.min"
+                  :max="field.max"
+                  :step="field.step"
+                  required
+                />
+              </label>
+              <label class="check-label">
+                <input v-model="monsoon" type="checkbox" />
+                季风与季节差异
+              </label>
+            </template>
             <label>
               侵蚀强度
               <input v-model.number="erosion" type="number" min="0" max="2" step="0.1" required />
+            </label>
+            <label class="check-label">
+              <input v-model="glacier" type="checkbox" />
+              冰川侵蚀
+            </label>
+            <label v-if="startScope === 'world'" v-for="field in planetFields" :key="field.key">
+              {{ field.label }}
+              <input
+                v-model.number="options[field.key]"
+                type="number"
+                :min="field.min"
+                :max="field.max"
+                :step="field.step"
+                required
+              />
+            </label>
+            <label>
+              显示格距 · km
+              <input
+                v-model.number="options.grid_km"
+                type="number"
+                min="0"
+                max="10000"
+                step="0.001"
+                required
+              />
+              <small>只影响叠加格网；0为隐藏，不改变地形或计算精度。</small>
             </label>
           </details>
           <div class="quality-note">
@@ -1307,12 +1524,17 @@ onBeforeUnmount(() => {
             <i v-if="layer === l.id">●</i>
           </button>
         </div>
-        <p v-if="layer === 6" class="layer-help" role="status">
+        <p v-if="layer === 10" class="layer-help" role="status">
           {{
-            tectonics?.available
-              ? '箭头等长，仅表示方向；点击地图查看 cm/年。'
-              : tectonics?.reason || '正在读取板块记录…'
+            store.generating
+              ? '实时预览使用当前已计算的地形与气候；最终生态和河道会在完成后显示。'
+              : hydrology?.available
+                ? `地形明暗、生态植被与真实河道；${hydrology.segments || 0} 段河流，湖泊随地形保存。`
+                : hydrology?.reason || '正在读取水系…'
           }}
+        </p>
+        <p v-if="layer === 6" class="layer-help" role="status">
+          {{ plateStatus }}
         </p>
         <template v-if="layer === 7">
           <label class="style-select">
@@ -1464,6 +1686,21 @@ onBeforeUnmount(() => {
               <dd>
                 {{ selectedPlate.speed.toFixed(2) }}
                 <small>cm/年</small>
+              </dd>
+            </div>
+            <div v-if="selectedPlate?.identity && layer === 6">
+              <dt>独立运动开始</dt>
+              <dd>
+                {{ selectedPlate.identity.born_myr.toFixed(0) }}
+                <small>百万年 / 自演化起点</small>
+              </dd>
+            </div>
+            <div v-if="selectedPlate?.identity && layer === 6">
+              <dt>当前 / 历史最大面积</dt>
+              <dd>
+                {{ (selectedPlate.identity.area_m2 / 1e12).toFixed(2) }} /
+                {{ (selectedPlate.identity.maximum_area_m2 / 1e12).toFixed(2) }}
+                <small>百万 km²</small>
               </dd>
             </div>
           </dl>

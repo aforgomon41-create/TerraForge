@@ -176,6 +176,86 @@ async fn terminal_event_reconnects_finish_and_release_the_stream_capacity() {
 }
 
 #[tokio::test]
+async fn rendered_rivers_follow_saved_receivers_and_keep_session_isolation() {
+    use tf_grid::GridOps;
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let other = f.session().await;
+    let world = f.world(&token).await;
+    let descriptor = tf_grid::GridDescriptor::plane(25., 0., 32000., 32, 24, 6371000.);
+    let grid = descriptor.build();
+    let n = grid.cell_count();
+    let mut fields = tf_sim::WorldFields::with_capacity(n);
+    for i in 0..n {
+        let p = grid.field_position(i);
+        fields.elevation[i] = (500. + p.x.abs() * 0.02 + p.y * 0.02) as f32;
+    }
+    let water = tf_sim::erosion::refresh_hydrology(&grid, &mut fields);
+    let receivers: Vec<f32> = water
+        .flow_dir
+        .iter()
+        .map(|&r| if r == u32::MAX { -1. } else { r as f32 })
+        .collect();
+    let mut map = node(&world, "river-map");
+    map.cells = n as u32;
+    map.cell_size_m = 1000.;
+    map.grid = Some(descriptor);
+    f.state
+        .store
+        .submit_job(&map, &job(&world, "river-map", "river-job"))
+        .unwrap();
+    f.state
+        .store
+        .transition_job("river-job", "running", None)
+        .unwrap();
+    f.state
+        .store
+        .publish_fields(
+            "river-map",
+            &[
+                (Channel::Elevation, &fields.elevation),
+                (Channel::FlowAccumulation, &fields.flow_accumulation),
+                (Channel::LakeDepth, &fields.lake_depth),
+                (Channel::FlowReceiver, &receivers),
+            ],
+            &json!({}),
+        )
+        .unwrap();
+    let (s, body) = f
+        .request(
+            "GET",
+            "/api/v1/maps/river-map/hydrology",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["source"], "saved_priority_flood_receivers");
+    assert!(body["segments"].as_u64().unwrap() > 0, "{body}");
+    let points = body["groups"][0].as_array().unwrap();
+    assert_eq!(points.len() % 6, 0);
+    for segment in points.chunks_exact(6) {
+        let a = grid
+            .locate_local(segment[0].as_f64().unwrap(), segment[1].as_f64().unwrap())
+            .unwrap();
+        let b = grid
+            .locate_local(segment[3].as_f64().unwrap(), segment[4].as_f64().unwrap())
+            .unwrap();
+        assert_eq!(water.flow_dir[a] as usize, b);
+    }
+    assert_eq!(
+        f.request(
+            "GET",
+            "/api/v1/maps/river-map/hydrology",
+            Some(&other),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+}
+#[tokio::test]
 async fn circulation_months_use_saved_vectors_and_remain_private_and_bounded() {
     let f = Fixture::new(false);
     let token = f.session().await;
@@ -206,6 +286,8 @@ async fn circulation_months_use_saved_vectors_and_remain_private_and_bounded() {
         energy: Default::default(),
         water: Default::default(),
         circulation: Some(tf_sim::circulation::CirculationAtlas {
+            current_velocity_scale: vec![1.; 12],
+            forcing_wind_rms_difference_m_s: vec![0.; 12],
             model: "fixture".into(),
             wind_east_m_s: east.clone(),
             wind_north_m_s: vec![vec![0.; count]; 12],

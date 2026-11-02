@@ -222,6 +222,11 @@ pub fn run_child_generation(
             Some(item)
         })
         .collect();
+    let receivers: Vec<f32> = water
+        .flow_dir
+        .iter()
+        .map(|&r| if r == u32::MAX { -1. } else { r as f32 })
+        .collect();
     let mut channels: Vec<(Channel, &[f32])> = vec![
         (Channel::Elevation, &fields.elevation),
         (Channel::Temperature, &fields.temperature),
@@ -234,6 +239,7 @@ pub fn run_child_generation(
         (Channel::SoilDepth, &ecology.soil_depth_m),
         (Channel::PotentialEvaporation, &fields.potential_evaporation),
         (Channel::Aridity, &fields.aridity),
+        (Channel::FlowReceiver, &receivers),
     ];
     for (channel, data) in &inherited {
         channels.push((*channel, data.as_slice()));

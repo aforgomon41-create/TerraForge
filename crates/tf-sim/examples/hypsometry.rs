@@ -89,7 +89,13 @@ fn main() {
     let grid = if plane {
         GridDescriptor::plane(0., 0., 32_000_000., 256, 148, params.planet.radius_m)
     } else {
-        GridDescriptor::sphere(64, params.planet.radius_m)
+        GridDescriptor::sphere(
+            std::env::var("TF_DIAG_FREQ")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+            params.planet.radius_m,
+        )
     }
     .build();
     if args.get(3).is_some_and(|v| v == "full") {
@@ -111,6 +117,16 @@ fn main() {
                 w.ecology.biome.iter().filter(|&&b| b == kind as u8).count() as f64 / land
             );
         }
+        data["latitude_and_temperature"] = serde_json::json!((0..6).map(|zone| {
+            let cells:Vec<_>=(0..grid.cell_count()).filter(|&i|w.fields.elevation[i]>0. && (grid.latitude_deg(i).abs()/15.).floor().min(5.) as usize==zone).collect();
+            serde_json::json!({"absolute_latitude_from":zone*15,"land_cells":cells.len(),"mean_temperature_c":cells.iter().map(|&i|w.fields.temperature[i] as f64).sum::<f64>()/cells.len().max(1) as f64,"mean_height_m":cells.iter().map(|&i|w.fields.elevation[i] as f64).sum::<f64>()/cells.len().max(1) as f64})
+        }).collect::<Vec<_>>());
+        data["energy"] = serde_json::json!(w.fields.climate.as_ref().map(|c| &c.energy));
+        data["stage_timings_ms"] = serde_json::json!(w
+            .stage_timings
+            .iter()
+            .map(|(s, t)| (format!("{s:?}"), t))
+            .collect::<Vec<_>>());
         println!(
             "{}",
             serde_json::json!({"seed":params.seed,"plane":plane,"full":data})
@@ -120,11 +136,11 @@ fn main() {
         let state =
             tf_sim::evolution::generate(&grid, &params, &mut f, &mut |_| {}, &|| false).unwrap();
         let before = report(&grid, &f);
-        tf_sim::evolution::landforms(&grid, &mut f, &state, &params);
+        let peak = tf_sim::evolution::landforms_diagnosed(&grid, &mut f, &state, &params);
         tf_sim::erosion::compute_distance_to_sea(&grid, &mut f);
         println!(
             "{}",
-            serde_json::json!({"seed":params.seed,"plane":plane,"duration_myr":params.tectonic_age_myr,"ancient_steps":state.history.ancient_steps,"recent_steps":state.history.steps,"budget_error":state.history.relative_budget_error,"material":before,"terrain":report(&grid,&f)})
+            serde_json::json!({"peak_components":peak,"lifecycle":{"identities":state.lifecycle.identities.len(),"events":state.lifecycle.events,"current":state.lifecycle.identities.iter().filter(|id|id.status=="active").count()},"seed":params.seed,"plane":plane,"duration_myr":params.tectonic_age_myr,"ancient_steps":state.history.ancient_steps,"recent_steps":state.history.steps,"budget_error":state.history.relative_budget_error,"material":before,"terrain":report(&grid,&f)})
         );
     }
 }

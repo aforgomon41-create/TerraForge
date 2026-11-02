@@ -35,6 +35,8 @@ pub struct History {
     pub plate_reorganizations: u32,
     #[serde(default)]
     pub geologic_provinces: Vec<crate::geology::ProvinceRecord>,
+    #[serde(default)]
+    pub lifecycle: crate::lifecycle::Lifecycle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +97,7 @@ fn hotspot_events(
                 };
                 let bearing = rng.range_f64(0., std::f64::consts::TAU);
                 let along = east * bearing.cos() + north * bearing.sin();
-                history.volcanoes.push(Volcano {
+                let candidate = Volcano {
                     position_m: move_point(state, plate_id as usize, source.position, age)
                         .to_array(),
                     plate_id,
@@ -108,7 +110,40 @@ fn hotspot_events(
                     shape_seed: source.seed ^ source.episode,
                     quiet_myr: age,
                     preserved_growth_m: None,
-                });
+                };
+                // A stalled plate builds one broad volcanic complex. Repeated
+                // eruptions must not create coincident independent mountains.
+                let position = DVec3::from_array(candidate.position_m);
+                let nearby = history
+                    .volcanoes
+                    .iter_mut()
+                    .filter(|v| {
+                        v.origin == "hotspot"
+                            && v.plate_id == plate_id
+                            && DVec3::from_array(v.position_m).distance(position)
+                                < (v.radius_m + candidate.radius_m) * 0.4
+                    })
+                    .min_by(|a, b| {
+                        DVec3::from_array(a.position_m)
+                            .distance_squared(position)
+                            .total_cmp(&DVec3::from_array(b.position_m).distance_squared(position))
+                    });
+                if let Some(v) = nearby {
+                    let old = volcano_amplitude(v);
+                    let increment = candidate.summit_growth_m * 0.15;
+                    let amplitude = (old + increment).min(9500.);
+                    // For a Gaussian edifice, volume is proportional to A*r^2.
+                    // Continued supply spreads the complex when relief saturates.
+                    v.radius_m = ((old * v.radius_m.powi(2)
+                        + increment * candidate.radius_m.powi(2))
+                        / amplitude.max(1.))
+                    .sqrt();
+                    v.preserved_growth_m = Some(amplitude);
+                    v.summit_growth_m = (v.summit_growth_m + increment).min(9500.);
+                    v.quiet_myr = age;
+                } else {
+                    history.volcanoes.push(candidate);
+                }
             }
             source.episode += 1;
             // Each mantle source has its own episodic clock and quiet periods.
@@ -375,6 +410,7 @@ fn remap(
     let mut orogen_age = vec![0.; n];
     let mut shear_strain = vec![0.; n];
     let mut craton_strength = vec![0.; n];
+    let mut rift_damage = vec![0.; n];
     let mut votes = vec![0_f64; n * count];
     let thickness: Vec<_> = f.crust_thickness.iter().map(|v| *v as f64).collect();
     let reference_height: Vec<_> = f
@@ -450,7 +486,7 @@ fn remap(
         coverage[i] += inward;
         volume[i] += inward * 7000.;
         reference[i] += inward * 7000.;
-        basement[i] -= inward * 2800.;
+        basement[i] -= inward * 2000.;
         age[i] += inward * 70.;
         votes[i * count + plate] += inward;
         history.imported_crust_m3 += inward * 7000.;
@@ -542,6 +578,7 @@ fn remap(
             orogen_age[j] += f.orogen_age[i] as f64 * share;
             shear_strain[j] += f.shear_strain[i] as f64 * share;
             craton_strength[j] += f.craton_strength[i] as f64 * share;
+            rift_damage[j] += f.rift_damage[i] as f64 * share;
             votes[j * count + plate] += share;
         }
     }
@@ -553,7 +590,7 @@ fn remap(
         history.new_ocean_crust_m3 += new_volume;
         volume[i] += new_volume;
         reference[i] += new_volume;
-        basement[i] -= missing * 2800.;
+        basement[i] -= missing * 2000.;
         let total_area = coverage[i] + missing;
         let ref_h = reference[i] / total_area.max(1.);
         let ocean_volume = (volume[i] - continental_volume[i]).max(0.);
@@ -567,6 +604,7 @@ fn remap(
         f.crust_type[i] = (continental_volume[i] / volume[i].max(1.)).clamp(0., 1.) as f32;
         f.shear_strain[i] = (shear_strain[i] / total_area.max(1.)) as f32;
         f.craton_strength[i] = (craton_strength[i] / total_area.max(1.)).clamp(0., 1.) as f32;
+        f.rift_damage[i] = (rift_damage[i] / total_area.max(1.)).clamp(0., 1.) as f32;
         f.crust_age[i] = (age[i] / total_area.max(1.) + dt * fraction.min(1.)) as f32;
         f.crustal_strain[i] = (strain[i] / total_area.max(1.)
             + fraction.max(1.).ln() * f.crust_type[i] as f64) as f32;
@@ -578,6 +616,7 @@ fn remap(
         f.plate_id[i] = votes[i * count..(i + 1) * count]
             .iter()
             .enumerate()
+            .filter(|(slot, _)| state.lifecycle.active(*slot))
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map_or(0, |(p, _)| p as u16);
         if coverage[i] < 1. {
@@ -586,6 +625,7 @@ fn remap(
                 .centers
                 .iter()
                 .enumerate()
+                .filter(|(slot, _)| state.lifecycle.active(*slot))
                 .min_by(|(_, a), (_, b)| {
                     (position - **a)
                         .length_squared()
@@ -769,7 +809,12 @@ fn volcano_events(
 
 /// Continental collision resists normal motion; oceanic subduction remains mobile.
 /// This kinematic resistance is explicit, not a force-balanced mantle model.
-fn collision_resistance(grid: &MapGrid, f: &mut WorldFields, state: &mut TectonicState, dt: f64) {
+pub(crate) fn collision_resistance(
+    grid: &MapGrid,
+    f: &mut WorldFields,
+    state: &mut TectonicState,
+    dt: f64,
+) {
     let boundaries = crate::plates::find_boundaries(grid, &f.plate_id, state, f);
     let mut change = vec![DVec3::ZERO; state.plates.len()];
     let mut weight = vec![0.; state.plates.len()];
@@ -868,13 +913,20 @@ pub fn generate_observed<G: GridOps>(
             &grid,
             params,
             &mut state,
+            &ids,
             ancient_duration,
             progress,
             cancel,
             observer,
         )?;
-    if let Some(latest) = latest_ids {
+    let mut inherited_damage = None;
+    let mut inherited_ages = None;
+    let mut inherited_strength = None;
+    if let Some((latest, damage, ages, strength)) = latest_ids {
         ids = latest;
+        inherited_damage = Some(damage);
+        inherited_ages = Some(ages);
+        inherited_strength = Some(strength);
     }
     for province in &mut provinces {
         if let Some(cell) = locate(&grid, province.shape.center) {
@@ -884,6 +936,9 @@ pub fn generate_observed<G: GridOps>(
     let mut material = WorldFields::with_capacity(grid.cell_count());
     crate::geology::initialize(&grid, &mut material, params, &provinces);
     material.plate_id.copy_from_slice(&ids);
+    if let Some(damage) = inherited_damage {
+        material.rift_damage = damage;
+    }
     state.provinces = provinces;
     let age_noise = tf_core::noise::SimplexNoise::new(params.seed ^ 0xA6E0_0410);
     for i in 0..grid.cell_count() {
@@ -892,6 +947,15 @@ pub fn generate_observed<G: GridOps>(
         material.crust_age[i] = (ancient_duration.max(600.) * material.crust_type[i] as f64
             + ocean_age * (1. - material.crust_type[i] as f64))
             as f32;
+    }
+    if let Some(ages) = inherited_ages {
+        material.crust_age = ages;
+    }
+    if let Some(strength) = inherited_strength {
+        material.craton_strength = strength;
+    }
+    if state.lifecycle.slot_uids.is_empty() {
+        crate::lifecycle::initialize(&grid, &material, &mut state);
     }
     crate::plates::limit_speeds(&mut state, &grid, params);
     for plate in &mut state.plates {
@@ -915,7 +979,7 @@ pub fn generate_observed<G: GridOps>(
     crate::plates::limit_speeds(&mut state, &grid, params);
     material.orogen_age.fill(150.);
     let mut history = History {
-        model: "staged-terrane-history+recent-conservative-crust-v5".into(),
+        model: "damage-guided-dynamic-topology+recent-conservative-crust-v6".into(),
         initial_crust_m3: crust_volume(&grid, &material),
         duration_myr: params.tectonic_age_myr,
         ancient_duration_myr: ancient_duration,
@@ -959,6 +1023,7 @@ pub fn generate_observed<G: GridOps>(
     let mut arc_rng = DeterministicRng::derive(params.seed, "arc-epochs");
     let mut next_event = ancient_duration + arc_rng.range_f64(3., 10.);
     let mut elapsed = ancient_duration;
+    let mut topology_elapsed = elapsed;
     evolution_frame(
         &grid, &material, &state, &history, params, elapsed, observer,
     );
@@ -1014,10 +1079,20 @@ pub fn generate_observed<G: GridOps>(
             v.age_myr += dt;
             v.quiet_myr += dt;
             if let Some(height) = &mut v.preserved_growth_m {
-                *height *= (-dt / 28.).exp();
+                *height *= (-dt / if v.origin == "hotspot" { 75. } else { 28. }).exp();
             }
         }
         remap(&grid, &geometry, &mut material, &state, dt, &mut history);
+        if !crate::lifecycle::advance_labels(
+            &grid,
+            &mut material,
+            &mut state,
+            dt,
+            elapsed + dt,
+            false,
+        ) {
+            return None;
+        }
         collision_resistance(&grid, &mut material, &mut state, dt);
         let mut provinces = std::mem::take(&mut state.provinces);
         crate::geology::advance(&grid, &mut provinces, &state, dt);
@@ -1027,6 +1102,22 @@ pub fn generate_observed<G: GridOps>(
         }
         elapsed += dt;
         history.steps += 1;
+        if elapsed - topology_elapsed >= params.tectonic_step_myr.min(10.) - 1e-8
+            || elapsed >= params.tectonic_age_myr - 1e-8
+        {
+            let interval = elapsed - topology_elapsed;
+            crate::lifecycle::update(
+                &grid,
+                &mut material,
+                &mut state,
+                params,
+                elapsed,
+                interval,
+                &mut history.volcanoes,
+            );
+            crate::lifecycle::fit_motion(&grid, &material, &mut state, params, elapsed, interval);
+            topology_elapsed = elapsed;
+        }
         hotspot_events(
             &grid,
             &material,
@@ -1079,6 +1170,7 @@ pub fn generate_observed<G: GridOps>(
         fields.orogen_age[i] = interpolate(&material.orogen_age);
         fields.shear_strain[i] = interpolate(&material.shear_strain);
         fields.craton_strength[i] = interpolate(&material.craton_strength);
+        fields.rift_damage[i] = interpolate(&material.rift_damage);
         let nearest = weights.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
         fields.plate_id[i] = material.plate_id[nearest];
     }
@@ -1111,6 +1203,11 @@ pub fn generate_observed<G: GridOps>(
     }
     history.output_crust_m3 = crust_volume(fine, fields);
     history.geologic_provinces = crate::geology::records(&state.provinces);
+    history.plate_reorganizations = state.lifecycle.events.len() as u32;
+    state
+        .lifecycle
+        .record(&grid, &material, params.tectonic_age_myr, true);
+    history.lifecycle = state.lifecycle.clone();
     state.history = history;
     for plate in &mut state.plates {
         let mut crust = 0.;
@@ -1160,6 +1257,34 @@ pub fn landforms<G: GridOps>(
     state: &TectonicState,
     params: &GenerationParams,
 ) {
+    let _ = landforms_diagnosed(grid, fields, state, params);
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LandformReport {
+    pub cell: usize,
+    pub raw_height_m: f64,
+    pub final_height_m: f64,
+    pub crust_thickness_m: f64,
+    pub reference_thickness_m: f64,
+    pub continental_fraction: f64,
+    pub basement_m: f64,
+    pub root_uplift_m: f64,
+    pub folds_m: f64,
+    pub ocean_component_m: f64,
+    pub volcanic_relief_m: f64,
+    pub sea_and_coast_shift_m: f64,
+}
+pub fn landforms_diagnosed<G: GridOps>(
+    grid: &G,
+    fields: &mut WorldFields,
+    state: &TectonicState,
+    params: &GenerationParams,
+) -> LandformReport {
+    let mut report = LandformReport {
+        raw_height_m: f64::NEG_INFINITY,
+        ..Default::default()
+    };
     let noise = tf_core::noise::SimplexNoise::new(params.seed ^ 0x0ED0_6E17);
     let sampling = (grid.area_m2(0) * 2. / 3_f64.sqrt()).sqrt();
     let axis_ratio = |v: &Volcano| {
@@ -1203,7 +1328,10 @@ pub fn landforms<G: GridOps>(
         let excess = fields.crust_thickness[i] as f64 - fields.reference_crust_thickness[i] as f64;
         let uplift = excess.max(0.) * (1. - 2800. / 3300.) * params.orogeny_strength;
         let rift = excess.min(0.) * (1. - 2800. / 3300.) * params.rift_strength;
-        let ocean = -2700. - 330. * age.max(0.).min(180.).sqrt();
+        // The transported basement already contains the sea/land transition.
+        // Apply oceanic thermal subsidence to that reference surface; mixing a
+        // second -6 km ocean floor into it double-counts coastal submergence.
+        let ocean = (-700. - 330. * age.max(0.).min(180.).sqrt()) * (1. - c).powi(2);
         let transported_basement = fields.elevation[i] as f64;
         let (inherited, stability, province_support) =
             crate::geology::sample(&state.provinces, p, grid.radius_m(), grid.field_is_planar());
@@ -1237,7 +1365,10 @@ pub fn landforms<G: GridOps>(
             + folded
                 * ((strain * 2.).min(1.5) * old_decay
                     + (fields.shear_strain[i] as f64).min(1.) * 0.35 * params.shear_strength);
-        let mut height = ocean * (1. - c) + (basement + uplift + rift + folds) * c;
+        let mut height = basement + ocean + (uplift + rift + folds) * c;
+        let before_volcanoes = height;
+        let mut volcanic_envelope = 0_f64;
+        let mut load_deflection = 0.;
         let (kx, ky, kz) = key(p);
         for x in kx - 1..=kx + 1 {
             for y in ky - 1..=ky + 1 {
@@ -1298,12 +1429,17 @@ pub fn landforms<G: GridOps>(
                                     * (longitudinal * longitudinal / (long_radius * long_radius)
                                         + transverse2 / sigma2))
                                     .exp();
-                            height += cone * (1. - v.arc_platform_fraction)
-                                + platform * v.arc_platform_fraction;
+                            // Records describe preserved edifices, not independent
+                            // full-height deposits. Overlapping vents share a
+                            // surface envelope rather than stacking whole mountains.
+                            volcanic_envelope = volcanic_envelope.max(
+                                cone * (1. - v.arc_platform_fraction)
+                                    + platform * v.arc_platform_fraction,
+                            );
                             // Lithospheric flexure beneath the volcanic load, adapted from Landlab.
                             let alpha = crate::scientific::flexure_length(25000., 7e10, 33000.);
                             let line_load = 2800. * 9.81 * amplitude * radius * 0.35;
-                            height -= crate::scientific::line_load_deflection(
+                            load_deflection += crate::scientific::line_load_deflection(
                                 line_load, distance, alpha, 33000.,
                             ) * 0.20;
                         }
@@ -1311,15 +1447,89 @@ pub fn landforms<G: GridOps>(
                 }
             }
         }
+        height += volcanic_envelope - load_deflection;
         fields.elevation[i] = height as f32;
+        if height > report.raw_height_m {
+            report = LandformReport {
+                cell: i,
+                raw_height_m: height,
+                final_height_m: 0.,
+                crust_thickness_m: fields.crust_thickness[i] as f64,
+                reference_thickness_m: fields.reference_crust_thickness[i] as f64,
+                continental_fraction: c,
+                basement_m: basement,
+                root_uplift_m: (uplift + rift) * c,
+                folds_m: folds * c,
+                ocean_component_m: ocean,
+                volcanic_relief_m: height - before_volcanoes,
+                sea_and_coast_shift_m: 0.,
+            };
+        }
     }
     crate::plates::adjust_sea_level(grid, fields, params.land_fraction);
     crate::terrain::apply_planar_coast_constraint(grid, fields, params);
+    report.final_height_m = fields.elevation[report.cell] as f64;
+    report.sea_and_coast_shift_m = report.raw_height_m - report.final_height_m;
+    report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mixed_coastal_reference_is_not_mixed_with_a_second_deep_ocean_floor() {
+        let g = MapGrid::Plane(FlatGrid::new(8, 8, 800000., 25., 0., 6371000.));
+        let mut f = WorldFields::with_capacity(g.cell_count());
+        f.crust_type.fill(0.8);
+        f.crust_thickness.fill(35000.);
+        f.reference_crust_thickness.fill(35000.);
+        f.crust_age.fill(100.);
+        f.elevation.fill(300.);
+        let p = GenerationParams {
+            interior_relief: 0.,
+            ..Default::default()
+        };
+        let report = landforms_diagnosed(&g, &mut f, &TectonicState::default(), &p);
+        assert!(
+            report.raw_height_m > 0. && report.raw_height_m < 300.,
+            "{report:?}"
+        );
+        assert!(report.ocean_component_m.abs() < 200., "{report:?}");
+    }
+    #[test]
+    fn overlapping_preserved_edifices_share_a_surface_instead_of_stacking_full_mountains() {
+        let g = MapGrid::Plane(FlatGrid::new(24, 24, 1_200_000., 25., 0., 6371000.));
+        let mut f = WorldFields::with_capacity(g.cell_count());
+        f.elevation.fill(400.);
+        f.crust_type.fill(1.);
+        f.crust_thickness.fill(35000.);
+        f.reference_crust_thickness.fill(35000.);
+        let mut state = TectonicState::default();
+        state.history.volcanoes.push(Volcano {
+            position_m: [0., 0., 0.],
+            plate_id: 0,
+            age_myr: 0.,
+            radius_m: 80000.,
+            summit_growth_m: 8000.,
+            origin: "hotspot".into(),
+            along_arc: DVec3::X.to_array(),
+            arc_platform_fraction: 0.,
+            shape_seed: 0,
+            quiet_myr: 0.,
+            preserved_growth_m: None,
+        });
+        let p = GenerationParams {
+            interior_relief: 0.,
+            ..Default::default()
+        };
+        let single = landforms_diagnosed(&g, &mut f.clone(), &state, &p);
+        state.history.volcanoes = vec![state.history.volcanoes[0].clone(); 12];
+        let repeated = landforms_diagnosed(&g, &mut f, &state, &p);
+        assert!(
+            repeated.raw_height_m < single.raw_height_m * 1.2,
+            "{single:?} -> {repeated:?}"
+        );
+    }
     #[test]
     fn a_thick_continental_root_resists_collision_without_stopping_oceanic_motion() {
         let grid = MapGrid::Plane(FlatGrid::new(20, 10, 1_000_000., 0., 0., 6_371_000.));

@@ -24,6 +24,8 @@ pub struct WorldFields {
     pub shear_strain: Vec<f32>,
     /// Cold stable continental material; advected, never inferred from map colour.
     pub craton_strength: Vec<f32>,
+    /// Accumulated extension of inherited weak material, transported with it.
+    pub rift_damage: Vec<f32>,
     pub potential_evaporation: Vec<f32>,
     /// Dimensionless P/PET, not a prescribed desert fraction.
     pub aridity: Vec<f32>,
@@ -58,6 +60,7 @@ impl WorldFields {
             orogen_age: vec![0.0; n],
             shear_strain: vec![0.0; n],
             craton_strength: vec![0.0; n],
+            rift_damage: vec![0.0; n],
             potential_evaporation: vec![0.0; n],
             aridity: vec![0.0; n],
             climate: None,

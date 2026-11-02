@@ -396,6 +396,14 @@ mod regression {
             };
             let result = generate(&grid, &params, &mut |_, _| {});
             let f = &result.fields;
+            assert!(
+                result
+                    .tectonic
+                    .lifecycle
+                    .validate(result.tectonic.plates.len(), params.tectonic_age_myr)
+                    .is_ok(),
+                "seed {seed}: invalid plate identities"
+            );
             for channel in [
                 &f.elevation,
                 &f.temperature,
@@ -413,6 +421,11 @@ mod regression {
                 land[land.len() / 2] < 1800.,
                 "seed {seed}: median {}",
                 land[land.len() / 2]
+            );
+            assert!(
+                *land.last().unwrap() < 10000.,
+                "seed {seed}: peak {}",
+                land.last().unwrap()
             );
             let mut seen = vec![false; grid.cell_count()];
             let mut areas = Vec::new();
@@ -456,6 +469,9 @@ mod regression {
         let grid = tf_grid::FlatGrid::new(24, 16, 2_400_000., 25., 0., 6371000.);
         let mut params = GenerationParams {
             seed: 42,
+            // This isolates the display-grid parameter. Four seeded worlds
+            // above separately exercise the complete 4600 Myr history.
+            tectonic_age_myr: 12.,
             quality: tf_core::params::SimQuality::Economy,
             ..Default::default()
         };

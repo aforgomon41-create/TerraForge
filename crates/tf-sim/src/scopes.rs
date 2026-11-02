@@ -62,6 +62,7 @@ pub fn local_terrain<G: GridOps>(
         history: Default::default(),
         planar_spin_rad_myr: None,
         provinces: Vec::new(),
+        lifecycle: Default::default(),
     }
 }
 pub fn local_climate<G: GridOps>(

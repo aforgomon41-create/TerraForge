@@ -7,6 +7,7 @@ pub mod climatology;
 pub mod config;
 pub mod generate;
 pub mod geography;
+pub mod hydrology;
 pub mod jobs;
 mod project;
 pub mod render;

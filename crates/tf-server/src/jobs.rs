@@ -353,6 +353,12 @@ pub fn persist_fields<G: tf_grid::GridOps>(
     let biome: Vec<f32> = world.ecology.biome.iter().map(|&b| b as f32).collect();
     let plate: Vec<f32> = f.plate_id.iter().map(|&v| v as f32).collect();
     let soil: Vec<f32> = world.ecology.soil.iter().map(|&b| b as f32).collect();
+    let receivers: Vec<f32> = world
+        .erosion
+        .flow_dir
+        .iter()
+        .map(|&r| if r == u32::MAX { -1. } else { r as f32 })
+        .collect();
     let mut metadata = serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"planar_velocities":world.tectonic.planar_velocities,"planar_spin_rad_myr":world.tectonic.planar_spin_rad_myr,"plate_centers_m":world.tectonic.centers,"motion_domain":if world.tectonic.planar_velocities.is_some() {"plane"} else {"sphere"},"tectonic_history":world.tectonic.history,"generator_version":"tf-0.5"});
     if let Some(atlas) = &f.climate {
         metadata["climate_atlas"] = crate::climatology::encode(atlas)?;
@@ -380,6 +386,7 @@ pub fn persist_fields<G: tf_grid::GridOps>(
             (Channel::OrogenAge, &f.orogen_age),
             (Channel::PotentialEvaporation, &f.potential_evaporation),
             (Channel::Aridity, &f.aridity),
+            (Channel::FlowReceiver, &receivers),
         ],
         &metadata,
     )

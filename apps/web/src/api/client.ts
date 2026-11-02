@@ -50,6 +50,21 @@ export interface TectonicDiagnostic {
   plate_centers_m?: number[][]
   motion_grid?: GridDescriptor
   reference_frame?: string
+  lifecycle?: {
+    slot_uids: number[]
+    identities: {
+      uid: number
+      born_myr: number
+      ended_myr: number | null
+      parent_uid: number | null
+      absorbed_by: number | null
+      status: string
+      area_m2: number
+      maximum_area_m2: number
+    }[]
+    events: { time_myr: number; kind: string; uid: number; related_uid: number | null }[]
+    capacity_limited_events: number
+  } | null
 }
 export interface CirculationDiagnostic {
   available: boolean
@@ -60,6 +75,16 @@ export interface CirculationDiagnostic {
   maximum_speed_m_s?: number
   heat_coupled?: boolean
   relative_solver_residual?: number[]
+  current_velocity_scale?: number[]
+  forcing_wind_rms_difference_m_s?: number[]
+}
+export interface HydrologyDiagnostic {
+  available: boolean
+  reason?: string
+  groups?: number[][]
+  segments?: number
+  minimum_upstream_area_m2?: number
+  limited?: boolean
 }
 export interface Surface {
   centers: Float32Array
@@ -151,6 +176,10 @@ async function geometryRequest(path: string, signal?: AbortSignal): Promise<Resp
   }
 }
 export const api = {
+  async hydrology(id: string, signal?: AbortSignal): Promise<HydrologyDiagnostic> {
+    const response = await geometryRequest(`/maps/${id}/hydrology`, signal)
+    return response.json()
+  },
   async vectors(
     id: string,
     kind: 'wind' | 'current',

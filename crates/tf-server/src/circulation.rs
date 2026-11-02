@@ -103,6 +103,8 @@ pub async fn get_vectors(
         Ok(json!({"available":true,"kind":kind,"month":query.month,"model":c.model,
             "heat_coupled":c.heat_coupled,"units":"m/s","maximum_speed_m_s":maximum,
             "relative_solver_residual":c.relative_solver_residual,"solver_iterations":c.solver_iterations,
+            "current_velocity_scale":c.current_velocity_scale,"forcing_wind_rms_difference_m_s":c.forcing_wind_rms_difference_m_s,
+            "coupling":"one lagged wind/ocean/temperature feedback; not jointly converged",
             "groups":groups,"samples":samples,"reference_frame":"local east/north; annual means average vectors, not scalar speeds; arrow length is uniform"}))
     }).await??;
     Ok(Json(result))

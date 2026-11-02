@@ -16,6 +16,11 @@ pub struct CirculationAtlas {
     pub relative_solver_residual: Vec<f64>,
     pub solver_iterations: Vec<u32>,
     pub heat_coupled: bool,
+    #[serde(default)]
+    pub current_velocity_scale: Vec<f32>,
+    /// Difference between the final water-transport wind and the lagged ocean forcing.
+    #[serde(default)]
+    pub forcing_wind_rms_difference_m_s: Vec<f64>,
 }
 
 fn frame(g: &MapGrid, i: usize) -> (DVec3, DVec3) {
@@ -205,6 +210,8 @@ pub fn solve(
             .map(|(u, v)| u.hypot(*v))
             .fold(0_f32, f32::max);
         let scale = (2. / peak.max(2.)) as f32;
+        result.current_velocity_scale.push(scale);
+        result.forcing_wind_rms_difference_m_s.push(0.);
         for x in u.iter_mut().chain(&mut v) {
             *x *= scale;
         }

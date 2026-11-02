@@ -26,6 +26,7 @@ export const useWorldStore = defineStore('world', () => {
     temperature = shallowRef<Float32Array | null>(null),
     precipitation = shallowRef<Float32Array | null>(null),
     flow = shallowRef<Float32Array | null>(null),
+    lakeDepth = shallowRef<Float32Array | null>(null),
     plateIds = shallowRef<Float32Array | null>(null)
   const indices = shallowRef<Uint32Array | null>(null)
   const geography = shallowRef<Geography | null>(null),
@@ -51,6 +52,7 @@ export const useWorldStore = defineStore('world', () => {
     currentMap.value = null
     centers.value = elevation.value = temperature.value = precipitation.value = flow.value = null
     plateIds.value = null
+    lakeDepth.value = null
     biome.value = null
     indices.value = null
     geography.value = null
@@ -107,18 +109,25 @@ export const useWorldStore = defineStore('world', () => {
           api.getField(id, ch, controller.signal),
         ),
       )
-      const [f, ids] = await Promise.all([
+      const [f, ids, lakes] = await Promise.all([
         api.getField(id, 'flow_accumulation', controller.signal),
         api.getField(id, 'plate_id', controller.signal).catch((e: Error & { status?: number }) => {
           if (e.status === 404) return null
           throw e
         }),
+        api
+          .getField(id, 'lake_depth', controller.signal)
+          .catch((e: Error & { status?: number }) => {
+            if (e.status === 404) return null
+            throw e
+          }),
       ])
       if (controller.signal.aborted) return
       if (
         xyz.length !== node.cells * 3 ||
         [e, b, t, p, f].some((a) => a.length !== node.cells) ||
-        (ids && ids.length !== node.cells)
+        (ids && ids.length !== node.cells) ||
+        (lakes && lakes.length !== node.cells)
       )
         throw new Error('地图数据与坐标尺寸不一致')
       centers.value = xyz
@@ -128,6 +137,7 @@ export const useWorldStore = defineStore('world', () => {
       temperature.value = t
       precipitation.value = p
       flow.value = f
+      lakeDepth.value = lakes
       plateIds.value = ids
       currentMap.value = node
       // Geography is derived independently: a failed detection cannot hide the map.
@@ -264,6 +274,7 @@ export const useWorldStore = defineStore('world', () => {
     temperature,
     precipitation,
     flow,
+    lakeDepth,
     plateIds,
     init,
     refreshWorlds,

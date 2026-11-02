@@ -573,6 +573,20 @@ fn solve_observed_at_resolution<G: GridOps>(
             let transport = transfer_mesh(&atmospheric, &winds, params.wind_speed_m_s, dt);
             if cycle == 1 {
                 if let Some(c) = &mut atlas.circulation {
+                    let area = (0..n).map(|i| atmospheric.area_m2(i)).sum::<f64>();
+                    c.forcing_wind_rms_difference_m_s[month] = ((0..n)
+                        .map(|i| {
+                            ((winds[i].1 * params.wind_speed_m_s
+                                - c.wind_east_m_s[month][i] as f64)
+                                .powi(2)
+                                + (winds[i].2 * params.wind_speed_m_s
+                                    - c.wind_north_m_s[month][i] as f64)
+                                    .powi(2))
+                                * atmospheric.area_m2(i)
+                        })
+                        .sum::<f64>()
+                        / area)
+                        .sqrt();
                     c.wind_east_m_s[month] = winds
                         .iter()
                         .map(|v| (v.1 * params.wind_speed_m_s) as f32)

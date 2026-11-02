@@ -1,13 +1,16 @@
 """Real HTTP geography acceptance; uses only disposable sessions, no page automation."""
 import argparse
 import array
+import base64
 import collections
+import gzip
 import hashlib
 import json
 import math
 from pathlib import Path
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -28,6 +31,8 @@ def main():
     parser.add_argument('--shape', choices=['sphere', 'plane'], default='sphere')
     parser.add_argument('--tectonic-myr', type=float)
     parser.add_argument('--vectors', action='store_true', help='Verify saved monthly wind/current fields and project round trip')
+    parser.add_argument('--live', action='store_true', help='Verify changing solver frames in the same generation')
+    parser.add_argument('--map-png', action='store_true', help='Keep the API map export for terrain inspection')
     parser.add_argument('--out', default='artifacts/geography-acceptance')
     args = parser.parse_args()
     base = args.base.rstrip('/') + '/api/v1'
@@ -78,8 +83,32 @@ def main():
         })
         started = time.monotonic()
         job = call('/worlds/' + world['id'] + '/generate', token, 'POST')
-        for _ in range(900):
+        live_frames, live_errors = [], []
+        def monitor():
+            try:
+                req=urllib.request.Request(base+'/events?job_id='+job['job_id']+'&frame_encoding=gzip',headers={'Authorization':'Bearer '+token})
+                with opener.open(req,timeout=180) as stream:
+                    kind,data='message',[]
+                    for raw in stream:
+                        line=raw.decode().strip()
+                        if line.startswith('event:'): kind=line[6:].strip()
+                        elif line.startswith('data:'): data.append(line[5:].strip())
+                        elif not line and data:
+                            value=json.loads('\n'.join(data)); data=[]
+                            if kind=='frame':
+                                pixels=base64.b64decode(value['data'],validate=True)
+                                if value['fmt'].startswith('gzip-'): pixels=gzip.decompress(pixels)
+                                assert len(pixels)==value['w']*value['h']*5
+                                if not live_frames or value['tick']>live_frames[-1]['tick']:
+                                    live_frames.append({'seconds':time.monotonic()-started,'tick':value['tick'],'meta':value['meta'],
+                                        'height_hash':hashlib.sha256(pixels[0::5]+pixels[1::5]).hexdigest()})
+                            elif kind in ('done','failed','cancelled'): break
+            except Exception as exc: live_errors.append(repr(exc))
+        stream_thread=threading.Thread(target=monitor,daemon=True) if args.live else None
+        if stream_thread: stream_thread.start()
+        for poll in range(900):
             state = call('/jobs/' + job['job_id'], token)
+            if poll%30==0: print(json.dumps({'shape':args.shape,'seconds':round(time.monotonic()-started,1),'stage':state.get('stage'),'progress':state.get('progress')},ensure_ascii=False),flush=True)
             assert state['state'] not in ['failed', 'cancelled'], state
             if state['state'] == 'done':
                 break
@@ -87,6 +116,16 @@ def main():
         else:
             raise TimeoutError('world did not complete')
         report['generation_secs'] = time.monotonic()-started
+        if stream_thread:
+            stream_thread.join(5)
+            assert not stream_thread.is_alive() and not live_errors,(live_errors,'stream did not close')
+            tectonic=[frame for frame in live_frames if frame['meta']['elapsed_myr'] is not None]
+            assert len(live_frames)>=8 and len({f['height_hash'] for f in tectonic})>=3
+            assert all(a['meta']['progress']<=b['meta']['progress']+1e-6 for a,b in zip(live_frames,live_frames[1:]))
+            gaps=[b['seconds']-a['seconds'] for a,b in zip(live_frames,live_frames[1:])]
+            report['live']={'frames':len(live_frames),'tectonic_frames':len(tectonic),'largest_gap_seconds':max(gaps)}
+            live_out=Path(args.out); live_out.mkdir(parents=True,exist_ok=True)
+            (live_out/(args.shape+'-frames.json')).write_text(json.dumps(live_frames,ensure_ascii=False),encoding='utf-8')
         map_id = job['map_id']
         node = call('/maps/' + map_id, token)
         catalog, labels, size, elapsed = geography(map_id, token)
@@ -165,8 +204,37 @@ def main():
             report['history'] = {key: history.get(key) for key in [
                 'duration_myr', 'output_step_myr', 'ancient_duration_myr', 'detailed_duration_myr',
                 'ancient_steps', 'steps', 'relative_budget_error']}
+            saved_water=call('/maps/'+map_id+'/hydrology',token)
+            assert saved_water['available'] and saved_water['source']=='saved_priority_flood_receivers'
+            assert saved_water['segments']<=60000 and all(len(g)%6==0 for g in saved_water['groups'])
+            call('/maps/'+map_id+'/hydrology',other,expected=404)
+            report['river_segments']=saved_water['segments']
+            receiver_bytes=call('/maps/'+map_id+'/field/flow_receiver',token,binary=True)
+            life = history.get('lifecycle')
+            if life and life.get('identities'):
+                identities = life['identities']
+                assert all(item['uid'] == i for i,item in enumerate(identities))
+                assert len(set(life['slot_uids'])) == len(life['slot_uids'])
+                assert all(0 <= uid < len(identities) for uid in life['slot_uids'])
+                assert all(item['parent_uid'] is None or item['parent_uid'] < item['uid'] for item in identities)
+                assert all(item['ended_myr'] is None or item['ended_myr'] >= item['born_myr'] for item in identities)
+                assert all(item['ended_myr'] is None for item in identities if item['status'] in ('outside_window','below_resolution','unresolved_initial'))
+                assert abs(life['area_history'][-1]['time_myr'] - history['duration_myr']) < 1e-6
+                assert history['relative_budget_error'] < 1e-6
+                diagnostic = call('/maps/'+map_id+'/tectonics',token)
+                assert diagnostic['available'] and diagnostic['lifecycle'] == life
+                assert all(a['plate_uid'] == life['slot_uids'][a['plate_id']] for a in diagnostic['arrows'])
+                report['lifecycle'] = {'identities':len(identities),'status_counts':dict(collections.Counter(item['status'] for item in identities)),
+                    'event_counts':dict(collections.Counter(event['kind'] for event in life['events'])),
+                    'area_samples':len(life['area_history']),'subducted_surface_samples':life['subducted_surface_samples'],
+                    'ridge_surface_samples':life['ridge_surface_samples'],'capacity_limited_events':life['capacity_limited_events']}
         assert len(call('/worlds/' + world['id'] + '/maps', token)) == 1
         project = call('/maps/' + map_id + '/export.json', token, binary=True)
+        if args.map_png:
+            image=call('/maps/'+map_id+'/export.png?size=2048',token,binary=True)
+            assert image.startswith(b'\x89PNG\r\n\x1a\n')
+            image_out=Path(args.out); image_out.mkdir(parents=True,exist_ok=True)
+            (image_out/(args.shape+'.png')).write_bytes(image)
         if args.vectors:
             saved = Path(args.out)
             saved.mkdir(parents=True, exist_ok=True)
@@ -176,6 +244,12 @@ def main():
         assert len(imported_maps) == 1
         for suffix, data in vector_fields.items():
             assert call('/maps/' + imported_maps[0]['id'] + suffix, token) == data
+        if args.vectors and metadata.get('tectonic_history',{}).get('lifecycle',{}).get('identities'):
+            restored = call('/maps/'+imported_maps[0]['id']+'/tectonics',token)
+            assert restored['lifecycle'] == life
+        if args.vectors:
+            assert call('/maps/'+imported_maps[0]['id']+'/hydrology',token)==saved_water
+            assert call('/maps/'+imported_maps[0]['id']+'/field/flow_receiver',token,binary=True)==receiver_bytes
         rebuilt, rebuilt_labels, _, rebuild_secs = geography(imported_maps[0]['id'], token)
         assert rebuilt_labels == labels
         assert [(f['id'], f['kind'], f['parent'], f['anchor_cell']) for f in rebuilt['features']] == [

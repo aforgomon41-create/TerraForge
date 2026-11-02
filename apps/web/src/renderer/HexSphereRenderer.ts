@@ -18,6 +18,7 @@ export interface CellData {
   /** 每格降水（毫米/年）。可选。 */
   precipitations?: Float32Array
   flows?: Float32Array
+  lakeDepths?: Float32Array
   plateIds?: Float32Array
   indices: Uint32Array
   count: number
@@ -59,6 +60,7 @@ export class HexSphereRenderer {
   private instTempBuf: WebGLBuffer | null = null
   private instPrecipBuf: WebGLBuffer | null = null
   private instFlowBuf: WebGLBuffer | null = null
+  private instLakeBuf: WebGLBuffer | null = null
   private geographyBuf: WebGLBuffer | null = null
   private geographySourceIds: Uint32Array | undefined
   private geographyActive = false
@@ -277,6 +279,22 @@ export class HexSphereRenderer {
   getCanvas(): HTMLCanvasElement {
     return this.canvas
   }
+  /** Snapshot immediately after drawing; WebGL may clear the buffer later. */
+  capturePng(): Promise<Blob> {
+    return new Promise((resolve, reject) => {
+      requestAnimationFrame(() => {
+        try {
+          this.render()
+          this.canvas.toBlob(
+            (blob) => (blob ? resolve(blob) : reject(new Error('地图图像未能生成'))),
+            'image/png',
+          )
+        } catch (e) {
+          reject(e)
+        }
+      })
+    })
+  }
 
   /** 上传格子数据。 */
   setCells(data: CellData) {
@@ -332,6 +350,7 @@ export class HexSphereRenderer {
     this.instTempBuf = upload(4, channel(data.temperatures), 1, this.instTempBuf)
     this.instPrecipBuf = upload(5, channel(data.precipitations), 1, this.instPrecipBuf)
     this.instFlowBuf = upload(6, channel(data.flows), 1, this.instFlowBuf)
+    this.instLakeBuf = upload(10, channel(data.lakeDepths), 1, this.instLakeBuf)
     this.instPlateBuf = upload(3, channel(data.plateIds), 1, this.instPlateBuf)
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuf)
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
@@ -543,6 +562,7 @@ export class HexSphereRenderer {
       this.instTempBuf,
       this.instPrecipBuf,
       this.instFlowBuf,
+      this.instLakeBuf,
       this.instPlateBuf,
       this.geographyBuf,
       this.partitionBuf,
@@ -696,7 +716,7 @@ export class HexSphereRenderer {
       gl.disable(gl.DEPTH_TEST)
       gl.enable(gl.BLEND)
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
-      if (![6, 7, 8, 9].includes(this.layer)) {
+      if (![6, 7, 8, 9, 10].includes(this.layer)) {
         gl.uniform4f(lu('uColor'), 0.27, 0.36, 0.29, 0.22)
         gl.drawArrays(gl.LINES, 0, this.lineCount)
       } else {
@@ -723,7 +743,11 @@ export class HexSphereRenderer {
           gl.bindVertexArray(group.vao)
           gl.uniform4fv(
             lu('uColor'),
-            this.layer === 7 ? [0.22, 0.29, 0.24, 0.8] : colors[index] || colors[3],
+            this.layer === 10
+              ? [0.19, 0.43, 0.49, 0.82]
+              : this.layer === 7
+                ? [0.22, 0.29, 0.24, 0.8]
+                : colors[index] || colors[3],
           )
           gl.drawArrays(gl.LINES, 0, group.count)
         })

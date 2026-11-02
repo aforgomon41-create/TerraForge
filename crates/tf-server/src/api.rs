@@ -79,6 +79,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/maps/{id}/children", post(generate_child))
         .route("/api/v1/maps/{id}/export.json", get(export_json))
         .route("/api/v1/maps/{id}/export.png", get(export_png))
+        .route(
+            "/api/v1/maps/{id}/hydrology",
+            get(crate::hydrology::get_hydrology),
+        )
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/events", get(sse_events))

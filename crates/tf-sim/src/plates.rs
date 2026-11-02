@@ -35,6 +35,7 @@ pub struct TectonicState {
     pub planar_velocities: Option<Vec<DVec3>>,
     pub planar_spin_rad_myr: Option<Vec<f64>>,
     pub provinces: Vec<crate::geology::GeologicProvince>,
+    pub lifecycle: crate::lifecycle::Lifecycle,
     pub centers: Vec<DVec3>,
     pub partition_scale: f64,
     pub partition_seed: u64,
@@ -317,6 +318,7 @@ pub fn build_plates<G: GridOps>(
                     .collect()
             }),
             provinces: Vec::new(),
+            lifecycle: Default::default(),
         },
         plate_id,
     )

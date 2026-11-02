@@ -22,6 +22,7 @@ pub mod fields;
 pub mod geography;
 pub mod geology;
 pub mod landforms;
+pub mod lifecycle;
 pub mod pipeline;
 pub mod plates;
 pub mod preview;

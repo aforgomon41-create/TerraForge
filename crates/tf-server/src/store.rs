@@ -102,10 +102,11 @@ pub enum Channel {
     OrogenAge = 14,
     PotentialEvaporation = 15,
     Aridity = 16,
+    FlowReceiver = 17,
 }
 
 impl Channel {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Elevation,
         Self::CrustThickness,
         Self::CrustType,
@@ -123,6 +124,7 @@ impl Channel {
         Self::OrogenAge,
         Self::PotentialEvaporation,
         Self::Aridity,
+        Self::FlowReceiver,
     ];
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|ch| ch.name() == name)
@@ -146,6 +148,7 @@ impl Channel {
             Channel::OrogenAge => "orogen_age",
             Channel::PotentialEvaporation => "potential_evaporation",
             Channel::Aridity => "aridity",
+            Channel::FlowReceiver => "flow_receiver",
         }
     }
 }

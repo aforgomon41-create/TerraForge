@@ -296,6 +296,15 @@ pub fn import(
                         .all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()),
                 "通道数据损坏或含无效数值"
             );
+            if ch == Channel::FlowReceiver {
+                anyhow::ensure!(
+                    data.chunks_exact(4).all(|b| {
+                        let r = f32::from_le_bytes(b.try_into().unwrap());
+                        r == -1. || (r >= 0. && r.fract() == 0. && (r as usize) < field.count)
+                    }),
+                    "水系下游编号无效"
+                );
+            }
             channels.push((ch, compressed));
         }
         for required in [
@@ -316,6 +325,15 @@ pub fn import(
         node.parent = node.parent.map(|p| ids[&p].clone());
         node.world_id = world.id.clone();
         let mut metadata: serde_json::Value = serde_json::from_str(m.metadata.get())?;
+        if let Some(value) = metadata.pointer("/tectonic_history/lifecycle") {
+            let life: tf_sim::lifecycle::Lifecycle = serde_json::from_value(value.clone())?;
+            let count = metadata
+                .get("plates")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            life.validate(count, params.tectonic_age_myr)
+                .map_err(anyhow::Error::msg)?;
+        }
         if let Some(climate) = metadata.get("climate_atlas") {
             let atlas = crate::climatology::decode(climate)?;
             anyhow::ensure!(

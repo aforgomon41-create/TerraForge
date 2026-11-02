@@ -38,6 +38,11 @@ pub async fn get_tectonics(
             root=st.store.get_map_node(parent)?.ok_or_else(||anyhow::anyhow!("缺少运动父图"))?;
             anyhow::ensure!(root.world_id==node.world_id,"运动父图不属于此工程");
         }
+        // Descendants keep their root's geological identity table. Copying
+        // the full history into every local map would inflate project files.
+        let root_meta=if root.id==node.id {metadata.clone()}else{st.store.get_metadata(&root.id)?.unwrap_or_default()};
+        let lifecycle:Option<tf_sim::lifecycle::Lifecycle>=root_meta.pointer("/tectonic_history/lifecycle").filter(|v|!v.is_null()).map(|v|serde_json::from_value(v.clone())).transpose()?;
+        if let Some(life)=&lifecycle {life.validate(plates.len(),4600.).map_err(anyhow::Error::msg)?;}
         let motion_grid=root.grid.as_ref().ok_or_else(||anyhow::anyhow!("缺少原始运动网格"))?;
         let fine=descriptor.build();
         let coarse=match descriptor.clone() {
@@ -124,10 +129,10 @@ pub async fn get_tectonics(
                 groups[3].extend(surface(point).to_array().map(|x|x as f32));
             }
             let(lat,lon)=spherical.to_lat_lon_deg();
-            arrows.push(json!({"plate_id":plate,"latitude":lat,"longitude":lon,"speed_cm_year":speed}));
+            arrows.push(json!({"plate_id":plate,"plate_uid":lifecycle.as_ref().map_or(plate as u32,|life|life.uid(plate)),"latitude":lat,"longitude":lon,"speed_cm_year":speed}));
             chosen.push(physical);per_plate[plate]+=1;
         }
-        Ok(json!({"available":true,"groups":groups,"plates":plates,"planar_velocities":planar,"planar_spin_rad_myr":spins,"plate_centers_m":centers,"motion_grid":motion_grid,"arrows":arrows,"reference_frame":"生成器固定地幔参考系；箭头长度统一，速度请查看数值；局部图边界类型按图心运动近似","diagnostic_cells":coarse.cell_count()}))
+        Ok(json!({"available":true,"groups":groups,"plates":plates,"lifecycle":lifecycle,"planar_velocities":planar,"planar_spin_rad_myr":spins,"plate_centers_m":centers,"motion_grid":motion_grid,"arrows":arrows,"reference_frame":"生成器固定地幔参考系；箭头长度统一，速度请查看数值；局部图边界类型按图心运动近似","diagnostic_cells":coarse.cell_count()}))
     }).await??;
     Ok(Json(result))
 }
