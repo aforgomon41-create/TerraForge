@@ -744,7 +744,6 @@ fn collision_resistance(grid: &MapGrid, f: &mut WorldFields, state: &mut Tectoni
     let boundaries = crate::plates::find_boundaries(grid, &f.plate_id, state, f);
     let mut change = vec![DVec3::ZERO; state.plates.len()];
     let mut weight = vec![0.; state.plates.len()];
-    let factor = 1. - (-dt / 12.).exp();
     for b in boundaries {
         let (i, j) = (b.cell as usize, b.other as usize);
         if b.kind == crate::BoundaryKind::Transform {
@@ -757,6 +756,16 @@ fn collision_resistance(grid: &MapGrid, f: &mut WorldFields, state: &mut Tectoni
         }
         let a = f.plate_id[i] as usize;
         let c = f.plate_id[j] as usize;
+        // A growing continental root increases gravitational resistance. A
+        // fixed response time kept driving thick collision zones at essentially
+        // their initial speed, compressing whole continents into plateaus.
+        // 5 km of excess crust corresponds to ~0.76 km Airy uplift; the squared
+        // root scale is a potential-energy proxy, not a mantle force solution.
+        let root = ((f.crust_thickness[i] - f.reference_crust_thickness[i]).max(0.)
+            + (f.crust_thickness[j] - f.reference_crust_thickness[j]).max(0.))
+            as f64
+            * 0.5;
+        let factor = 1. - (-dt / 12. * (1. + (root / 5000.).powi(2))).exp();
         let normal = DVec3::from_array(b.normal);
         let correction = if grid.field_is_planar() {
             normal * b.normal_velocity * 0.5 * factor
@@ -852,7 +861,7 @@ pub fn generate_observed<G: GridOps>(
     }
     material.orogen_age.fill(150.);
     let mut history = History {
-        model: "muscl-conservative-surface+episodic-volcanism-v3".into(),
+        model: "muscl-conservative-surface+episodic-volcanism-v4-buoyant-collision".into(),
         initial_crust_m3: crust_volume(&grid, &material),
         duration_myr: params.tectonic_age_myr,
         ..Default::default()
@@ -1221,6 +1230,65 @@ pub fn landforms<G: GridOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_thick_continental_root_resists_collision_without_stopping_oceanic_motion() {
+        let grid = MapGrid::Plane(FlatGrid::new(20, 10, 1_000_000., 0., 0., 6_371_000.));
+        let state = TectonicState {
+            plates: (0..2)
+                .map(|id| crate::Plate {
+                    id,
+                    euler_pole: DVec3::Y.to_array(),
+                    omega: 0.,
+                    oceanic: false,
+                })
+                .collect(),
+            planar_velocities: Some(vec![
+                DVec3::new(20_000., 3_000., 0.),
+                DVec3::new(-20_000., 3_000., 0.),
+            ]),
+            ..Default::default()
+        };
+        let mut material = WorldFields::with_capacity(grid.cell_count());
+        material.crust_type.fill(1.);
+        material.crust_thickness.fill(35_000.);
+        material.reference_crust_thickness.fill(35_000.);
+        for i in 0..grid.cell_count() {
+            material.plate_id[i] = u16::from(grid.local_center_m(i).unwrap().0 >= 0.);
+        }
+        let mut thin = state.clone();
+        collision_resistance(&grid, &mut material.clone(), &mut thin, 1.);
+        let mut thick = state.clone();
+        let mut rooted = material.clone();
+        rooted.crust_thickness.fill(55_000.);
+        collision_resistance(&grid, &mut rooted, &mut thick, 1.);
+        let relative = |s: &TectonicState| {
+            let v = s.planar_velocities.as_ref().unwrap();
+            v[0].x - v[1].x
+        };
+        assert!(
+            relative(&thick) > 0.
+                && relative(&thick) < relative(&thin)
+                && relative(&thin) < relative(&state)
+        );
+        let velocities = thick.planar_velocities.as_ref().unwrap();
+        assert!((velocities[0].y + velocities[1].y - 6000.).abs() < 1e-8);
+        assert_eq!(rooted.crust_thickness, vec![55_000.; grid.cell_count()]);
+        let remaining = |dt| {
+            let mut trial = state.clone();
+            collision_resistance(&grid, &mut rooted.clone(), &mut trial, dt);
+            relative(&trial)
+        };
+        assert!((remaining(0.) - relative(&state)).abs() < 1e-8);
+        assert!(remaining(1.5) > 0. && remaining(1.5) < relative(&thick));
+        let small_step_ratio =
+            (relative(&state) - remaining(1e-5)) / (relative(&state) - remaining(2e-5));
+        assert!((small_step_ratio - 0.5).abs() < 1e-4);
+        let mut ocean = material;
+        ocean.crust_type.fill(0.);
+        let mut mobile = state.clone();
+        collision_resistance(&grid, &mut ocean, &mut mobile, 1.);
+        assert_eq!(mobile.planar_velocities, state.planar_velocities);
+    }
     #[test]
     fn episodic_hotspot_chain_has_irregular_ages_and_keeps_its_motion_at_finer_steps() {
         let g = MapGrid::Plane(FlatGrid::new(32, 16, 10_000_000., 25., 0., 6371000.));
