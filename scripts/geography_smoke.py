@@ -13,6 +13,15 @@ import urllib.error
 import urllib.request
 
 
+def float_field(raw, offset=0, count=None):
+    values = array.array('f')
+    end = None if count is None else offset + 4*count
+    values.frombytes(memoryview(raw)[offset:end])
+    if sys.byteorder != 'little':
+        values.byteswap()
+    return values
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base', default='http://127.0.0.1:18795/terraforge')
@@ -83,7 +92,8 @@ def main():
         features = catalog['features']
         assert catalog['cell_count'] == node['cells']
         elevation_bytes = call('/maps/' + map_id + '/field/elevation', token, binary=True)
-        height = struct.unpack('<' + 'f'*node['cells'], elevation_bytes)
+        height = float_field(elevation_bytes)
+        assert len(height) == node['cells']
         land_heights = sorted(h for h in height if h > 0)
         if land_heights:
             report['land_elevation_m'] = {str(q): land_heights[round((len(land_heights)-1)*q)] for q in [.1,.5,.9,.99]}
@@ -91,16 +101,19 @@ def main():
             report['land_cell_share_above_3000m'] = sum(h > 3000 for h in land_heights)/len(land_heights)
         if args.tectonic_myr == 0:
             assert report['land_elevation_m']['0.5'] < 800, report
+        del land_heights
         biome_bytes = call('/maps/' + map_id + '/field/biome', token, binary=True)
-        biomes = struct.unpack('<' + 'f'*node['cells'], biome_bytes)
+        biomes = float_field(biome_bytes)
+        assert len(biomes) == node['cells']
         report['land_biome_counts'] = dict(collections.Counter(int(b) for b,h in zip(biomes,height) if h>0))
         if node['grid']['type'] == 'sphere':
             surface = call('/maps/' + map_id + '/surface', token, binary=True)
             version, cells, _ = struct.unpack_from('<III', surface)
             assert version == 1 and cells == node['cells']
-            xyz = struct.unpack_from('<' + 'f'*(3*cells), surface, 12)
-            distance = struct.unpack('<' + 'f'*cells, call('/maps/' + map_id + '/field/distance_to_sea', token, binary=True))
-            temperature = struct.unpack('<' + 'f'*cells, call('/maps/' + map_id + '/field/temperature', token, binary=True))
+            xyz = float_field(surface, 12, 3*cells)
+            distance = float_field(call('/maps/' + map_id + '/field/distance_to_sea', token, binary=True))
+            temperature = float_field(call('/maps/' + map_id + '/field/temperature', token, binary=True))
+            assert len(xyz) == 3*cells and len(distance) == cells and len(temperature) == cells
             inland = [i for i,h in enumerate(height) if h>0 and distance[i]>300_000 and abs(math.degrees(math.asin(max(-1,min(1,xyz[3*i+1])))))<50]
             if inland:
                 heights = sorted(height[i] for i in inland)
@@ -108,6 +121,7 @@ def main():
                     'cells': len(inland), 'median_height_m': heights[len(heights)//2],
                     'mean_temperature_c': sum(temperature[i] for i in inland)/len(inland),
                     'biome_counts': dict(collections.Counter(int(biomes[i]) for i in inland))}
+            del surface, xyz, distance, temperature, inland
         for i, h in enumerate(height):
             assert bool(labels[0][i]) == (h > 0)
             assert bool(labels[1][i]) == (h > 0)
