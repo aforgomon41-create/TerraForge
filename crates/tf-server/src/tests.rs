@@ -230,7 +230,7 @@ async fn rendered_rivers_follow_saved_receivers_and_keep_session_isolation() {
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(body["source"], "saved_priority_flood_receivers");
+    assert_eq!(body["source"], "saved_flow_receivers");
     assert!(body["segments"].as_u64().unwrap() > 0, "{body}");
     let points = body["groups"][0].as_array().unwrap();
     assert_eq!(points.len() % 6, 0);

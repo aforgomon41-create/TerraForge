@@ -80,6 +80,9 @@ export interface CirculationDiagnostic {
 }
 export interface HydrologyDiagnostic {
   available: boolean
+  model?: string
+  legacy_lakes?: boolean
+  notice?: string
   reason?: string
   groups?: number[][]
   segments?: number

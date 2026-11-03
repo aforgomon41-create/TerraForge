@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--zoom', type=float, default=1.)
     parser.add_argument('--center', nargs=2, type=float, default=[0.,0.])
     parser.add_argument('--material-fallback', action='store_true')
+    parser.add_argument('--offline-artifacts', help='Folder containing surface.bin and hydrology.json from offline_world_qa; no network access')
     args = parser.parse_args()
     if not 64 <= args.width <= 8192 or not 0.5 <= args.zoom <= 30:
         parser.error('width must be 64..8192 and zoom must be 0.5..30')
@@ -55,26 +56,32 @@ def main():
                 time.sleep(.3*(attempt+1))
 
     try:
-        token = call('/session', 'POST')['token']
         project_bytes = Path(args.project).read_bytes()
         project = json.loads(project_bytes)
-        imported = call('/projects/import', 'POST', project_bytes)
-        maps = call('/worlds/'+imported['id']+'/maps')
-        node = next(m for m in maps if m['parent'] is None)
         source_map = next(m for m in project['maps'] if m['node']['parent'] is None)
+        if args.offline_artifacts:
+            node = source_map['node']
+        else:
+            token = call('/session', 'POST')['token']
+            imported = call('/projects/import', 'POST', project_bytes)
+            maps = call('/worlds/'+imported['id']+'/maps')
+            node = next(m for m in maps if m['parent'] is None)
         decoder = zstandard.ZstdDecompressor()
         field = source_map['channels']['elevation']
         elevation_bytes = decoder.decompress(base64.b64decode(field['data']),max_output_size=field['count']*4)
         (out/'elevation.bin').write_bytes(elevation_bytes)
-        surface = call('/maps/'+node['id']+'/surface', binary=True)
+        lake_field = source_map['channels'].get('lake_depth')
+        lake_bytes = decoder.decompress(base64.b64decode(lake_field['data']),max_output_size=lake_field['count']*4) if lake_field else bytes(field['count']*4)
+        (out/'lake.bin').write_bytes(lake_bytes)
+        surface = (Path(args.offline_artifacts)/'surface.bin').read_bytes() if args.offline_artifacts else call('/maps/'+node['id']+'/surface', binary=True)
         (out/'surface.bin').write_bytes(surface)
-        water = call('/maps/'+node['id']+'/hydrology')
+        water = json.loads((Path(args.offline_artifacts)/'hydrology.json').read_text(encoding='utf8')) if args.offline_artifacts else call('/maps/'+node['id']+'/hydrology')
         (out/'water.json').write_text(json.dumps(water), encoding='utf8')
         node_exe = shutil.which('node') or r'C:\Program Files\nodejs\node.exe'
         bundle="""import {createRequire} from 'node:module';
 const [root,out]=process.argv.slice(1);const req=createRequire(root+'/apps/web/package.json');
 const local=createRequire(req.resolve('vite/package.json'));const {build}=local('esbuild');
-await build({stdin:{contents:"export * from './surface.ts'; export * from './math.ts'; export * from './projections.ts'; export * from './relief.ts';",resolveDir:root+'/apps/web/src/renderer'},bundle:true,platform:'node',format:'esm',outfile:out+'/surface.mjs'});"""
+await build({stdin:{contents:"export * from './surface.ts'; export * from './math.ts'; export * from './projections.ts'; export * from './relief.ts'; export * from './lakeShore.ts';",resolveDir:root+'/apps/web/src/renderer'},bundle:true,platform:'node',format:'esm',outfile:out+'/surface.mjs'});"""
         subprocess.run([node_exe,'--input-type=module','-e',bundle,str(root),str(out)],check=True)
         javascript = """
 import fs from 'node:fs'; import {pathToFileURL} from 'node:url';
@@ -90,6 +97,11 @@ const atlas=flat?geometry.atlasSurface(centers,indices):{positions:centers,indic
 const h=fs.readFileSync(directory+'/elevation.bin');
 const heights=new Float32Array(h.buffer.slice(h.byteOffset,h.byteOffset+h.byteLength));
 const gradient=geometry.heightGradients(Float32Array.from(centers,v=>v*Number(normalization)),indices,heights);
+const lakeBytes=fs.readFileSync(directory+'/lake.bin');
+const lakeDepth=new Float32Array(lakeBytes.buffer.slice(lakeBytes.byteOffset,lakeBytes.byteOffset+lakeBytes.byteLength));
+const shore=geometry.lakeShoreDepths(heights,lakeDepth,indices);
+const mappedShore=Float32Array.from(atlas.sourceIds,id=>shore[id]);
+fs.writeFileSync(directory+'/shore.bin',Buffer.from(mappedShore.buffer));
 const mappedGradient=Float32Array.from({length:atlas.sourceIds.length*3},(_,i)=>gradient[atlas.sourceIds[Math.floor(i/3)]*3+i%3]);
 fs.writeFileSync(directory+'/gradients.bin',Buffer.from(mappedGradient.buffer));
 fs.writeFileSync(directory+'/geoPositions.bin',Buffer.from(atlas.positions.buffer));
@@ -157,7 +169,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
         attributes={'aCenter':positions,'aAtlasPosition':geo_positions,'aHeight':channel('elevation'),'aBiome':channel('biome'),
                     'aHeightGradient':np.fromfile(out/'gradients.bin',dtype='<f4').reshape(-1,3),
                     'aPlate':channel('plate_id'),'aTemperature':channel('temperature'),'aPrecipitation':channel('precipitation'),
-                    'aFlow':channel('flow_accumulation'),'aLake':channel('lake_depth'),
+                    'aFlow':channel('flow_accumulation'),'aLake':np.fromfile(out/'shore.bin',dtype='<f4'),
                     'aGeography':np.zeros(len(source_ids),dtype='f4'),'aPartition':np.zeros(len(source_ids),dtype='f4')}
         program['uHeightScale'].value=.025/max(float(attributes['aHeight'].max()),1.)
         for name,values in attributes.items():
@@ -186,6 +198,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
         gl_error = ctx.error
         if gl_error != 'GL_NO_ERROR': raise RuntimeError(gl_error)
         report={'result':'passed','exact_es300_sources':True,'browser_ui_checked':False,'renderer':ctx.info['GL_RENDERER'],
+                'offline_artifacts':bool(args.offline_artifacts),
                 'view':args.view if sphere else 'plane','pixels':[width,height],'material_fallback':args.material_fallback,
                 'zoom':args.zoom,'center':args.center,
                 'material_sha256':hashlib.sha256(pigment_path.read_bytes()).hexdigest(),'gl_error':gl_error,

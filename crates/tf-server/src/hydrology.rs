@@ -29,6 +29,9 @@ pub async fn get_hydrology(
         let flow=st.store.get_field(&id,Channel::FlowAccumulation)?.ok_or_else(||anyhow::anyhow!("缺少汇流资料"))?;
         let height=st.store.get_field(&id,Channel::Elevation)?.ok_or_else(||anyhow::anyhow!("缺少高程"))?;
         let lake=st.store.get_field(&id,Channel::LakeDepth)?.unwrap_or_else(||vec![0.;height.len()]);
+        let metadata=st.store.get_metadata(&id)?.unwrap_or_default();
+        let model=metadata.get("hydrology_model").and_then(|v|v.get("name")).and_then(Value::as_str);
+        let legacy=model!=Some("depression-hierarchy-annual-balance-v1");
         let grid=node.grid.as_ref().ok_or_else(||anyhow::anyhow!("缺少地图网格"))?.build();
         let n=grid.cell_count();
         anyhow::ensure!([receivers.len(),flow.len(),height.len(),lake.len()].iter().all(|&s|s==n),"水系资料尺寸无效");
@@ -42,10 +45,14 @@ pub async fn get_hydrology(
             let r=receivers[i];let j=r as usize;
             anyhow::ensure!(r.is_finite() && r.fract()==0. && j<n,"水系下游编号无效");
             if i==j{continue;}
+            // A saved legacy potential route may climb over a dry sill. It is
+            // not a currently flowing river. Account for f32 water-level roundoff.
+            let down=if height[j]<=0. {0.} else {height[j]+lake[j]};
+            if down>height[i]+lake[i]+0.002 {continue;}
             for cell in [i,j]{let p=if grid.field_is_planar(){grid.field_position(cell)}else{grid.center_dir(cell).as_vec()*1.0006};lines.extend(p.to_array().map(|x|x as f32));}
             count+=1;
         }
-        Ok(json!({"available":true,"groups":[lines],"segments":count,"minimum_upstream_area_m2":threshold,"source":"saved_priority_flood_receivers","limited":threshold>(node.cell_size_m.powi(2)*40.).max(100.)}))
+        Ok(json!({"available":true,"groups":[lines],"segments":count,"minimum_upstream_area_m2":threshold,"source":"saved_flow_receivers","model":model,"legacy_lakes":legacy,"notice":if legacy {Some("此地图使用旧水文规则，重新生成后可应用湖泊修正。")} else {None},"limited":threshold>(node.cell_size_m.powi(2)*40.).max(100.)}))
     }).await??;
     Ok(Json(result))
 }

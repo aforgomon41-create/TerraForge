@@ -21,6 +21,7 @@ pub mod evolution;
 pub mod fields;
 pub mod geography;
 pub mod geology;
+pub mod lakes;
 pub mod landforms;
 pub mod lifecycle;
 pub mod pipeline;

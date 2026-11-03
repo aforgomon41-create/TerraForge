@@ -8,6 +8,7 @@ import { frameTextureChannels } from './frameTexture'
 import { createPigmentTexture } from './pigmentTexture'
 import pigmentUrl from '../assets/atlas-pigment.png'
 import { heightGradients } from './relief'
+import { lakeShoreDepths } from './lakeShore'
 
 export interface CellData {
   /** 格子中心方向 xyz 交错，长度 = count * 3 */
@@ -364,7 +365,8 @@ export class HexSphereRenderer {
     this.instTempBuf = upload(4, channel(data.temperatures), 1, this.instTempBuf)
     this.instPrecipBuf = upload(5, channel(data.precipitations), 1, this.instPrecipBuf)
     this.instFlowBuf = upload(6, channel(data.flows), 1, this.instFlowBuf)
-    this.instLakeBuf = upload(10, channel(data.lakeDepths), 1, this.instLakeBuf)
+    const lakeShore = lakeShoreDepths(data.heights, data.lakeDepths, data.indices)
+    this.instLakeBuf = upload(10, channel(lakeShore), 1, this.instLakeBuf)
     this.instPlateBuf = upload(3, channel(data.plateIds), 1, this.instPlateBuf)
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuf)
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)

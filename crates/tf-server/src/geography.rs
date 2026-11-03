@@ -7,6 +7,7 @@ use crate::{
 use axum::extract::{Path, State};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::io::Read;
+use tf_grid::GridOps;
 use tf_sim::geography::{Feature, Geography};
 
 const MAX_RAW: usize = 128 * 1024 * 1024;
@@ -113,15 +114,14 @@ fn for_map(store: &Store, node: &MapNodeRecord) -> anyhow::Result<Geography> {
     let elevation = store
         .get_field(&node.id, Channel::Elevation)?
         .ok_or_else(|| anyhow::anyhow!("缺少地形"))?;
-    let mut fields = tf_sim::WorldFields {
-        elevation,
-        lake_depth: vec![0.; node.cells as usize],
-        flow_accumulation: vec![0.; node.cells as usize],
-        precipitation: store
-            .get_field(&node.id, Channel::Precipitation)?
-            .unwrap_or_default(),
-        ..Default::default()
-    };
+    let mut fields = tf_sim::WorldFields::with_capacity(grid.cell_count());
+    fields.elevation = elevation;
+    if let Some(rain) = store.get_field(&node.id, Channel::Precipitation)? {
+        fields.precipitation = rain;
+    }
+    if let Some(pet) = store.get_field(&node.id, Channel::PotentialEvaporation)? {
+        fields.potential_evaporation = pet;
+    }
     let water = tf_sim::erosion::refresh_hydrology(&grid, &mut fields);
     let g = tf_sim::geography::recognize(&grid, &fields, &water, &|| false)
         .map_err(anyhow::Error::msg)?;

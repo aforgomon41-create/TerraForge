@@ -11,10 +11,10 @@ out vec2 vAtlasPosition;
 out vec3 vPaintColor;out vec2 vVegetation;
 layout(location=11)in vec3 aHeightGradient;out vec3 vHeightGradient;
 vec3 biome(float value){int b=int(value+.5);
-if(b==1)return vec3(.91,.93,.90);if(b==2)return vec3(.65,.69,.58);if(b==3)return vec3(.30,.43,.32);if(b==4)return vec3(.40,.54,.34);if(b==5)return vec3(.66,.71,.43);if(b==6)return vec3(.65,.67,.44);if(b==7)return vec3(.81,.71,.50);if(b==8)return vec3(.73,.71,.45);if(b==9)return vec3(.25,.46,.32);if(b==10)return vec3(.37,.55,.34);if(b==11)return vec3(.67,.69,.55);if(b==12)return vec3(.36,.52,.44);return vec3(.55,.64,.56);}
+if(b==1)return vec3(.91,.93,.90);if(b==2)return vec3(.65,.69,.58);if(b==3)return vec3(.30,.43,.32);if(b==4)return vec3(.40,.54,.34);if(b==5)return vec3(.66,.71,.43);if(b==6)return vec3(.65,.67,.44);if(b==7)return vec3(.81,.71,.50);if(b==8)return vec3(.73,.71,.45);if(b==9)return vec3(.25,.46,.32);if(b==10)return vec3(.37,.55,.34);if(b==11)return vec3(.67,.69,.55);if(b==12)return vec3(.36,.52,.44);if(b==13)return vec3(.20,.55,.63);return vec3(.55,.64,.56);}
 // Separate art palette: the scientific biome layer retains its own colors.
 vec3 paintedBiome(float value){int b=int(value+.5);
-if(b==1)return vec3(.92,.95,.92);if(b==2)return vec3(.64,.66,.46);if(b==3)return vec3(.23,.40,.28);if(b==4)return vec3(.34,.48,.25);if(b==5)return vec3(.72,.73,.35);if(b==6)return vec3(.66,.66,.34);if(b==7)return vec3(.84,.71,.43);if(b==8)return vec3(.76,.70,.34);if(b==9)return vec3(.18,.38,.25);if(b==10)return vec3(.33,.49,.25);if(b==11)return vec3(.64,.61,.46);if(b==12)return vec3(.34,.52,.39);return vec3(.62,.69,.42);}
+if(b==1)return vec3(.92,.95,.92);if(b==2)return vec3(.64,.66,.46);if(b==3)return vec3(.23,.40,.28);if(b==4)return vec3(.34,.48,.25);if(b==5)return vec3(.72,.73,.35);if(b==6)return vec3(.66,.66,.34);if(b==7)return vec3(.84,.71,.43);if(b==8)return vec3(.76,.70,.34);if(b==9)return vec3(.18,.38,.25);if(b==10)return vec3(.33,.49,.25);if(b==11)return vec3(.64,.61,.46);if(b==12)return vec3(.34,.52,.39);if(b==13)return vec3(.45,.53,.32);return vec3(.62,.69,.42);}
 
 void main(){
   vLake=aLake;
@@ -53,7 +53,7 @@ in vec3 vHeightGradient;uniform bool uPreviewMode;
 uniform sampler2D uPigmentTex;
 uniform bool uPlanarMode,uWorldFlatMode;uniform float uMapMetres;uniform vec3 uLightDir;uniform int uStyle,uLayer,uProjection;out vec4 fragColor;
 vec3 biome(float value){int b=int(value+.5);
-if(b==1)return vec3(.91,.93,.90);if(b==2)return vec3(.65,.69,.58);if(b==3)return vec3(.30,.43,.32);if(b==4)return vec3(.40,.54,.34);if(b==5)return vec3(.66,.71,.43);if(b==6)return vec3(.65,.67,.44);if(b==7)return vec3(.81,.71,.50);if(b==8)return vec3(.73,.71,.45);if(b==9)return vec3(.25,.46,.32);if(b==10)return vec3(.37,.55,.34);if(b==11)return vec3(.67,.69,.55);if(b==12)return vec3(.36,.52,.44);return vec3(.55,.64,.56);}
+if(b==1)return vec3(.91,.93,.90);if(b==2)return vec3(.65,.69,.58);if(b==3)return vec3(.30,.43,.32);if(b==4)return vec3(.40,.54,.34);if(b==5)return vec3(.66,.71,.43);if(b==6)return vec3(.65,.67,.44);if(b==7)return vec3(.81,.71,.50);if(b==8)return vec3(.73,.71,.45);if(b==9)return vec3(.25,.46,.32);if(b==10)return vec3(.37,.55,.34);if(b==11)return vec3(.67,.69,.55);if(b==12)return vec3(.36,.52,.44);if(b==13)return vec3(.20,.55,.63);return vec3(.55,.64,.56);}
 vec3 ocean(float h){return mix(vec3(.60,.73,.72),vec3(.30,.48,.53),clamp(-h/6500.,0.,1.));}
 vec3 temperature(float t){float n=clamp((t+40.)/80.,0.,1.);return n<.5?mix(vec3(.35,.48,.70),vec3(.78,.82,.64),n*2.):mix(vec3(.78,.82,.64),vec3(.77,.35,.24),(n-.5)*2.);}
 vec3 precipitation(float p){return mix(vec3(.83,.74,.51),vec3(.21,.45,.58),pow(clamp(p/3000.,0.,1.),.6));}

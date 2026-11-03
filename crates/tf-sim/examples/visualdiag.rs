@@ -75,7 +75,7 @@ fn main() {
     );
 
     // 4. 各群系占比
-    let mut counts = [0usize; 13];
+    let mut counts = [0usize; 14];
     for i in 0..n {
         counts[world.ecology.biome[i] as usize] += 1;
     }
@@ -93,6 +93,7 @@ fn main() {
         "热带季雨林",
         "高山草甸",
         "湿地",
+        "内陆水体",
     ];
     println!();
     for (k, &c) in counts.iter().enumerate() {

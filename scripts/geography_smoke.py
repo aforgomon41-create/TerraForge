@@ -182,6 +182,18 @@ def main():
         assert cached == catalog and repeated == labels
         metadata = call('/maps/' + map_id + '/metadata', token)
         assert 'geography_v1' not in metadata
+        if metadata.get('hydrology_model', {}).get('lake_depth') == 'actual_supported_water':
+            model = metadata['hydrology_model']
+            water, sediment = model['water'], model.get('sediment')
+            assert abs(water['residual_m3_yr']) <= max(1, water['precipitation_m3_yr']) * 1e-8, water
+            if sediment:
+                assert abs(sediment['residual_m3']) <= max(1, sediment['eroded_m3']) * 1e-8, sediment
+            lakes = float_field(call('/maps/'+map_id+'/field/lake_depth', token, binary=True))
+            assert len(lakes) == len(height) and all(math.isfinite(d) and d >= 0 for d in lakes)
+            assert all(b != 12 or .1 <= d <= 2.5 for b,d in zip(biomes,lakes)), 'deep or dry wetland'
+            lake_cells = sum(h > 0 and d > .5 for h,d in zip(height,lakes))
+            report['actual_lakes'] = {'cells':lake_cells, 'land_cell_fraction':lake_cells/max(1,sum(h>0 for h in height)),
+                                      'water_budget':water, 'sediment':sediment}
         vector_fields = {}
         if args.vectors:
             assert 'climate_atlas' not in metadata
@@ -205,7 +217,7 @@ def main():
                 'duration_myr', 'output_step_myr', 'ancient_duration_myr', 'detailed_duration_myr',
                 'ancient_steps', 'steps', 'relative_budget_error']}
             saved_water=call('/maps/'+map_id+'/hydrology',token)
-            assert saved_water['available'] and saved_water['source']=='saved_priority_flood_receivers'
+            assert saved_water['available'] and saved_water['source']=='saved_flow_receivers'
             assert saved_water['segments']<=60000 and all(len(g)%6==0 for g in saved_water['groups'])
             call('/maps/'+map_id+'/hydrology',other,expected=404)
             report['river_segments']=saved_water['segments']

@@ -27,6 +27,7 @@ pub enum Biome {
     TropicalSeasonalForest = 10,
     AlpineMeadow = 11,
     Wetland = 12,
+    InlandWater = 13,
 }
 
 impl Biome {
@@ -45,6 +46,7 @@ impl Biome {
             Biome::TropicalSeasonalForest => "热带季雨林",
             Biome::AlpineMeadow => "高山草甸",
             Biome::Wetland => "湿地",
+            Biome::InlandWater => "内陆水体",
         }
     }
 
@@ -64,6 +66,7 @@ impl Biome {
             Biome::TropicalSeasonalForest => [50, 120, 45],
             Biome::AlpineMeadow => [120, 140, 100],
             Biome::Wetland => [70, 110, 80],
+            Biome::InlandWater => [51, 140, 161],
         }
     }
 }
@@ -140,15 +143,20 @@ pub fn run_ecology_with_diversity<G: GridOps>(
             // annual-only fallback rather than inventing an observed wet season.
             classify_biome(t, prec, fields.elevation[i]) as u8
         };
-        if fields.lake_depth[i] > 0.01 && fields.elevation[i] > 0. && fields.temperature[i] > 0. {
-            *b = Biome::Wetland as u8;
+        if fields.lake_depth[i] >= 0.1 {
+            let shallow = fields.lake_depth[i] <= 2.5 && fields.temperature[i] > 0.;
+            *b = if shallow {
+                Biome::Wetland as u8
+            } else {
+                Biome::InlandWater as u8
+            };
         }
     });
 
     // 土壤：Jenny 方程的简化实现
     for i in 0..n {
         let b = biome[i];
-        if b == Biome::Ocean as u8 {
+        if b == Biome::Ocean as u8 || b == Biome::InlandWater as u8 {
             continue;
         }
         let (t, d) = classify_soil(
@@ -163,7 +171,10 @@ pub fn run_ecology_with_diversity<G: GridOps>(
 
     // 河流沿线算冲积土
     for i in 0..n {
-        if fields.flow_accumulation[i] > 5e9 && fields.elevation[i] > 0.0 {
+        if fields.flow_accumulation[i] > 5e9
+            && fields.elevation[i] > 0.0
+            && biome[i] != Biome::InlandWater as u8
+        {
             soil[i] = SoilType::Alluvial as u8;
             soil_depth[i] = soil_depth[i].max(1.5);
         }
@@ -326,6 +337,29 @@ pub fn classify_seasonal(
 #[cfg(test)]
 mod seasonal_tests {
     use super::*;
+    #[test]
+    fn dry_land_shallow_wetlands_and_deep_lakes_remain_distinct() {
+        use tf_grid::GridOps;
+        let grid = tf_grid::FlatGrid::new(6, 4, 6000., 25., 0., 6371000.);
+        let mut f = WorldFields::with_capacity(grid.cell_count());
+        f.elevation.fill(100.);
+        f.temperature.fill(15.);
+        f.precipitation.fill(800.);
+        f.lake_depth[1] = 1.;
+        f.lake_depth[2] = 25.;
+        f.lake_depth[3] = 1.;
+        f.temperature[3] = -5.;
+        f.flow_accumulation[2] = 1e12;
+        let ecology = run_ecology(&grid, &f);
+        assert_ne!(ecology.biome[0], Biome::Wetland as u8);
+        assert_ne!(ecology.biome[0], Biome::InlandWater as u8);
+        assert_eq!(ecology.biome[1], Biome::Wetland as u8);
+        for i in [2, 3] {
+            assert_eq!(ecology.biome[i], Biome::InlandWater as u8);
+            assert_eq!(ecology.soil[i], SoilType::None as u8);
+            assert_eq!(ecology.soil_depth_m[i], 0.);
+        }
+    }
     #[test]
     fn the_same_rainfall_can_support_cold_grassland_or_hot_desert() {
         let rain = [20.; 12];

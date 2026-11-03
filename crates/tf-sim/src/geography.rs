@@ -504,7 +504,7 @@ pub fn recognize<G: GridOps>(
         out.site[i] = id;
     }
     check()?;
-    // Filled depressions are candidate lake basins, not proven permanent lakes.
+    // lake_depth now describes annually supported water, not fill capacity.
     let mut seen = vec![false; n];
     for i in 0..n {
         if seen[i] || h[i] <= 0. || fields.lake_depth[i] < 1. {
@@ -615,13 +615,10 @@ mod tests {
     use tf_grid::GridDescriptor;
     fn detect(grid: &impl GridOps, h: Vec<f32>) -> Geography {
         let original = h.clone();
-        let mut f = WorldFields {
-            elevation: h,
-            lake_depth: vec![0.; grid.cell_count()],
-            flow_accumulation: vec![0.; grid.cell_count()],
-            precipitation: vec![600.; grid.cell_count()],
-            ..Default::default()
-        };
+        let mut f = WorldFields::with_capacity(grid.cell_count());
+        f.elevation = h;
+        f.precipitation.fill(600.);
+        f.potential_evaporation.fill(1000.);
         let water = crate::erosion::refresh_hydrology(grid, &mut f);
         let out = recognize(grid, &f, &water, &|| false).unwrap();
         assert_eq!(f.elevation, original);

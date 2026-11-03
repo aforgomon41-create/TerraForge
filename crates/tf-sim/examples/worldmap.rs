@@ -292,6 +292,7 @@ fn biome_color(b: u8) -> [u8; 3] {
         Biome::TropicalSeasonalForest,
         Biome::AlpineMeadow,
         Biome::Wetland,
+        Biome::InlandWater,
     ];
     list.get(b as usize)
         .map(|x| x.color())

@@ -157,6 +157,7 @@ const biomes = [
   '热带季雨林',
   '高山草甸',
   '湿地',
+  '内陆水体',
 ]
 const tectonics = ref<TectonicDiagnostic | null>(null)
 const circulation = ref<CirculationDiagnostic | null>(null)
@@ -1534,6 +1535,9 @@ onBeforeUnmount(() => {
                 ? `地形明暗、生态植被与真实河道；${hydrology.segments || 0} 段河流，湖泊随地形保存。`
                 : hydrology?.reason || '正在读取水系…'
           }}
+        </p>
+        <p v-if="layer === 10 && hydrology?.notice" class="layer-help" role="status">
+          {{ hydrology.notice }}
         </p>
         <p v-if="layer === 6" class="layer-help" role="status">
           {{ plateStatus }}

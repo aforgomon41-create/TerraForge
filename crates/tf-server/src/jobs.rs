@@ -360,6 +360,7 @@ pub fn persist_fields<G: tf_grid::GridOps>(
         .map(|&r| if r == u32::MAX { -1. } else { r as f32 })
         .collect();
     let mut metadata = serde_json::json!({"minerals":world.minerals,"plates":world.tectonic.plates,"planar_velocities":world.tectonic.planar_velocities,"planar_spin_rad_myr":world.tectonic.planar_spin_rad_myr,"plate_centers_m":world.tectonic.centers,"motion_domain":if world.tectonic.planar_velocities.is_some() {"plane"} else {"sphere"},"tectonic_history":world.tectonic.history,"generator_version":"tf-0.5"});
+    metadata["hydrology_model"] = serde_json::json!({"name":"depression-hierarchy-annual-balance-v1","lake_depth":"actual_supported_water","water":world.erosion.lake_budget,"sediment":world.erosion.sediment});
     if let Some(atlas) = &f.climate {
         metadata["climate_atlas"] = crate::climatology::encode(atlas)?;
         metadata["climate_model"] = serde_json::json!({"name":atlas.model,"months":12,"cells":atlas.grid.cell_count(),"energy":atlas.energy,"water":atlas.water,"pet":"Thornthwaite temperature/daylength approximation"});

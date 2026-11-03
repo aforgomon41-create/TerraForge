@@ -1,4 +1,4 @@
-//! Priority-Flood drainage, area-conserving accumulation and implicit incision.
+//! Actual-water-surface drainage, conservative accumulation and implicit incision.
 use crate::fields::WorldFields;
 use std::{
     cmp::Ordering,
@@ -33,6 +33,26 @@ impl Default for ErosionParams {
 pub struct ErosionState {
     pub flow_dir: Vec<u32>,
     pub topo_order: Vec<u32>,
+    pub lake_budget: crate::lakes::LakeBudget,
+    pub sediment: SedimentBudget,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct SedimentBudget {
+    pub eroded_m3: f64,
+    pub deposited_m3: f64,
+    pub exported_m3: f64,
+    pub suspended_m3: f64,
+    pub residual_m3: f64,
+}
+impl std::ops::AddAssign for SedimentBudget {
+    fn add_assign(&mut self, other: Self) {
+        self.eroded_m3 += other.eroded_m3;
+        self.deposited_m3 += other.deposited_m3;
+        self.exported_m3 += other.exported_m3;
+        self.suspended_m3 += other.suspended_m3;
+        self.residual_m3 += other.residual_m3;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -59,120 +79,89 @@ impl Ord for Entry {
     }
 }
 
-/// Flood outward from oceans and open map boundaries. The flood parent drains
-/// equal-height flats without adding arbitrary epsilon elevations to the ground.
+/// Route the actual ground/water surface. A dry depression is a real terminal,
+/// not a permanently full reservoir. Equal surfaces drain by a breadth-first
+/// forest, so lake outlets and flat plains have no arbitrary epsilon slopes.
 fn drainage<G: GridOps>(grid: &G, fields: &mut WorldFields) -> ErosionState {
     let n = grid.cell_count();
-    let mut seen = vec![false; n];
-    let mut levels = fields.elevation.clone();
-    let mut receivers = vec![u32::MAX; n];
-    let mut heap = BinaryHeap::new();
-    let mut pit = VecDeque::new();
-    let mut order = Vec::with_capacity(n);
+    let (surface, lake_budget) = crate::lakes::balance(grid, fields);
+    let mut receiver = vec![u32::MAX; n];
+    let mut assigned = vec![false; n];
+    let mut queue = VecDeque::new();
     let boundary = grid.boundary_mask();
     for i in 0..n {
         if fields.elevation[i] <= 0. {
-            seen[i] = true;
-            order.push(i as u32);
-            if grid
-                .neighbors(i)
-                .iter()
-                .any(|&j| fields.elevation[j as usize] > 0.)
-            {
-                heap.push(Entry {
-                    height: 0.,
-                    cell: i,
-                });
-            }
-        } else if boundary[i] {
-            seen[i] = true;
-            heap.push(Entry {
-                height: levels[i] as f64,
-                cell: i,
-            });
-        }
-    }
-    if heap.is_empty() && order.len() < n {
-        let i = (0..n)
-            .min_by(|&a, &b| levels[a].total_cmp(&levels[b]))
-            .unwrap();
-        seen[i] = true;
-        heap.push(Entry {
-            height: levels[i] as f64,
-            cell: i,
-        });
-    }
-    let mut rank = vec![usize::MAX; n];
-    while !heap.is_empty() || !pit.is_empty() {
-        let cur = if let Some(i) = pit.pop_front() {
-            i
-        } else {
-            heap.pop().unwrap().cell
-        };
-        if rank[cur] != usize::MAX {
+            assigned[i] = true;
             continue;
         }
-        rank[cur] = order.len();
-        if fields.elevation[cur] > 0. {
-            order.push(cur as u32)
+        if boundary[i] {
+            assigned[i] = true;
+            queue.push_back(i);
+            continue;
         }
-        let level = if fields.elevation[cur] <= 0. {
-            0.
-        } else {
-            levels[cur]
-        };
-        for &nb in grid.neighbors(cur) {
+        let mut slope = 0.;
+        for &nb in grid.neighbors(i) {
             let j = nb as usize;
-            if seen[j] {
-                continue;
-            }
-            seen[j] = true;
-            receivers[j] = cur as u32;
-            if levels[j] <= level {
-                levels[j] = level;
-                pit.push_back(j)
-            } else {
-                heap.push(Entry {
-                    height: levels[j] as f64,
-                    cell: j,
-                })
-            }
-        }
-    }
-    // Oceans have no receiver; every positive cell is reached, including flats.
-    for i in 0..n {
-        fields.lake_depth[i] = if fields.elevation[i] > 0. {
-            (levels[i] - fields.elevation[i]).max(0.)
-        } else {
-            0.
-        };
-        if receivers[i] == u32::MAX {
-            continue;
-        }
-        let mut best = receivers[i] as usize;
-        let mut best_slope = -1.0;
-        for &j in grid.neighbors(i) {
-            let j = j as usize;
-            if rank[j] >= rank[i] && fields.elevation[j] > 0. {
-                continue;
-            }
             let target = if fields.elevation[j] <= 0. {
                 0.
             } else {
-                levels[j]
+                surface[j]
             };
-            let slope = (levels[i] - target) as f64 / grid.distance_m(i, j).max(1e-6);
-            if slope > best_slope && target <= levels[i] {
-                best_slope = slope;
-                best = j;
+            let descent = (surface[i] - target) / grid.distance_m(i, j).max(1.);
+            if descent > slope {
+                slope = descent;
+                receiver[i] = nb;
             }
         }
-        receivers[i] = best as u32;
+        if receiver[i] != u32::MAX {
+            assigned[i] = true;
+            queue.push_back(i);
+        }
     }
-    order.reverse();
+    let expand = |queue: &mut VecDeque<usize>, assigned: &mut [bool], receiver: &mut [u32]| {
+        while let Some(i) = queue.pop_front() {
+            for &nb in grid.neighbors(i) {
+                let j = nb as usize;
+                if !assigned[j] && surface[j] == surface[i] {
+                    assigned[j] = true;
+                    receiver[j] = i as u32;
+                    queue.push_back(j);
+                }
+            }
+        }
+    };
+    expand(&mut queue, &mut assigned, &mut receiver);
+    for i in 0..n {
+        if !assigned[i] {
+            assigned[i] = true;
+            queue.push_back(i);
+            expand(&mut queue, &mut assigned, &mut receiver);
+        }
+    }
+    let mut incoming = vec![0u32; n];
+    for &r in &receiver {
+        if r != u32::MAX {
+            incoming[r as usize] += 1;
+        }
+    }
+    queue.extend((0..n).filter(|&i| incoming[i] == 0));
+    let mut order = Vec::with_capacity(n);
+    while let Some(i) = queue.pop_front() {
+        order.push(i as u32);
+        let r = receiver[i];
+        if r != u32::MAX {
+            incoming[r as usize] -= 1;
+            if incoming[r as usize] == 0 {
+                queue.push_back(r as usize);
+            }
+        }
+    }
+    assert_eq!(order.len(), n, "actual-surface drainage cycle");
     ErosionState {
-        flow_dir: receivers,
+        flow_dir: receiver,
         topo_order: order,
+        lake_budget,
+        sediment: SedimentBudget::default(),
     }
 }
 
@@ -223,6 +212,11 @@ pub fn run_erosion_observed<G: GridOps>(
         return None;
     }
     let mut state = refresh_hydrology(grid, fields);
+    let mut sediment = SedimentBudget::default();
+    let mut pending = vec![0.; grid.cell_count()];
+    // Sub-ULP bed-volume remainder stays unplaced. Never move it to an unrelated
+    // source cell merely to close a scalar ledger.
+    let mut unplaced_roundoff = 0.;
     for iteration in 0..params.iterations {
         if cancel() {
             return None;
@@ -236,7 +230,10 @@ pub fn run_erosion_observed<G: GridOps>(
             .map(|i| {
                 grid.area_m2(i)
                     * if rain_driven {
-                        (fields.precipitation[i] as f64 / 1000.).max(0.)
+                        crate::lakes::annual_runoff_m(
+                            fields.precipitation[i] as f64,
+                            fields.potential_evaporation[i] as f64,
+                        )
                     } else {
                         1.
                     }
@@ -253,7 +250,7 @@ pub fn run_erosion_observed<G: GridOps>(
         for &cell in state.topo_order.iter().rev() {
             let i = cell as usize;
             let receiver = state.flow_dir[i];
-            if receiver == u32::MAX || fields.elevation[i] <= 0. || fields.lake_depth[i] > 0.01 {
+            if receiver == u32::MAX || fields.elevation[i] <= 0. {
                 continue;
             }
             let j = receiver as usize;
@@ -262,6 +259,9 @@ pub fn run_erosion_observed<G: GridOps>(
             let down = (fields.elevation[j] + fields.lake_depth[j]).max(0.) as f64;
             let k = params.k_river * params.timestep_years * discharge[i].powf(params.m) / dist;
             fields.elevation[i] = ((h + k * down) / (1. + k)).min(h).max(0.001) as f32;
+            let volume = (h - fields.elevation[i] as f64).max(0.) * grid.area_m2(i);
+            sediment.eroded_m3 += volume;
+            pending[i] += volume;
         }
         if params.k_diffusion > 0. {
             let old = fields.elevation.clone();
@@ -284,12 +284,39 @@ pub fn run_erosion_observed<G: GridOps>(
                 fields.elevation[i] = (old[i] as f64 + delta / total.max(1.)).max(0.001) as f32;
             }
         }
+        if params.k_deposition > 0.
+            && ((iteration + 1) % 8 == 0 || iteration + 1 == params.iterations)
+        {
+            // k_deposition is an annual settling rate. Keep unresolved/unsunk
+            // load explicitly instead of inventing terrain or losing material.
+            let fraction = 1. - (-params.k_deposition * params.timestep_years).exp();
+            let source: Vec<f64> = pending
+                .iter_mut()
+                .map(|v| {
+                    let settled = *v * fraction;
+                    *v -= settled;
+                    settled
+                })
+                .collect();
+            let (deposited, exported, unresolved) = crate::lakes::deposit(grid, fields, &source);
+            sediment.deposited_m3 += deposited;
+            sediment.exported_m3 += exported;
+            unplaced_roundoff += unresolved;
+            state = refresh_hydrology(grid, fields);
+        }
         on_step(iteration + 1, fields);
     }
     if cancel() {
         None
     } else {
-        Some(refresh_hydrology(grid, fields))
+        let mut final_state = refresh_hydrology(grid, fields);
+        sediment.suspended_m3 = pending.iter().sum::<f64>() + unplaced_roundoff;
+        sediment.residual_m3 = sediment.eroded_m3
+            - sediment.deposited_m3
+            - sediment.exported_m3
+            - sediment.suspended_m3;
+        final_state.sediment = sediment;
+        Some(final_state)
     }
 }
 
@@ -402,6 +429,8 @@ mod tests {
                 f.elevation[r * 7 + c] = 1.;
             }
         }
+        f.precipitation.fill(2000.);
+        f.potential_evaporation.fill(1000.);
         let s = refresh_hydrology(&g, &mut f);
         assert!(f.lake_depth[3 * 7 + 3] > 3.9);
         for i in 0..49 {

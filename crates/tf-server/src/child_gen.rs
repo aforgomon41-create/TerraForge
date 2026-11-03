@@ -92,6 +92,7 @@ pub fn run_child_generation(
     fields.temperature = sample.temperature.clone();
     fields.precipitation = sample.precipitation.clone();
     fields.climate = crate::climatology::for_map(store, &parent)?;
+    inherited_pet(&patch, &mut fields, params);
     let progress = |stage: &str, p: f64| {
         let _ = store.update_progress(job_id, stage, p);
         let _ = tx.send(JobEvent::Progress {
@@ -114,7 +115,7 @@ pub fn run_child_generation(
         k_river: tf_sim::erosion::ErosionParams::default().k_river * params.erosion_strength,
         ..Default::default()
     };
-    if tf_sim::erosion::run_erosion_observed(
+    let Some(erosion_result) = tf_sim::erosion::run_erosion_observed(
         &patch,
         &mut fields,
         &erosion,
@@ -128,11 +129,9 @@ pub fn run_child_generation(
             info.detail = "子区域河流与坡面细化";
             tf_sim::preview::emit(&mut live, &patch, fields, info);
         },
-    )
-    .is_none()
-    {
+    ) else {
         return Ok(());
-    }
+    };
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -141,33 +140,9 @@ pub fn run_child_generation(
     for i in 0..patch.cell_count() {
         fields.temperature[i] -= (fields.elevation[i] - sample.elevation[i]) * 0.0065;
     }
+    inherited_pet(&patch, &mut fields, params);
     let water = tf_sim::erosion::refresh_hydrology(&patch, &mut fields);
     tf_sim::erosion::compute_distance_to_sea(&patch, &mut fields);
-    if let Some(atlas) = &fields.climate {
-        let climate_grid = atlas.grid.build();
-        for i in 0..patch.cell_count() {
-            let (_, _, pet) = atlas.sample(
-                &climate_grid,
-                patch.center_dir(i),
-                fields.temperature[i],
-                fields.precipitation[i],
-            );
-            fields.potential_evaporation[i] = pet.iter().sum();
-            fields.aridity[i] = fields.precipitation[i] / fields.potential_evaporation[i].max(1.);
-        }
-    } else {
-        // Annual-only legacy roots have no seasonal observations. Keep this
-        // explicit constant-temperature PET fallback instead of saving false zeros.
-        for i in 0..patch.cell_count() {
-            let pet = tf_sim::scientific::monthly_pet(
-                &[fields.temperature[i]; 12],
-                patch.latitude_deg(i).to_radians(),
-                params.planet.axial_tilt_deg.to_radians(),
-            );
-            fields.potential_evaporation[i] = pet.iter().sum();
-            fields.aridity[i] = fields.precipitation[i] / fields.potential_evaporation[i].max(1.);
-        }
-    }
     let ecology =
         tf_sim::ecology::run_ecology_with_diversity(&patch, &fields, params.biome_diversity);
     progress("气候与生态", 0.9);
@@ -245,6 +220,7 @@ pub fn run_child_generation(
         channels.push((*channel, data.as_slice()));
     }
     let mut metadata = serde_json::json!({"generator_version":"tf-0.4","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
+    metadata["hydrology_model"] = serde_json::json!({"name":"depression-hierarchy-annual-balance-v1","lake_depth":"actual_supported_water","water":water.lake_budget,"sediment":erosion_result.sediment});
     metadata["planar_spin_rad_myr"] = parent_meta
         .get("planar_spin_rad_myr")
         .cloned()
@@ -262,4 +238,36 @@ pub fn run_child_generation(
     store.publish_fields(&node.id, &channels, &metadata)?;
     progress("完成", 1.);
     Ok(())
+}
+
+fn inherited_pet<G: GridOps>(
+    grid: &G,
+    fields: &mut tf_sim::WorldFields,
+    params: &tf_core::params::GenerationParams,
+) {
+    if let Some(atlas) = &fields.climate {
+        let climate_grid = atlas.grid.build();
+        for i in 0..grid.cell_count() {
+            let (_, _, pet) = atlas.sample(
+                &climate_grid,
+                grid.center_dir(i),
+                fields.temperature[i],
+                fields.precipitation[i],
+            );
+            fields.potential_evaporation[i] = pet.iter().sum();
+            fields.aridity[i] = fields.precipitation[i] / fields.potential_evaporation[i].max(1.);
+        }
+    } else {
+        // Annual-only legacy roots have no seasonal observations. Keep this
+        // explicit constant-temperature PET fallback instead of saving false zeros.
+        for i in 0..grid.cell_count() {
+            let pet = tf_sim::scientific::monthly_pet(
+                &[fields.temperature[i]; 12],
+                grid.latitude_deg(i).to_radians(),
+                params.planet.axial_tilt_deg.to_radians(),
+            );
+            fields.potential_evaporation[i] = pet.iter().sum();
+            fields.aridity[i] = fields.precipitation[i] / fields.potential_evaporation[i].max(1.);
+        }
+    }
 }

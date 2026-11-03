@@ -177,6 +177,7 @@ pub fn generate_observed<G: GridOps>(
             emit(observer, grid, fields, info);
         },
     )?;
+    let mut sediment_total = erosion.sediment;
     cumulative += Stage::Erosion.weight();
     timings.push((Stage::Erosion, t.elapsed().as_millis()));
     emit(
@@ -244,6 +245,7 @@ pub fn generate_observed<G: GridOps>(
                 emit(observer, grid, fields, info);
             },
         )?;
+        sediment_total += erosion.sediment;
         compute_distance_to_sea(grid, &mut fields);
         if !climate_pass(
             grid,
@@ -296,9 +298,12 @@ pub fn generate_observed<G: GridOps>(
             fields.elevation[i] = (old[i] - loss).max(0.001);
             fields.temperature[i] += loss * 0.0065;
         }
-        erosion = crate::erosion::refresh_hydrology(grid, &mut fields);
         compute_distance_to_sea(grid, &mut fields);
     }
+    // The final annual rain/PET must determine actual lakes even when glacier
+    // erosion or the climate feedback pass was disabled.
+    erosion = crate::erosion::refresh_hydrology(grid, &mut fields);
+    erosion.sediment = sediment_total;
     let ecology = run_ecology_with_diversity(grid, &fields, params.biome_diversity);
     let minerals = find_minerals(
         grid,

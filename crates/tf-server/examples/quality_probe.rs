@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
         .iter_ones()
         .filter(|&i| world.fields.elevation[i] > 0.)
         .count());
-    let mut biomes = vec![0usize; 13];
+    let mut biomes = vec![0usize; 14];
     for (i, &b) in world.ecology.biome.iter().enumerate() {
         if world.fields.elevation[i] > 0. {
             biomes[b as usize] += 1;

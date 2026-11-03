@@ -182,16 +182,17 @@ export function buildTools(ctx: ToolContext): ToolDef[] {
           '热带季雨林',
           '高山草甸',
           '湿地',
+          '内陆水体',
         ]
         let biomeCounts: Record<string, number> | null = null
         if (biome) {
-          const counts = new Array(13).fill(0)
+          const counts = new Array(biomeNames.length).fill(0)
           for (let i = 0; i < biome.length; i++) {
             const b = biome[i]
-            if (b < 13) counts[b]++
+            if (b >= 0 && b < biomeNames.length) counts[b]++
           }
           biomeCounts = {}
-          for (let i = 0; i < 13; i++) {
+          for (let i = 0; i < biomeNames.length; i++) {
             if (counts[i] > 0) {
               biomeCounts[biomeNames[i]] = +((counts[i] / biome.length) * 100).toFixed(1)
             }
