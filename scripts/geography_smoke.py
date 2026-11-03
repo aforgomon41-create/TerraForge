@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--vectors', action='store_true', help='Verify saved monthly wind/current fields and project round trip')
     parser.add_argument('--live', action='store_true', help='Verify changing solver frames in the same generation')
     parser.add_argument('--map-png', action='store_true', help='Keep the API map export for terrain inspection')
+    parser.add_argument('--cryosphere', action='store_true', help='Check saved ice, seasonal rivers, privacy and import agreement')
     parser.add_argument('--out', default='artifacts/geography-acceptance')
     args = parser.parse_args()
     base = args.base.rstrip('/') + '/api/v1'
@@ -195,6 +196,42 @@ def main():
             report['actual_lakes'] = {'cells':lake_cells, 'land_cell_fraction':lake_cells/max(1,sum(h>0 for h in height)),
                                       'water_budget':water, 'sediment':sediment}
         vector_fields = {}
+        ice_packets, seasonal_rivers = {}, {}
+        if args.cryosphere:
+            assert 'cryosphere_atlas' not in metadata
+            saved = Path(args.out)
+            saved.mkdir(parents=True, exist_ok=True)
+            (saved/'surface.bin').write_bytes(call('/maps/'+map_id+'/surface', token, binary=True))
+            report['cryosphere'] = {}
+            for month in [0, 1, 7]:
+                suffix = f'/cryosphere?month={month}'
+                raw = call('/maps/'+map_id+suffix, token, binary=True)
+                header_size = struct.unpack_from('<I', raw)[0]
+                header = json.loads(raw[4:4+header_size])
+                assert header['available'] and header['month'] == month and header['count'] == node['cells']
+                assert len(header['channels']) == 8 and len(raw) == 4+header_size+32*node['cells']
+                summary = {}
+                for index, name in enumerate(header['channels']):
+                    values = float_field(raw, 4+header_size+index*4*node['cells'], node['cells'])
+                    assert all(math.isfinite(v) and v >= 0 for v in values), name
+                    if name in ['snow_cover','sea_ice_cover','lake_ice_cover','permafrost']:
+                        assert max(values) <= 1, name
+                    if month == 0:
+                        assert values == float_field(call('/maps/'+map_id+'/field/'+name, token, binary=True))
+                    summary[name] = {'positive_cells':sum(v>0 for v in values),'maximum':max(values)}
+                ice_packets[suffix] = raw
+                (saved/f'ice-{month}.bin').write_bytes(raw)
+                water = call('/maps/'+map_id+f'/hydrology?month={month}', token)
+                assert water['available'] and water['liquid_support'] and water['segments'] <= 60000
+                assert not month or water['monthly_liquid']
+                seasonal_rivers[month] = water
+                (saved/(f'hydrology-{month}.json' if month else 'hydrology.json')).write_text(json.dumps(water), encoding='utf8')
+                report['cryosphere'][str(month)] = {'fields':summary, 'river_segments':water['segments'],
+                    'seasonal_segments':water['seasonal_segments'],'monthly_liquid':water['monthly_liquid']}
+                call('/maps/'+map_id+suffix, other, expected=404)
+                call('/maps/'+map_id+f'/hydrology?month={month}', other, expected=404)
+            call('/maps/'+map_id+'/cryosphere?month=13', token, expected=400)
+            call('/maps/'+map_id+'/hydrology?month=13', token, expected=400)
         if args.vectors:
             assert 'climate_atlas' not in metadata
             for kind, month in [('wind', 1), ('current', 7), ('wind', 0)]:
@@ -262,6 +299,10 @@ def main():
         if args.vectors:
             assert call('/maps/'+imported_maps[0]['id']+'/hydrology',token)==saved_water
             assert call('/maps/'+imported_maps[0]['id']+'/field/flow_receiver',token,binary=True)==receiver_bytes
+        for suffix, raw in ice_packets.items():
+            assert call('/maps/'+imported_maps[0]['id']+suffix,token,binary=True) == raw
+        for month, water in seasonal_rivers.items():
+            assert call('/maps/'+imported_maps[0]['id']+f'/hydrology?month={month}',token) == water
         rebuilt, rebuilt_labels, _, rebuild_secs = geography(imported_maps[0]['id'], token)
         assert rebuilt_labels == labels
         assert [(f['id'], f['kind'], f['parent'], f['anchor_cell']) for f in rebuilt['features']] == [

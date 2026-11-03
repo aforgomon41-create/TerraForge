@@ -60,3 +60,5 @@ final result: blocked
 最终Windows默认球面655362格、平面189440格分别447.52／213.08秒完整生成。冰雪、年度与1／7月河道、保存／导入、湖泊复算通过；原生GPU绘制球体、展开、Equal Earth、实际平面和冬夏两极，均为GL_NO_ERROR，已打开并目视核查展开图与诊断图。最终着色器SHA-256 `38d322c74a39827a6699b2bc62f60ccad8be26d1676257fe9a2fede2cb70c8bd`。
 
 证据目录 `artifacts/polar-final-{sphere,plane}`、`artifacts/shader-qa/polar-final-*`。前端44项、类型、生产构建和格式通过；服务端23项和新增7项冰雪检查通过。浏览器／手机交互缺口仍保留，原生GPU与HTTP检查不冒充这部分验收。部署结果后续单独记录。
+
+最终已部署，Linux全部102项模拟检查通过。线上默认世界420.30秒完成，冰雪／河流0、1、7月及保存导入一致，实际PNG两极冰色已打开检查；运行内存峰值405.09MiB、异常重启0。详见 `docs/deployment-polar-2026-11-03.md`。手机与浏览器交互仍未复验。
