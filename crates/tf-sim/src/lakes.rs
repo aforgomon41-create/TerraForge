@@ -11,8 +11,8 @@ use tf_grid::GridOps;
 const OUT: usize = usize::MAX;
 
 /// Marine outlets for sediment transport: below-sea-level pits enclosed by land
-/// are sediment traps, not unlimited exports. Keep the largest connected sea
-/// and every water component touching an open map boundary.
+/// are sediment traps, not unlimited exports. A closed spherical domain keeps
+/// its largest sea; finite maps keep water connected to an open map boundary.
 pub fn marine_cells<G: GridOps>(grid: &G, elevation: &[f32]) -> Vec<bool> {
     let n = grid.cell_count();
     let mut labels = vec![OUT; n];
@@ -716,5 +716,31 @@ mod tests {
         let (d, e, u) = deposit(&g, &mut f, &source);
         assert!(f.elevation.iter().all(|h| h.is_finite()));
         assert!((d + e + u - 11e6).abs() < 1e-6);
+    }
+    #[test]
+    fn all_closed_and_open_domain_basins_acquire_finite_spills() {
+        use tf_grid::GridDescriptor;
+        for descriptor in [
+            GridDescriptor::sphere(4, 6371000.),
+            GridDescriptor::plane(25., 0., 31000., 31, 23, 6371000.),
+        ] {
+            let grid = descriptor.build();
+            for seed in 0..64 {
+                let mut rng = tf_core::DeterministicRng::derive(seed, "finite-spill-invariant");
+                let height: Vec<_> = (0..grid.cell_count())
+                    .map(|_| rng.below(25) as f32 - if seed % 2 == 0 { 2. } else { 0. })
+                    .collect();
+                for sediment in [false, true] {
+                    let hierarchy = Hierarchy::build(&grid, &height, sediment);
+                    for (i, node) in hierarchy.nodes.iter().enumerate() {
+                        assert!(
+                            node.spill.is_finite(),
+                            "{descriptor:?} seed {seed}, node {i}"
+                        );
+                        assert!(node.parent == OUT || node.parent > i);
+                    }
+                }
+            }
+        }
     }
 }

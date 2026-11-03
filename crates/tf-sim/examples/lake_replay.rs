@@ -21,7 +21,9 @@ fn write(path: &Path, data: &[f32]) {
 }
 fn stats(grid: &impl GridOps, f: &WorldFields) -> serde_json::Value {
     let marine = tf_sim::lakes::marine_cells(grid, &f.elevation);
-    let enclosed_subsea = (0..grid.cell_count()).filter(|&i| f.elevation[i] <= 0. && !marine[i]).count();
+    let enclosed_subsea = (0..grid.cell_count())
+        .filter(|&i| f.elevation[i] <= 0. && !marine[i])
+        .count();
     let land = (0..grid.cell_count())
         .filter(|&i| f.elevation[i] > 0.)
         .collect::<Vec<_>>();
