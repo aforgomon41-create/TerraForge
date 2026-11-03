@@ -72,6 +72,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/maps/{id}/climate", get(get_monthly_climate))
         .route(
+            "/api/v1/maps/{id}/cryosphere",
+            get(crate::cryosphere::get_cryosphere),
+        )
+        .route(
             "/api/v1/maps/{id}/tectonics",
             get(crate::tectonics::get_tectonics),
         )
@@ -602,6 +606,15 @@ async fn sample_map(
             Channel::FlowAccumulation,
             Channel::LakeDepth,
             Channel::PlateId,
+            Channel::LandIce,
+            Channel::SnowCover,
+            Channel::SeaIce,
+            Channel::IceShelf,
+            Channel::Permafrost,
+            Channel::ActiveLayer,
+            Channel::LiquidWater,
+            Channel::LakeIce,
+            Channel::LiquidDischarge,
         ] {
             if let Some(data) = store.get_field(&id, ch)? {
                 if let Some(value) = data.get(cell) {
@@ -1066,6 +1079,7 @@ async fn get_metadata(
     let mut metadata = st.store.get_metadata(&id)?.unwrap_or_default();
     if let Some(object) = metadata.as_object_mut() {
         object.remove("climate_atlas");
+        object.remove("cryosphere_atlas");
         object.remove(crate::geography::KEY);
     }
     if let Some(cell) = query.get("cell") {
@@ -1212,7 +1226,18 @@ async fn export_png(
             .store
             .get_field(&map_id, Channel::Biome)?
             .ok_or_else(|| anyhow::anyhow!("缺少生态"))?;
-        crate::render::render_map_png(&elevation, &biome, &descriptor, size)
+        let ice = crate::cryosphere::CHANNELS
+            .iter()
+            .map(|&ch| st.store.get_field(&map_id, ch))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let ice: Option<Vec<_>> = ice.into_iter().collect();
+        crate::render::render_map_png_with_ice(
+            &elevation,
+            &biome,
+            &descriptor,
+            size,
+            ice.as_deref(),
+        )
     })
     .await??;
     Ok((

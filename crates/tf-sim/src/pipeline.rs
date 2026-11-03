@@ -300,10 +300,17 @@ pub fn generate_observed<G: GridOps>(
         }
         compute_distance_to_sea(grid, &mut fields);
     }
+    fields.cryosphere = Some(crate::cryosphere::solve(
+        grid,
+        &fields,
+        params.planet.surface_gravity(),
+        cancel,
+    )?);
     // The final annual rain/PET must determine actual lakes even when glacier
     // erosion or the climate feedback pass was disabled.
     erosion = crate::erosion::refresh_hydrology(grid, &mut fields);
     erosion.sediment = sediment_total;
+    crate::cryosphere::update_water_surfaces(grid, &mut fields);
     let ecology = run_ecology_with_diversity(grid, &fields, params.biome_diversity);
     let minerals = find_minerals(
         grid,

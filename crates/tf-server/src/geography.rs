@@ -122,7 +122,37 @@ fn for_map(store: &Store, node: &MapNodeRecord) -> anyhow::Result<Geography> {
     if let Some(pet) = store.get_field(&node.id, Channel::PotentialEvaporation)? {
         fields.potential_evaporation = pet;
     }
-    let water = tf_sim::erosion::refresh_hydrology(&grid, &mut fields);
+    fields.lake_depth = store
+        .get_field(&node.id, Channel::LakeDepth)?
+        .unwrap_or_else(|| vec![0.; grid.cell_count()]);
+    let water = if let Some(saved) = store.get_field(&node.id, Channel::FlowReceiver)? {
+        let receivers = saved
+            .iter()
+            .map(|&r| {
+                if r == -1. {
+                    Ok(u32::MAX)
+                } else if r.is_finite()
+                    && r >= 0.
+                    && r.fract() == 0.
+                    && (r as usize) < grid.cell_count()
+                {
+                    Ok(r as u32)
+                } else {
+                    Err(anyhow::anyhow!("保存的流向编号无效"))
+                }
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        tf_sim::erosion::from_saved_receivers(&grid, &mut fields, receivers)
+            .map_err(anyhow::Error::msg)?
+    } else {
+        let rain = fields.precipitation.clone();
+        if let Some(liquid) = store.get_field(&node.id, Channel::LiquidWater)? {
+            fields.precipitation = liquid;
+        }
+        let water = tf_sim::erosion::refresh_hydrology(&grid, &mut fields);
+        fields.precipitation = rain;
+        water
+    };
     let g = tf_sim::geography::recognize(&grid, &fields, &water, &|| false)
         .map_err(anyhow::Error::msg)?;
     store.cache_geography(&node.id, &encode(&g)?)?;

@@ -141,7 +141,16 @@ pub fn run_child_generation(
         fields.temperature[i] -= (fields.elevation[i] - sample.elevation[i]) * 0.0065;
     }
     inherited_pet(&patch, &mut fields, params);
+    if let Some(atlas) = crate::cryosphere::for_map(store, &parent)? {
+        fields.cryosphere = Some(tf_sim::cryosphere::sample(&patch, &fields, atlas, 0));
+    } else if fields.climate.is_some() {
+        fields.cryosphere =
+            tf_sim::cryosphere::solve(&patch, &fields, params.planet.surface_gravity(), &|| {
+                cancel.load(Ordering::Relaxed)
+            });
+    }
     let water = tf_sim::erosion::refresh_hydrology(&patch, &mut fields);
+    tf_sim::cryosphere::update_water_surfaces(&patch, &mut fields);
     tf_sim::erosion::compute_distance_to_sea(&patch, &mut fields);
     let ecology =
         tf_sim::ecology::run_ecology_with_diversity(&patch, &fields, params.biome_diversity);
@@ -220,6 +229,21 @@ pub fn run_child_generation(
         channels.push((*channel, data.as_slice()));
     }
     let mut metadata = serde_json::json!({"generator_version":"tf-0.4","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
+    let discharge = fields
+        .cryosphere
+        .as_ref()
+        .map(|_| tf_sim::cryosphere::annual_discharge(&patch, &fields, &water));
+    if let Some(ice) = &fields.cryosphere {
+        crate::cryosphere::attach(&mut metadata, ice)?;
+        channels.extend(
+            crate::cryosphere::CHANNELS
+                .into_iter()
+                .zip(crate::cryosphere::fields(ice)),
+        );
+    }
+    if let Some(q) = &discharge {
+        channels.push((Channel::LiquidDischarge, q));
+    }
     metadata["hydrology_model"] = serde_json::json!({"name":"depression-hierarchy-annual-balance-v1","lake_depth":"actual_supported_water","water":water.lake_budget,"sediment":erosion_result.sediment});
     metadata["planar_spin_rad_myr"] = parent_meta
         .get("planar_spin_rad_myr")

@@ -14,6 +14,7 @@
 
 pub mod circulation;
 pub mod climate;
+pub mod cryosphere;
 pub mod downscale;
 pub mod ecology;
 pub mod erosion;

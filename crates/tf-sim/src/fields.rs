@@ -31,6 +31,8 @@ pub struct WorldFields {
     pub aridity: Vec<f32>,
     /// Coarse monthly fields retain their own geometry instead of duplicating 36 fine fields.
     pub climate: Option<crate::seasonal::ClimateAtlas>,
+    /// Final seasonal ice/snow state, absent during tectonics and legacy reads.
+    pub cryosphere: Option<crate::cryosphere::Cryosphere>,
     /// 地壳类型：0 = 洋壳，1 = 陆壳。过渡区用 0-1 之间的小数表示混合。
     pub crust_type: Vec<f32>,
     /// 地壳年龄，百万年。洋壳用热沉降模型转深度。
@@ -64,6 +66,7 @@ impl WorldFields {
             potential_evaporation: vec![0.0; n],
             aridity: vec![0.0; n],
             climate: None,
+            cryosphere: None,
             crust_type: vec![0.0; n],
             crust_age: vec![0.0; n],
             plate_id: vec![0; n],

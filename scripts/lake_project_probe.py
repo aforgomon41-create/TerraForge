@@ -28,6 +28,9 @@ for name in ['elevation', 'precipitation', 'temperature', 'potential_evaporation
 climate = world['metadata'].get('climate_atlas')
 if climate:
     (source/'climate.json').write_bytes(decoder.decompress(base64.b64decode(climate['data']), max_output_size=climate['bytes']))
+cryosphere = world['metadata'].get('cryosphere_atlas')
+if cryosphere:
+    (source/'cryosphere.json').write_bytes(decoder.decompress(base64.b64decode(cryosphere['data']), max_output_size=cryosphere['bytes']))
 subprocess.run([str(Path(args.replay).resolve()), str(source), str(out/'recomputed'), 'water'], check=True, stdout=subprocess.DEVNULL)
 report = json.loads((out/'recomputed/report.json').read_text(encoding='utf8'))
 assert (source/'lake_depth.bin').read_bytes() == (out/'recomputed/lake_depth.bin').read_bytes(), 'saved lakes disagree with final climate'

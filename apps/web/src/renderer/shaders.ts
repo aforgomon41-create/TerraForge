@@ -1,6 +1,7 @@
 /** Shared vertices form a continuous surface; hex outlines are a separate pass. */
 export const VERT = `#version 300 es
 precision highp float;
+layout(location=12)in vec4 aCryosphere;layout(location=13)in vec2 aFrozen;out vec4 vCryosphere;out vec2 vFrozen;
 layout(location=10)in float aLake;out float vLake;out vec3 vMapPosition;
 layout(location=8)in float aGeography;out float vGeography;
 layout(location=9)in float aPartition;out vec3 vPartitionColor;out float vPartitionPresent;
@@ -17,6 +18,7 @@ vec3 paintedBiome(float value){int b=int(value+.5);
 if(b==1)return vec3(.92,.95,.92);if(b==2)return vec3(.64,.66,.46);if(b==3)return vec3(.23,.40,.28);if(b==4)return vec3(.34,.48,.25);if(b==5)return vec3(.72,.73,.35);if(b==6)return vec3(.66,.66,.34);if(b==7)return vec3(.84,.71,.43);if(b==8)return vec3(.76,.70,.34);if(b==9)return vec3(.18,.38,.25);if(b==10)return vec3(.33,.49,.25);if(b==11)return vec3(.64,.61,.46);if(b==12)return vec3(.34,.52,.39);if(b==13)return vec3(.45,.53,.32);return vec3(.62,.69,.42);}
 
 void main(){
+  vCryosphere=uPreviewMode?vec4(0.):aCryosphere;vFrozen=uPreviewMode?vec2(0.):aFrozen;
   vLake=aLake;
   vHeightGradient=aHeightGradient;
   float lon=aAtlasPosition.x*1.57079632679,lat=aAtlasPosition.y*1.57079632679;
@@ -43,6 +45,7 @@ void main(){
 }`
 export const FRAG = `#version 300 es
 precision highp float;
+in vec4 vCryosphere;in vec2 vFrozen;uniform bool uHasCryosphere;
 in float vLake;in vec3 vMapPosition;
 in float vGeography;uniform bool uGeographyActive;
 in vec3 vPartitionColor;in float vPartitionPresent;
@@ -95,7 +98,10 @@ vec3 gameMap(){
     vec3 sea=mix(vec3(.35,.71,.70),vec3(.12,.43,.51),smoothstep(0.,1800.,depth));
     sea=mix(sea,vec3(.055,.25,.34),smoothstep(1200.,6800.,depth));
     sea=mix(sea,vec3(.67,.82,.72),(1.-smoothstep(0.,80.,depth))*.45);
-    return sea*(1.+wash*1.8)*(.94+.06*shade);
+    sea*=(1.+wash*1.8)*(.94+.06*shade);
+    float seaIce=clamp(vCryosphere.y*(.96+.04*grain),0.,1.);
+    sea=mix(sea,vec3(.85,.94,.95)*(.96+wash*.25),seaIce);
+    return mix(sea,vec3(.93,.96,.95)*(.96+wash*.18),clamp(vCryosphere.z,0.,1.));
   }
   vec3 color=vPaintColor;
   float slope=1.-max(dot(normal,up),0.);
@@ -104,9 +110,9 @@ vec3 gameMap(){
   float forest=clamp(vVegetation.x,0.,1.);
   color*=1.-forest*smoothstep(.35,.8,grain)*.16*visible;
   color*=shade*(1.+wash+(grain-.5)*.04*visible);
-  float snow=max(clamp(vVegetation.y,0.,1.),smoothstep(4200.,5700.,vHeight)*(1.-smoothstep(-8.,5.,vTemp)));
+  float snow=uHasCryosphere?max(vCryosphere.x,vCryosphere.w):max(clamp(vVegetation.y,0.,1.),smoothstep(4200.,5700.,vHeight)*(1.-smoothstep(-8.,5.,vTemp)));
   color=mix(color,vec3(.93,.96,.94)*(.88+.12*shade+wash*.3),snow);
-  if(vLake>.5)color=mix(color,mix(vec3(.20,.55,.63),vec3(.76,.87,.85),1.-smoothstep(-8.,0.,vTemp)),smoothstep(.5,3.,vLake));
+  if(vLake>.5)color=mix(color,mix(vec3(.20,.55,.63),vec3(.88,.95,.95),uHasCryosphere?clamp(vFrozen.y,0.,1.):1.-smoothstep(-8.,0.,vTemp)),smoothstep(.5,3.,vLake)*(uHasCryosphere?1.-clamp(vCryosphere.x,0.,1.):1.));
   return mix(color,vec3(.96,.93,.82),.018);
 }
 void main(){if(uWorldFlatMode && (abs(vAtlasPosition.x)>2.00001 || abs(vAtlasPosition.y)>1.00001 || (uProjection==1 && abs(vAtlasPosition.y)>.9450125416934075)))discard;vec3 color;
@@ -122,6 +128,8 @@ else{
   if(uStyle==2)color=mix(color,vec3(.94,.90,.79),.16);
   if(uStyle==3&&vHeight>0.){color=elevation(vHeight);float contour=abs(fract(vHeight/200.-.5)-.5)/max(fwidth(vHeight/200.),1.e-5);color=mix(color,vec3(.32,.32,.23),(1.-min(contour,1.))*.55);}
 }
+if(uLayer==11){color=vHeight<=0.?mix(vec3(.19,.40,.53),vec3(.84,.94,.95),clamp(vCryosphere.y,0.,1.)):mix(vec3(.70,.74,.61),vec3(.57,.49,.68),clamp(vFrozen.x,0.,1.));if(vHeight>0.&&vLake>.5)color=mix(color,mix(vec3(.19,.40,.53),vec3(.84,.94,.95),clamp(vFrozen.y,0.,1.)),smoothstep(.5,3.,vLake));color=mix(color,vec3(.97,.98,.96),clamp(vHeight<=0.?vCryosphere.z:max(vCryosphere.x,vCryosphere.w),0.,1.));}
+if(uLayer==0&&uHasCryosphere&&!uPreviewMode){float ice=vHeight<=0.?max(vCryosphere.y,vCryosphere.z):max(max(vCryosphere.x,vCryosphere.w),vLake>.5?vFrozen.y:0.);color=mix(color,vec3(.91,.96,.95),clamp(ice,0.,1.));}
 if(uGeographyActive){float member=smoothstep(.25,.75,vGeography);color=mix(mix(color,vec3(.94,.92,.85),.48),mix(color,vec3(.28,.52,.36),.22),member);}
 fragColor=vec4(color,1.);
 }`

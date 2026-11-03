@@ -10,6 +10,17 @@ pub fn render_map_png(
     descriptor: &tf_grid::GridDescriptor,
     width: u32,
 ) -> anyhow::Result<Vec<u8>> {
+    render_map_png_with_ice(elevation, biome, descriptor, width, None)
+}
+
+/// Optional saved ice appearance, without changing bedrock elevation colors.
+pub fn render_map_png_with_ice(
+    elevation: &[f32],
+    biome: &[f32],
+    descriptor: &tf_grid::GridDescriptor,
+    width: u32,
+    ice: Option<&[Vec<f32>]>,
+) -> anyhow::Result<Vec<u8>> {
     use std::io::Write;
     use tf_grid::{GridOps, MapGrid};
     anyhow::ensure!(
@@ -17,6 +28,12 @@ pub fn render_map_png(
         "字段与网格尺寸不一致"
     );
     anyhow::ensure!((16..=8192).contains(&width), "导出尺寸无效");
+    if let Some(ice) = ice {
+        anyhow::ensure!(
+            ice.len() == 8 && ice.iter().all(|c| c.len() == elevation.len()),
+            "冰雪导出字段长度无效"
+        );
+    }
     let grid = descriptor.build();
     let height = match &grid {
         MapGrid::Sphere(_) => width / 2,
@@ -41,6 +58,17 @@ pub fn render_map_png(
                 let shade = (1. - slope * 5.).clamp(0.65, 1.2);
                 for c in &mut color {
                     *c = (*c as f64 * shade).min(255.) as u8;
+                }
+            }
+            if let Some(ice) = ice {
+                let snow = if elevation[i] > 0. {
+                    ice[0][i].min(1.).max(ice[1][i]).max(ice[7][i])
+                } else {
+                    ice[2][i].max(1. - (-ice[3][i] / 30.).exp())
+                };
+                let white = [233., 245., 245.];
+                for c in 0..3 {
+                    color[c] = (color[c] as f32 * (1. - snow) + white[c] * snow) as u8;
                 }
             }
             color
@@ -154,5 +182,20 @@ mod tests {
         assert!(
             render_map_png(&[], &[], &tf_grid::GridDescriptor::sphere(4, 6371000.), 64).is_err()
         );
+    }
+    #[test]
+    fn exported_ocean_ice_is_visible_without_turning_the_ocean_into_land() {
+        let d = tf_grid::GridDescriptor::sphere(4, 6371000.);
+        let n = d.cell_count();
+        let mut ice = vec![vec![0.; n]; 8];
+        ice[2].fill(1.);
+        let bytes =
+            render_map_png_with_ice(&vec![-1000.; n], &vec![0.; n], &d, 64, Some(&ice)).unwrap();
+        let mut reader = png::Decoder::new(bytes.as_slice()).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert!(pixels[..info.buffer_size()]
+            .chunks_exact(3)
+            .all(|p| p[0] > 220 && p[1] > 230 && p[2] > 230));
     }
 }

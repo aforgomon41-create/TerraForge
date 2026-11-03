@@ -10,6 +10,7 @@ import {
 } from '@/api/client'
 import { openEventStream, type DecodedFrameEvent } from '@/api/sse'
 import type { Geography } from '@/geography/catalog'
+import type { IceResponse } from '@/cryosphere/data'
 export const useWorldStore = defineStore('world', () => {
   const session = ref<Session | null>(null),
     worlds = ref<World[]>([]),
@@ -29,6 +30,7 @@ export const useWorldStore = defineStore('world', () => {
     lakeDepth = shallowRef<Float32Array | null>(null),
     plateIds = shallowRef<Float32Array | null>(null)
   const indices = shallowRef<Uint32Array | null>(null)
+  const cryosphere = shallowRef<IceResponse | null>(null)
   const geography = shallowRef<Geography | null>(null),
     geographyLoading = ref(false),
     geographyError = ref('')
@@ -53,6 +55,7 @@ export const useWorldStore = defineStore('world', () => {
     centers.value = elevation.value = temperature.value = precipitation.value = flow.value = null
     plateIds.value = null
     lakeDepth.value = null
+    cryosphere.value = null
     biome.value = null
     indices.value = null
     geography.value = null
@@ -140,6 +143,16 @@ export const useWorldStore = defineStore('world', () => {
       lakeDepth.value = lakes
       plateIds.value = ids
       currentMap.value = node
+      cryosphere.value = null
+      void api
+        .cryosphere(id, node.cells, 0, controller.signal)
+        .then((value) => {
+          if (!controller.signal.aborted && currentMap.value?.id === id) cryosphere.value = value
+        })
+        .catch((e: Error) => {
+          if (!controller.signal.aborted && currentMap.value?.id === id)
+            cryosphere.value = { available: false, reason: e.message }
+        })
       // Geography is derived independently: a failed detection cannot hide the map.
       geographyLoading.value = true
       void api
@@ -276,6 +289,7 @@ export const useWorldStore = defineStore('world', () => {
     flow,
     lakeDepth,
     plateIds,
+    cryosphere,
     init,
     refreshWorlds,
     refreshMaps,

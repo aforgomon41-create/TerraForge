@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--zoom', type=float, default=1.)
     parser.add_argument('--center', nargs=2, type=float, default=[0.,0.])
     parser.add_argument('--material-fallback', action='store_true')
+    parser.add_argument('--ice-month',type=int,choices=range(13),default=0)
     parser.add_argument('--offline-artifacts', help='Folder containing surface.bin and hydrology.json from offline_world_qa; no network access')
     args = parser.parse_args()
     if not 64 <= args.width <= 8192 or not 0.5 <= args.zoom <= 30:
@@ -75,13 +76,17 @@ def main():
         (out/'lake.bin').write_bytes(lake_bytes)
         surface = (Path(args.offline_artifacts)/'surface.bin').read_bytes() if args.offline_artifacts else call('/maps/'+node['id']+'/surface', binary=True)
         (out/'surface.bin').write_bytes(surface)
-        water = json.loads((Path(args.offline_artifacts)/'hydrology.json').read_text(encoding='utf8')) if args.offline_artifacts else call('/maps/'+node['id']+'/hydrology')
+        water_file=f'hydrology-{args.ice_month}.json' if args.ice_month else 'hydrology.json'
+        water = json.loads((Path(args.offline_artifacts)/water_file).read_text(encoding='utf8')) if args.offline_artifacts else call('/maps/'+node['id']+f'/hydrology?month={args.ice_month}')
         (out/'water.json').write_text(json.dumps(water), encoding='utf8')
+        has_ice='land_ice_m' in source_map['channels'] and 'cryosphere_atlas' in source_map.get('metadata',{})
+        ice_bytes=((Path(args.offline_artifacts)/f'ice-{args.ice_month}.bin').read_bytes() if args.offline_artifacts else call('/maps/'+node['id']+f'/cryosphere?month={args.ice_month}',binary=True)) if has_ice else b''
+        (out/'ice.bin').write_bytes(ice_bytes)
         node_exe = shutil.which('node') or r'C:\Program Files\nodejs\node.exe'
         bundle="""import {createRequire} from 'node:module';
 const [root,out]=process.argv.slice(1);const req=createRequire(root+'/apps/web/package.json');
 const local=createRequire(req.resolve('vite/package.json'));const {build}=local('esbuild');
-await build({stdin:{contents:"export * from './surface.ts'; export * from './math.ts'; export * from './projections.ts'; export * from './relief.ts'; export * from './lakeShore.ts';",resolveDir:root+'/apps/web/src/renderer'},bundle:true,platform:'node',format:'esm',outfile:out+'/surface.mjs'});"""
+await build({stdin:{contents:"export * from './surface.ts'; export * from './math.ts'; export * from './projections.ts'; export * from './relief.ts'; export * from './lakeShore.ts'; export * from '../cryosphere/data.ts';",resolveDir:root+'/apps/web/src/renderer'},bundle:true,platform:'node',format:'esm',outfile:out+'/surface.mjs'});"""
         subprocess.run([node_exe,'--input-type=module','-e',bundle,str(root),str(out)],check=True)
         javascript = """
 import fs from 'node:fs'; import {pathToFileURL} from 'node:url';
@@ -102,14 +107,21 @@ const lakeDepth=new Float32Array(lakeBytes.buffer.slice(lakeBytes.byteOffset,lak
 const shore=geometry.lakeShoreDepths(heights,lakeDepth,indices);
 const mappedShore=Float32Array.from(atlas.sourceIds,id=>shore[id]);
 fs.writeFileSync(directory+'/shore.bin',Buffer.from(mappedShore.buffer));
+const iceBytes=fs.readFileSync(directory+'/ice.bin');
+const ice=iceBytes.length?geometry.decodeIce(iceBytes.buffer.slice(iceBytes.byteOffset,iceBytes.byteOffset+iceBytes.byteLength),n):undefined;
+const iceAttributes=geometry.iceAttributes(ice,n,atlas.sourceIds);
+fs.writeFileSync(directory+'/cryocover.bin',Buffer.from(iceAttributes.cover.buffer));
+fs.writeFileSync(directory+'/cryoground.bin',Buffer.from(iceAttributes.ground.buffer));
 const mappedGradient=Float32Array.from({length:atlas.sourceIds.length*3},(_,i)=>gradient[atlas.sourceIds[Math.floor(i/3)]*3+i%3]);
 fs.writeFileSync(directory+'/gradients.bin',Buffer.from(mappedGradient.buffer));
 fs.writeFileSync(directory+'/geoPositions.bin',Buffer.from(atlas.positions.buffer));
 if(flat)atlas.positions=geometry.projectAtlasPositions(atlas.positions,view);
 for(const name of ['positions','indices','sourceIds'])fs.writeFileSync(directory+'/'+name+'.bin',Buffer.from(atlas[name].buffer));
 const water=JSON.parse(fs.readFileSync(directory+'/water.json','utf8'));
-const lines=Float32Array.from(water.groups?.[0]||[]);
-const riverGeo=flat?geometry.atlasLines(lines):lines;
+let first=0;const ranges=[];
+const groups=(water.groups||[]).map((group,index)=>{const lines=Float32Array.from(group);const atlas=flat?geometry.atlasLines(lines):lines;ranges.push({index,first,count:atlas.length/3});first+=atlas.length/3;return atlas;});
+const riverGeo=new Float32Array(first*3);let offset=0;for(const group of groups){riverGeo.set(group,offset);offset+=group.length;}
+fs.writeFileSync(directory+'/riverGroups.json',JSON.stringify(ranges));
 fs.writeFileSync(directory+'/riverGeo.bin',Buffer.from(riverGeo.buffer));
 fs.writeFileSync(directory+'/rivers.bin',Buffer.from((flat?geometry.projectAtlasPositions(riverGeo,view):riverGeo).buffer));
 const eye=[0,Math.sin(.35)*3.2,Math.cos(.35)*3.2];
@@ -126,6 +138,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
         river_geo = np.fromfile(out/'riverGeo.bin',dtype='<f4').reshape(-1,3)
         geo_positions = np.fromfile(out/'geoPositions.bin',dtype='<f4').reshape(-1,3)
         camera = json.loads((out/'camera.json').read_text())
+        river_groups=json.loads((out/'riverGroups.json').read_text())
         if not sphere:
             positions *= 2/node['grid']['width_m']; rivers *= 2/node['grid']['width_m']
         def channel(name):
@@ -161,7 +174,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
             matrix[3,0]=-args.center[0]*matrix[0,0];matrix[3,1]=-args.center[1]*matrix[1,1]
         program['uViewProj'].write(matrix.tobytes())
         uniforms={'uRadius':1.,'uHeightScale':.00001,'uMapMetres':node['grid'].get('radius_m') if sphere else node['grid']['width_m']/2,
-                  'uPlanarMode':not globe,'uWorldFlatMode':atlas,'uProjection':camera['projection'],'uPreviewMode':False,'uStyle':2,'uGeographyActive':False,
+                  'uPlanarMode':not globe,'uWorldFlatMode':atlas,'uProjection':camera['projection'],'uPreviewMode':False,'uHasCryosphere':has_ice,'uStyle':2,'uGeographyActive':False,
                   'uLightDir':(-.45,.55,.7)}
         for name,value in uniforms.items():
             if name in program: program[name].value=value
@@ -170,12 +183,13 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
                     'aHeightGradient':np.fromfile(out/'gradients.bin',dtype='<f4').reshape(-1,3),
                     'aPlate':channel('plate_id'),'aTemperature':channel('temperature'),'aPrecipitation':channel('precipitation'),
                     'aFlow':channel('flow_accumulation'),'aLake':np.fromfile(out/'shore.bin',dtype='<f4'),
+                    'aCryosphere':np.fromfile(out/'cryocover.bin',dtype='<f4').reshape(-1,4),'aFrozen':np.fromfile(out/'cryoground.bin',dtype='<f4').reshape(-1,2),
                     'aGeography':np.zeros(len(source_ids),dtype='f4'),'aPartition':np.zeros(len(source_ids),dtype='f4')}
         program['uHeightScale'].value=.025/max(float(attributes['aHeight'].max()),1.)
         for name,values in attributes.items():
             if name not in program: continue
             buffer=ctx.buffer(values.astype('f4').tobytes());buffers.append(buffer)
-            content.append((buffer,'3f' if values.ndim==2 else '1f',name))
+            content.append((buffer,str(values.shape[1])+'f' if values.ndim==2 else '1f',name))
         vao=ctx.vertex_array(program,content,index_buffer=ctx.buffer(indices.tobytes()))
         ctx.blend_func=(moderngl.SRC_ALPHA,moderngl.ONE_MINUS_SRC_ALPHA)
         river_vao=None
@@ -186,19 +200,24 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
             line['uViewProj'].write(matrix.tobytes())
             for name,value in {'uSphere':globe,'uWorldFlatMode':atlas,'uProjection':camera['projection'],'uEye':tuple(camera['eye']),'uRadius':1.,'uColor':(.18,.46,.57,.84)}.items():
                 if name in line: line[name].value=value
-        for layer,label in [(0,'terrain'),(4,'elevation'),(10,'game')]:
+        for layer,label in [(0,'terrain'),(4,'elevation'),(10,'game'),(11,'cryosphere')]:
             frame.clear(.96,.95,.91)
             ctx.enable(moderngl.DEPTH_TEST)
             program['uLayer'].value=layer;vao.render(moderngl.TRIANGLES)
             if layer==10 and river_vao:
                 ctx.disable(moderngl.DEPTH_TEST)
-                ctx.enable(moderngl.BLEND);river_vao.render(moderngl.LINES);ctx.disable(moderngl.BLEND)
+                ctx.enable(moderngl.BLEND)
+                for group in river_groups:
+                    line['uColor'].value=(.34,.62,.68,.74) if group['index']==1 else (.18,.46,.57,.84)
+                    river_vao.render(moderngl.LINES,vertices=group['count'],first=group['first'])
+                ctx.disable(moderngl.BLEND)
             image=Image.frombytes('RGB',(width,height),frame.read(components=3)).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
             image.save(out/(label+'.png'))
         gl_error = ctx.error
         if gl_error != 'GL_NO_ERROR': raise RuntimeError(gl_error)
         report={'result':'passed','exact_es300_sources':True,'browser_ui_checked':False,'renderer':ctx.info['GL_RENDERER'],
                 'offline_artifacts':bool(args.offline_artifacts),
+                'cryosphere_available':has_ice,'ice_month':args.ice_month,
                 'view':args.view if sphere else 'plane','pixels':[width,height],'material_fallback':args.material_fallback,
                 'zoom':args.zoom,'center':args.center,
                 'material_sha256':hashlib.sha256(pigment_path.read_bytes()).hexdigest(),'gl_error':gl_error,

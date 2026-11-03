@@ -9,6 +9,7 @@ import { createPigmentTexture } from './pigmentTexture'
 import pigmentUrl from '../assets/atlas-pigment.png'
 import { heightGradients } from './relief'
 import { lakeShoreDepths } from './lakeShore'
+import { iceAttributes, type IceData } from '../cryosphere/data'
 
 export interface CellData {
   /** 格子中心方向 xyz 交错，长度 = count * 3 */
@@ -23,6 +24,7 @@ export interface CellData {
   precipitations?: Float32Array
   flows?: Float32Array
   lakeDepths?: Float32Array
+  cryosphere?: IceData
   plateIds?: Float32Array
   indices: Uint32Array
   count: number
@@ -66,6 +68,10 @@ export class HexSphereRenderer {
   private instFlowBuf: WebGLBuffer | null = null
   private instLakeBuf: WebGLBuffer | null = null
   private gradientBuf: WebGLBuffer | null = null
+  private iceBuf: WebGLBuffer | null = null
+  private frozenBuf: WebGLBuffer | null = null
+  private hasCryosphere = false
+  private disposed = false
   private geographyBuf: WebGLBuffer | null = null
   private geographySourceIds: Uint32Array | undefined
   private geographyActive = false
@@ -371,6 +377,27 @@ export class HexSphereRenderer {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuf)
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
     gl.bindVertexArray(null)
+    this.setCryosphere(data.cryosphere)
+  }
+
+  setCryosphere(ice?: IceData) {
+    if (this.disposed || !this.vao) return
+    const gl = this.gl
+    const packed = iceAttributes(ice, this.cellCount, this.geographySourceIds)
+    gl.bindVertexArray(this.vao)
+    this.iceBuf ||= gl.createBuffer()
+    this.frozenBuf ||= gl.createBuffer()
+    for (const [buffer, location, size, values] of [
+      [this.iceBuf, 12, 4, packed.cover],
+      [this.frozenBuf, 13, 2, packed.ground],
+    ] as const) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+      gl.bufferData(gl.ARRAY_BUFFER, values, gl.STATIC_DRAW)
+      gl.enableVertexAttribArray(location)
+      gl.vertexAttribPointer(location, size, gl.FLOAT, false, 0, 0)
+    }
+    gl.bindVertexArray(null)
+    this.hasCryosphere = !!ice
   }
 
   setPartitionLabels(labels: Uint32Array | null) {
@@ -558,6 +585,7 @@ export class HexSphereRenderer {
   }
 
   dispose() {
+    this.disposed = true
     this.setDiagnostics([])
     this.stop()
     const gl = this.gl
@@ -582,6 +610,8 @@ export class HexSphereRenderer {
       this.instFlowBuf,
       this.instLakeBuf,
       this.gradientBuf,
+      this.iceBuf,
+      this.frozenBuf,
       this.instPlateBuf,
       this.geographyBuf,
       this.partitionBuf,
@@ -706,6 +736,7 @@ export class HexSphereRenderer {
 
     // 预览模式：绑定帧纹理
     gl.uniform1i(u('uPreviewMode'), this.previewMode ? 1 : 0)
+    gl.uniform1i(u('uHasCryosphere'), this.hasCryosphere ? 1 : 0)
     if (this.previewMode && this.frameTexture) {
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, this.frameTexture)
@@ -739,7 +770,7 @@ export class HexSphereRenderer {
       gl.disable(gl.DEPTH_TEST)
       gl.enable(gl.BLEND)
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
-      if (![6, 7, 8, 9, 10].includes(this.layer)) {
+      if (![6, 7, 8, 9, 10, 11].includes(this.layer)) {
         gl.uniform4f(lu('uColor'), 0.27, 0.36, 0.29, 0.22)
         gl.drawArrays(gl.LINES, 0, this.lineCount)
       } else {
@@ -767,7 +798,9 @@ export class HexSphereRenderer {
           gl.uniform4fv(
             lu('uColor'),
             this.layer === 10
-              ? [0.18, 0.46, 0.57, 0.84]
+              ? index === 1
+                ? [0.34, 0.62, 0.68, 0.74]
+                : [0.18, 0.46, 0.57, 0.84]
               : this.layer === 7
                 ? [0.22, 0.29, 0.24, 0.8]
                 : colors[index] || colors[3],

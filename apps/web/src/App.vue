@@ -17,6 +17,7 @@ import type { DecodedFrameEvent } from '@/api/frame'
 import { planarPreviewSurface } from '@/renderer/surface'
 import { projections, type WorldProjection } from '@/renderer/projections'
 import type { ToolContext } from '@/agent/tools'
+import type { IceResponse } from '@/cryosphere/data'
 import { flatDirection, flatProject } from '@/renderer/geometry'
 import { parseSeed } from '@/generation/seed'
 import {
@@ -163,7 +164,24 @@ const tectonics = ref<TectonicDiagnostic | null>(null)
 const circulation = ref<CirculationDiagnostic | null>(null)
 const hydrology = ref<HydrologyDiagnostic | null>(null)
 let hydrologyController: AbortController | undefined
-let hydrologyCache: { id: string; data: HydrologyDiagnostic } | undefined
+let hydrologyCache: { key: string; data: HydrologyDiagnostic } | undefined
+const iceMonth = ref(0)
+const monthlyIce = shallowRef<{ key: string; data: IceResponse } | null>(null)
+let iceController: AbortController | undefined
+const visibleIce = computed(() => {
+  if (iceMonth.value === 0) return store.cryosphere
+  const key = `${store.currentMap?.id}:${iceMonth.value}`
+  return monthlyIce.value?.key === key ? monthlyIce.value.data : null
+})
+const iceStatus = computed(() =>
+  store.generating
+    ? '冰雪将在最终气候完成后显示。'
+    : visibleIce.value?.available
+      ? '常年陆冰与季节海冰分别计算；灰紫色表示冻土估计，冻土表面夏季仍可解冻。'
+      : visibleIce.value?.reason ||
+        (store.cryosphere?.available === false && store.cryosphere.reason) ||
+        '正在读取冰雪资料…',
+)
 const circulationMonth = ref(0)
 let circulationController: AbortController | undefined
 let circulationCache: { key: string; data: CirculationDiagnostic } | undefined
@@ -231,6 +249,14 @@ const layers = [
     unit: '自然彩绘 · 高度 · 生态 · 水系',
     ends: ['海洋', '低地', '山地'],
     gradient: 'linear-gradient(90deg,#315e70,#9ebdb0,#7d9966,#d7ccad)',
+  },
+  {
+    id: 11,
+    name: '冰雪与冻土',
+    icon: '❄',
+    unit: '常年陆冰 · 年均水面冰 · 冻土估计',
+    ends: ['冻土', '水面冰', '陆冰'],
+    gradient: 'linear-gradient(90deg,#a7a1b4,#b4d5dd,#f2f4ec)',
   },
   {
     id: 8,
@@ -308,7 +334,7 @@ const layers = [
     id: 3,
     name: '生态',
     icon: '❋',
-    unit: '13 类生物群系',
+    unit: '14 类生物群系',
     ends: ['冰原', '森林', '荒漠'],
     gradient: 'linear-gradient(90deg,#e8ede5,#597b56,#cfb580)',
   },
@@ -334,6 +360,19 @@ const selectedFacts = computed(() => {
     biome: biomes[store.biome?.[i] || 0],
     flow: (store.flow?.[i] || 0) / 1e6,
   }
+})
+const selectedIce = computed(() => {
+  const i = selection.value?.cell,
+    ice = visibleIce.value
+  return i !== undefined && ice?.available
+    ? {
+        land: ice.landIce[i],
+        sea: ice.seaIce[i],
+        shelf: ice.shelf[i],
+        frost: ice.permafrost[i],
+        active: ice.activeLayer[i],
+      }
+    : null
 })
 const progress = computed(() => Math.round((store.job?.progress || 0) * 100)),
   jobState = computed(
@@ -506,25 +545,57 @@ async function refreshHydrology() {
   if (!node || !renderer) return
   const controller = new AbortController()
   hydrologyController = controller
+  const key = `${node.id}:${iceMonth.value}`
   try {
     const data =
-      hydrologyCache?.id === node.id
+      hydrologyCache?.key === key
         ? hydrologyCache.data
-        : await api.hydrology(node.id, controller.signal)
+        : await api.hydrology(node.id, controller.signal, iceMonth.value)
     if (
       controller.signal.aborted ||
       store.generating ||
       layer.value !== 10 ||
-      store.currentMap?.id !== node.id
+      store.currentMap?.id !== node.id ||
+      key !== `${node.id}:${iceMonth.value}`
     )
       return
-    hydrologyCache = { id: node.id, data }
+    hydrologyCache = { key, data }
     hydrology.value = data
     const scale = node.grid?.type === 'sphere' ? 1 : 2 / (node.grid?.width_m || 2)
     renderer.setDiagnostics((data.groups || []).map((g) => Float32Array.from(g, (v) => v * scale)))
   } catch (e) {
     if (!controller.signal.aborted && (e as Error).name !== 'AbortError')
       hydrology.value = { available: false, reason: (e as Error).message }
+  }
+}
+async function refreshIce() {
+  iceController?.abort()
+  const node = store.currentMap
+  if (!node || !renderer || store.generating) return
+  if (iceMonth.value === 0 || store.cryosphere?.available === false) {
+    const data = store.cryosphere
+    renderer.setCryosphere(data?.available ? data : undefined)
+    return
+  }
+  const key = `${node.id}:${iceMonth.value}`,
+    controller = new AbortController()
+  iceController = controller
+  monthlyIce.value = null
+  renderer.setCryosphere()
+  try {
+    const data = await api.cryosphere(node.id, node.cells, iceMonth.value, controller.signal)
+    if (
+      controller.signal.aborted ||
+      store.generating ||
+      store.currentMap?.id !== node.id ||
+      key !== `${node.id}:${iceMonth.value}`
+    )
+      return
+    monthlyIce.value = { key, data }
+    renderer?.setCryosphere(data.available ? data : undefined)
+  } catch (e) {
+    if (!controller.signal.aborted && store.currentMap?.id === node.id)
+      monthlyIce.value = { key, data: { available: false, reason: (e as Error).message } }
   }
 }
 async function refreshCirculation() {
@@ -634,6 +705,7 @@ function applyMap() {
     precipitations: store.precipitation || undefined,
     flows: store.flow || undefined,
     lakeDepths: store.lakeDepth || undefined,
+    cryosphere: visibleIce.value?.available ? visibleIce.value : undefined,
     plateIds: store.plateIds || undefined,
     count: node.cells,
   })
@@ -643,6 +715,7 @@ function applyMap() {
   renderer.setDiagnostics([])
   tectonics.value = null
   hydrology.value = null
+  void refreshIce()
   if (layer.value === 10) void refreshHydrology()
   if (layer.value === 6) void refreshTectonics()
   if (layer.value === 8 || layer.value === 9) void refreshCirculation()
@@ -705,6 +778,14 @@ watch(layer, (v) => {
     void refreshOverlay()
   } else void refreshOverlay()
   if (renderer) renderer.layer = v
+})
+watch(
+  () => store.cryosphere,
+  () => void refreshIce(),
+)
+watch(iceMonth, () => {
+  void refreshIce()
+  if (layer.value === 10) void refreshHydrology()
 })
 watch(style, (v) => {
   if (renderer) renderer.style = v
@@ -1026,6 +1107,7 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
+  iceController?.abort()
   hydrologyController?.abort()
   tectonicController?.abort()
   circulationController?.abort()
@@ -1539,6 +1621,23 @@ onBeforeUnmount(() => {
         <p v-if="layer === 10 && hydrology?.notice" class="layer-help" role="status">
           {{ hydrology.notice }}
         </p>
+        <template v-if="layer === 10 || layer === 11">
+          <label class="style-select">
+            冰雪时段
+            <select
+              v-model.number="iceMonth"
+              :disabled="store.generating || !hasMap"
+              aria-label="冰雪月份"
+            >
+              <option :value="0">常年陆冰 / 年均水面冰</option>
+              <option v-for="month in 12" :key="month" :value="month">{{ month }} 月</option>
+            </select>
+          </label>
+          <p class="layer-help" role="status">{{ iceStatus }}</p>
+          <p v-if="layer === 10 && hydrology?.liquid_support" class="layer-help">
+            浅青河段表示季节冻结或融水河道；冰盖核心不绘制普通地表河。
+          </p>
+        </template>
         <p v-if="layer === 6" class="layer-help" role="status">
           {{ plateStatus }}
         </p>
@@ -1687,6 +1786,48 @@ onBeforeUnmount(() => {
               <dt>生态</dt>
               <dd>{{ selectedFacts.biome }}</dd>
             </div>
+            <template v-if="selectedIce">
+              <div v-if="selectedIce.land > 0.1">
+                <dt>陆冰厚度估计</dt>
+                <dd>
+                  {{ Math.round(selectedIce.land).toLocaleString() }}
+                  <small>m</small>
+                </dd>
+              </div>
+              <div v-if="selectedFacts.height <= 0">
+                <dt>{{ iceMonth ? '海冰覆盖' : '年均海冰' }}</dt>
+                <dd>
+                  {{ Math.round(selectedIce.sea * 100) }}
+                  <small>%</small>
+                </dd>
+              </div>
+              <div v-if="selectedIce.shelf > 0.1">
+                <dt>浮冰架厚度估计</dt>
+                <dd>
+                  {{ Math.round(selectedIce.shelf).toLocaleString() }}
+                  <small>m</small>
+                </dd>
+              </div>
+              <div v-if="selectedFacts.height > 0 && selectedIce.land < 1">
+                <dt>冻土估计</dt>
+                <dd>
+                  {{
+                    selectedIce.frost > 0.5
+                      ? '多年冻土'
+                      : selectedIce.frost > 0
+                        ? '冻土边缘'
+                        : '未估计有多年冻土'
+                  }}
+                </dd>
+              </div>
+              <div v-if="selectedIce.frost > 0.1">
+                <dt>夏季解冻层</dt>
+                <dd>
+                  {{ selectedIce.active.toFixed(2) }}
+                  <small>m</small>
+                </dd>
+              </div>
+            </template>
             <div v-if="selectedPlate && layer === 6">
               <dt>板块 {{ selectedPlate.id + 1 }}</dt>
               <dd>
@@ -1789,7 +1930,9 @@ onBeforeUnmount(() => {
           liveFrame.meta.detail.includes('本月累计') &&
           layer === 2
             ? '本月累计降水（mm；求解中）'
-            : activeLayer.unit
+            : liveLayer === 11 && iceMonth
+              ? `${iceMonth}月冰雪 · 冻土估计`
+              : activeLayer.unit
         }}
       </span>
       <p v-if="liveLayer === 7" class="partition-key">

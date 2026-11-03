@@ -14,6 +14,37 @@ use std::{
 use tf_server::{api::AppState, config::ServerConfig, jobs::JobManager, store::Store};
 use tower::ServiceExt;
 
+// JSON f64 text may change by a rounding bit after decoding a compressed cache.
+// Keep integer identities and binary memberships exact; allow only that roundoff.
+fn same_catalogue(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) if !x.is_f64() && !y.is_f64() => x == y,
+        (Value::Number(x), Value::Number(y)) => {
+            let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+            (x - y).abs() <= 1e-12 * x.abs().max(y.abs()).max(1.)
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_catalogue(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| same_catalogue(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
+fn same_geography(a: &[u8], b: &[u8]) -> anyhow::Result<bool> {
+    let la = u32::from_le_bytes(a[..4].try_into()?) as usize;
+    let lb = u32::from_le_bytes(b[..4].try_into()?) as usize;
+    Ok(a[4 + la..] == b[4 + lb..]
+        && same_catalogue(
+            &serde_json::from_slice(&a[4..4 + la])?,
+            &serde_json::from_slice(&b[4..4 + lb])?,
+        ))
+}
+
 async fn call(
     app: &Router,
     path: &str,
@@ -86,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/worlds",
             Some(token),
             Some(json!({
-                "name":"Offline lake regression", "seed": seed, "params":{"world_shape":shape}
+                "name":"Offline cryosphere regression", "seed": seed, "params":{"world_shape":shape}
             })),
         )
         .await?,
@@ -141,6 +172,11 @@ async fn main() -> anyhow::Result<()> {
         ("hydrology", "hydrology.json"),
         ("surface", "surface.bin"),
         ("geography", "geography.bin"),
+        ("cryosphere?month=0", "ice-0.bin"),
+        ("cryosphere?month=1", "ice-1.bin"),
+        ("cryosphere?month=7", "ice-7.bin"),
+        ("hydrology?month=1", "hydrology-1.json"),
+        ("hydrology?month=7", "hydrology-7.json"),
     ] {
         std::fs::write(
             out.join(file),
@@ -152,6 +188,44 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?,
         )?;
+    }
+    let saved: Value = serde_json::from_slice(&std::fs::read(out.join("world.terraforge.json"))?)?;
+    let imported: Value = serde_json::from_slice(
+        &call(&app, "/api/v1/projects/import", Some(token), Some(saved)).await?,
+    )?;
+    let maps: Value = serde_json::from_slice(
+        &call(
+            &app,
+            &format!("/api/v1/worlds/{}/maps", imported["id"].as_str().unwrap()),
+            Some(token),
+            None,
+        )
+        .await?,
+    )?;
+    let restored = maps[0]["id"].as_str().unwrap();
+    for (suffix, file) in [
+        ("cryosphere?month=0", "ice-0.bin"),
+        ("cryosphere?month=1", "ice-1.bin"),
+        ("cryosphere?month=7", "ice-7.bin"),
+        ("hydrology", "hydrology.json"),
+        ("geography", "geography.bin"),
+    ] {
+        let actual = call(
+            &app,
+            &format!("/api/v1/maps/{restored}/{suffix}"),
+            Some(token),
+            None,
+        )
+        .await?;
+        let expected = std::fs::read(out.join(file))?;
+        anyhow::ensure!(
+            if suffix == "geography" {
+                same_geography(&actual, &expected)?
+            } else {
+                actual == expected
+            },
+            "saved {suffix} changed after import"
+        );
     }
     std::fs::write(
         out.join("report.json"),

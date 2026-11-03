@@ -1,5 +1,6 @@
 /** Same-origin API. Every tab gets a server-issued, temporary capability. */
 import { decodeGeography } from '@/geography/catalog'
+import { decodeIce, type IceResponse } from '@/cryosphere/data'
 export const API_BASE = import.meta.env.DEV
   ? ''
   : new URL(import.meta.env.BASE_URL, window.location.href).pathname.replace(/\/$/, '')
@@ -86,6 +87,9 @@ export interface HydrologyDiagnostic {
   reason?: string
   groups?: number[][]
   segments?: number
+  seasonal_segments?: number
+  perennial_segments?: number
+  liquid_support?: boolean
   minimum_upstream_area_m2?: number
   limited?: boolean
 }
@@ -179,9 +183,19 @@ async function geometryRequest(path: string, signal?: AbortSignal): Promise<Resp
   }
 }
 export const api = {
-  async hydrology(id: string, signal?: AbortSignal): Promise<HydrologyDiagnostic> {
-    const response = await geometryRequest(`/maps/${id}/hydrology`, signal)
+  async hydrology(id: string, signal?: AbortSignal, month = 0): Promise<HydrologyDiagnostic> {
+    const response = await geometryRequest(`/maps/${id}/hydrology?month=${month}`, signal)
     return response.json()
+  },
+  async cryosphere(
+    id: string,
+    count: number,
+    month = 0,
+    signal?: AbortSignal,
+  ): Promise<IceResponse> {
+    const response = await geometryRequest(`/maps/${id}/cryosphere?month=${month}`, signal)
+    if (response.headers.get('content-type')?.includes('application/json')) return response.json()
+    return decodeIce(await response.arrayBuffer(), count)
   },
   async vectors(
     id: string,

@@ -143,6 +143,14 @@ pub fn run_ecology_with_diversity<G: GridOps>(
             // annual-only fallback rather than inventing an observed wet season.
             classify_biome(t, prec, fields.elevation[i]) as u8
         };
+        if let Some(ice) = &fields.cryosphere {
+            if ice.land_ice_m[i] >= 1. || ice.snow_cover[i] > 0.8 {
+                *b = Biome::IceSheet as u8;
+            } else if *b == Biome::IceSheet as u8 {
+                // Cold bare ground is not an ice sheet without accumulated ice.
+                *b = Biome::Tundra as u8;
+            }
+        }
         if fields.lake_depth[i] >= 0.1 {
             let shallow = fields.lake_depth[i] <= 2.5 && fields.temperature[i] > 0.;
             *b = if shallow {
@@ -156,7 +164,7 @@ pub fn run_ecology_with_diversity<G: GridOps>(
     // 土壤：Jenny 方程的简化实现
     for i in 0..n {
         let b = biome[i];
-        if b == Biome::Ocean as u8 || b == Biome::InlandWater as u8 {
+        if b == Biome::Ocean as u8 || b == Biome::InlandWater as u8 || b == Biome::IceSheet as u8 {
             continue;
         }
         let (t, d) = classify_soil(
@@ -174,6 +182,7 @@ pub fn run_ecology_with_diversity<G: GridOps>(
         if fields.flow_accumulation[i] > 5e9
             && fields.elevation[i] > 0.0
             && biome[i] != Biome::InlandWater as u8
+            && biome[i] != Biome::IceSheet as u8
         {
             soil[i] = SoilType::Alluvial as u8;
             soil_depth[i] = soil_depth[i].max(1.5);

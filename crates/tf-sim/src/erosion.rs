@@ -184,6 +184,51 @@ pub fn refresh_hydrology<G: GridOps>(grid: &G, fields: &mut WorldFields) -> Eros
     state
 }
 
+/// Rebuild derived area/order from saved final receivers without re-simulating
+/// snow, lakes or climate when an exported project is imported.
+pub fn from_saved_receivers<G: GridOps>(
+    grid: &G,
+    fields: &mut WorldFields,
+    receivers: Vec<u32>,
+) -> Result<ErosionState, String> {
+    let n = grid.cell_count();
+    if receivers.len() != n {
+        return Err("保存的流向尺寸无效".into());
+    }
+    let mut incoming = vec![0u32; n];
+    for (i, &r) in receivers.iter().enumerate() {
+        if r != u32::MAX {
+            if r as usize >= n || !grid.neighbors(i).contains(&r) {
+                return Err("保存的流向不满足地形邻接".into());
+            }
+            incoming[r as usize] += 1;
+        }
+    }
+    let mut queue: VecDeque<_> = (0..n).filter(|&i| incoming[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+    while let Some(i) = queue.pop_front() {
+        order.push(i as u32);
+        let r = receivers[i];
+        if r != u32::MAX {
+            incoming[r as usize] -= 1;
+            if incoming[r as usize] == 0 {
+                queue.push_back(r as usize);
+            }
+        }
+    }
+    if order.len() != n {
+        return Err("保存的水系存在循环".into());
+    }
+    let state = ErosionState {
+        flow_dir: receivers,
+        topo_order: order,
+        lake_budget: Default::default(),
+        sediment: Default::default(),
+    };
+    accumulate(grid, fields, &state);
+    Ok(state)
+}
+
 pub fn run_erosion<G: GridOps>(
     grid: &G,
     fields: &mut WorldFields,

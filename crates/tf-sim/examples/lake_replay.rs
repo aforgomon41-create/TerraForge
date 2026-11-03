@@ -84,6 +84,11 @@ fn main() {
     if climate.is_file() {
         f.climate = Some(serde_json::from_slice(&fs::read(climate).unwrap()).unwrap());
     }
+    let cryosphere = input.join("cryosphere.json");
+    if cryosphere.is_file() {
+        let atlas = serde_json::from_slice(&fs::read(cryosphere).unwrap()).unwrap();
+        f.cryosphere = Some(tf_sim::cryosphere::sample(&grid, &f, atlas, 0));
+    }
     let before = stats(&grid, &f);
     let height = f.elevation.clone();
     let start = std::time::Instant::now();
@@ -99,6 +104,7 @@ fn main() {
     } else {
         tf_sim::erosion::refresh_hydrology(&grid, &mut f)
     };
+    tf_sim::cryosphere::update_water_surfaces(&grid, &mut f);
     let ecology = tf_sim::ecology::run_ecology(&grid, &f);
     let biomes = ecology.biome.iter().map(|&b| b as f32).collect::<Vec<_>>();
     let receivers = state

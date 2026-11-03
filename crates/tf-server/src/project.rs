@@ -305,6 +305,30 @@ pub fn import(
                     "水系下游编号无效"
                 );
             }
+            if matches!(
+                ch,
+                Channel::SnowCover | Channel::SeaIce | Channel::Permafrost | Channel::LakeIce
+            ) {
+                anyhow::ensure!(
+                    data.chunks_exact(4)
+                        .all(|b| (0. ..=1.).contains(&f32::from_le_bytes(b.try_into().unwrap()))),
+                    "冰雪覆盖应在0～1之间"
+                );
+            }
+            if matches!(
+                ch,
+                Channel::LandIce
+                    | Channel::IceShelf
+                    | Channel::ActiveLayer
+                    | Channel::LiquidWater
+                    | Channel::LiquidDischarge
+            ) {
+                anyhow::ensure!(
+                    data.chunks_exact(4)
+                        .all(|b| f32::from_le_bytes(b.try_into().unwrap()) >= 0.),
+                    "冰雪及液态水不能为负数"
+                );
+            }
             channels.push((ch, compressed));
         }
         for required in [
@@ -339,6 +363,13 @@ pub fn import(
             anyhow::ensure!(
                 (atlas.grid.radius_m() - params.planet.radius_m).abs() < 0.001,
                 "月气候半径与工程不一致"
+            );
+        }
+        if let Some(ice) = metadata.get("cryosphere_atlas") {
+            let atlas = crate::cryosphere::decode(ice)?;
+            anyhow::ensure!(
+                (atlas.grid.radius_m() - params.planet.radius_m).abs() < 0.001,
+                "冰雪半径与工程不一致"
             );
         }
         if let Some(obj) = metadata.as_object_mut() {

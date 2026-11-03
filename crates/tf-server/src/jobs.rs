@@ -367,28 +367,40 @@ pub fn persist_fields<G: tf_grid::GridOps>(
     }
     crate::geography::attach(&mut metadata, grid, f, &world.erosion, cancel);
     anyhow::ensure!(!cancel(), "生成已取消");
-    store.publish_fields(
-        map_id,
-        &[
-            (Channel::Elevation, &f.elevation),
-            (Channel::CrustThickness, &f.crust_thickness),
-            (Channel::CrustType, &f.crust_type),
-            (Channel::CrustAge, &f.crust_age),
-            (Channel::Temperature, &f.temperature),
-            (Channel::Precipitation, &f.precipitation),
-            (Channel::FlowAccumulation, &f.flow_accumulation),
-            (Channel::LakeDepth, &f.lake_depth),
-            (Channel::DistanceToSea, &f.distance_to_sea),
-            (Channel::Biome, &biome),
-            (Channel::Soil, &soil),
-            (Channel::SoilDepth, &world.ecology.soil_depth_m),
-            (Channel::PlateId, &plate),
-            (Channel::CrustalStrain, &f.crustal_strain),
-            (Channel::OrogenAge, &f.orogen_age),
-            (Channel::PotentialEvaporation, &f.potential_evaporation),
-            (Channel::Aridity, &f.aridity),
-            (Channel::FlowReceiver, &receivers),
-        ],
-        &metadata,
-    )
+    let discharge = f
+        .cryosphere
+        .as_ref()
+        .map(|_| tf_sim::cryosphere::annual_discharge(grid, f, &world.erosion));
+    let mut channels: Vec<(Channel, &[f32])> = vec![
+        (Channel::Elevation, &f.elevation),
+        (Channel::CrustThickness, &f.crust_thickness),
+        (Channel::CrustType, &f.crust_type),
+        (Channel::CrustAge, &f.crust_age),
+        (Channel::Temperature, &f.temperature),
+        (Channel::Precipitation, &f.precipitation),
+        (Channel::FlowAccumulation, &f.flow_accumulation),
+        (Channel::LakeDepth, &f.lake_depth),
+        (Channel::DistanceToSea, &f.distance_to_sea),
+        (Channel::Biome, &biome),
+        (Channel::Soil, &soil),
+        (Channel::SoilDepth, &world.ecology.soil_depth_m),
+        (Channel::PlateId, &plate),
+        (Channel::CrustalStrain, &f.crustal_strain),
+        (Channel::OrogenAge, &f.orogen_age),
+        (Channel::PotentialEvaporation, &f.potential_evaporation),
+        (Channel::Aridity, &f.aridity),
+        (Channel::FlowReceiver, &receivers),
+    ];
+    if let Some(ice) = &f.cryosphere {
+        crate::cryosphere::attach(&mut metadata, ice)?;
+        channels.extend(
+            crate::cryosphere::CHANNELS
+                .into_iter()
+                .zip(crate::cryosphere::fields(ice)),
+        );
+    }
+    if let Some(q) = &discharge {
+        channels.push((Channel::LiquidDischarge, q));
+    }
+    store.publish_fields(map_id, &channels, &metadata)
 }

@@ -367,6 +367,190 @@ async fn circulation_months_use_saved_vectors_and_remain_private_and_bounded() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(old["available"], false);
 }
+
+#[tokio::test]
+async fn ice_sheet_rivers_are_hidden_but_thawing_permafrost_keeps_surface_rivers() {
+    use tf_grid::GridOps;
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let other = f.session().await;
+    let world = f.world(&token).await;
+    let descriptor = tf_grid::GridDescriptor::plane(65., 0., 32000., 32, 24, 6371000.);
+    let grid = descriptor.build();
+    let n = grid.cell_count();
+    let mut fields = tf_sim::WorldFields::with_capacity(n);
+    for i in 0..n {
+        let p = grid.field_position(i);
+        fields.elevation[i] = (500. + p.x.abs() * 0.02 + p.y * 0.02) as f32;
+    }
+    let water = tf_sim::erosion::refresh_hydrology(&grid, &mut fields);
+    let receivers: Vec<f32> = water
+        .flow_dir
+        .iter()
+        .map(|&r| if r == u32::MAX { -1. } else { r as f32 })
+        .collect();
+    let mut temperatures = vec![vec![-15.; n]; 12];
+    temperatures[6].fill(10.);
+    let annual = vec![(-15. * 11. + 10.) / 12.; n];
+    let rain = vec![600.; n];
+    let zeros = vec![0.; n];
+    let ones = vec![1.; n];
+    let thick = vec![100.; n];
+    let atlas = tf_sim::seasonal::ClimateAtlas {
+        grid: descriptor.clone(),
+        model: "fixture".into(),
+        axial_tilt_deg: 23.44,
+        temperature_c: temperatures,
+        precipitation_mm: vec![vec![50.; n]; 12],
+        pet_mm: vec![vec![0.; n]; 12],
+        energy: Default::default(),
+        water: Default::default(),
+        circulation: None,
+    };
+    let mut map = node(&world, "polar-river-map");
+    map.grid = Some(descriptor);
+    map.cells = n as u32;
+    map.cell_size_m = 1000.;
+    f.state
+        .store
+        .submit_job(&map, &job(&world, &map.id, "polar-river-job"))
+        .unwrap();
+    f.state
+        .store
+        .transition_job("polar-river-job", "running", None)
+        .unwrap();
+    f.state.store.publish_fields(&map.id,&[(Channel::Elevation,&fields.elevation),(Channel::FlowAccumulation,&fields.flow_accumulation),
+        (Channel::FlowReceiver,&receivers),(Channel::LakeDepth,&fields.lake_depth),(Channel::Temperature,&annual),(Channel::Precipitation,&rain),
+        (Channel::LandIce,&thick),(Channel::SnowCover,&ones),(Channel::Permafrost,&ones),(Channel::LiquidDischarge,&zeros)],
+        &json!({"climate_atlas":crate::climatology::encode(&atlas).unwrap(),"hydrology_model":{"name":"depression-hierarchy-annual-balance-v1"}})).unwrap();
+    let path = "/api/v1/maps/polar-river-map/hydrology";
+    let (s, b) = f.request("GET", path, Some(&token), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["segments"], 0);
+    f.state
+        .store
+        .put_field(&map.id, Channel::LandIce, &zeros)
+        .unwrap();
+    f.state
+        .store
+        .put_field(&map.id, Channel::SnowCover, &zeros)
+        .unwrap();
+    f.state
+        .store
+        .put_field(&map.id, Channel::LiquidDischarge, &vec![10.; n])
+        .unwrap();
+    let (_, b) = f.request("GET", path, Some(&token), None).await;
+    assert!(b["segments"].as_u64().unwrap() > 0);
+    assert!(b["seasonal_segments"].as_u64().unwrap() > 0);
+    let (_, winter) = f
+        .request("GET", &(path.to_owned() + "?month=1"), Some(&token), None)
+        .await;
+    assert_eq!(winter["segments"], 0);
+    let (_, summer) = f
+        .request("GET", &(path.to_owned() + "?month=7"), Some(&token), None)
+        .await;
+    assert!(summer["segments"].as_u64().unwrap() > 0);
+    assert_eq!(
+        f.request("GET", path, Some(&other), None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.request("GET", &(path.to_owned() + "?month=13"), Some(&token), None)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    f.state
+        .store
+        .put_field(&map.id, Channel::LiquidDischarge, &zeros)
+        .unwrap();
+    assert_eq!(
+        f.request("GET", path, Some(&token), None).await.1["segments"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn saved_cryosphere_binary_is_bounded_private_and_keeps_canonical_fields() {
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let other = f.session().await;
+    let world = f.world(&token).await;
+    let descriptor = tf_grid::GridDescriptor::plane(65., 0., 600000., 12, 8, 6371000.);
+    let n = descriptor.cell_count();
+    let atlas = tf_sim::cryosphere::CryosphereAtlas {
+        model: tf_sim::cryosphere::MODEL.into(),
+        grid: descriptor.clone(),
+        spinup_years: 10000,
+        gravity_m_s2: 9.81,
+        grounded_ice_m: vec![0.; n],
+        shelf_ice_m: vec![0.; n],
+        sea_ice_m: vec![vec![1.; n]; 12],
+        ice_budget: Default::default(),
+    };
+    let mut map = node(&world, "ice-map");
+    map.grid = Some(descriptor);
+    map.cells = n as u32;
+    f.state
+        .store
+        .submit_job(&map, &job(&world, &map.id, "ice-job"))
+        .unwrap();
+    f.state
+        .store
+        .transition_job("ice-job", "running", None)
+        .unwrap();
+    let mut data = vec![vec![0.; n]; 8];
+    data[2].fill(0.75);
+    let channels: Vec<_> = crate::cryosphere::CHANNELS
+        .into_iter()
+        .zip(data.iter().map(Vec::as_slice))
+        .collect();
+    f.state
+        .store
+        .publish_fields(
+            &map.id,
+            &channels,
+            &json!({"cryosphere_atlas":crate::cryosphere::encode(&atlas).unwrap()}),
+        )
+        .unwrap();
+    let request = Request::builder()
+        .uri("/api/v1/maps/ice-map/cryosphere")
+        .header("host", "test.local")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = f.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = to_bytes(response.into_body(), 100000).await.unwrap();
+    let size = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+    let header: Value = serde_json::from_slice(&raw[4..4 + size]).unwrap();
+    assert_eq!(header["count"], n);
+    assert_eq!(raw.len(), 4 + size + n * 32);
+    assert_eq!(
+        f.request("GET", "/api/v1/maps/ice-map/cryosphere", Some(&other), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.request(
+            "GET",
+            "/api/v1/maps/ice-map/cryosphere?month=13",
+            Some(&token),
+            None
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, metadata) = f
+        .request("GET", "/api/v1/maps/ice-map/metadata", Some(&token), None)
+        .await;
+    assert!(metadata.get("cryosphere_atlas").is_none());
+    let mut corrupt = crate::cryosphere::encode(&atlas).unwrap();
+    corrupt["bytes"] = json!(32 * 1024 * 1024);
+    assert!(crate::cryosphere::decode(&corrupt).is_err());
+}
 #[tokio::test]
 async fn capabilities_isolate_world_map_field_job_events_and_delete() {
     let f = Fixture::new(false);

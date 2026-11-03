@@ -103,10 +103,19 @@ pub enum Channel {
     PotentialEvaporation = 15,
     Aridity = 16,
     FlowReceiver = 17,
+    LandIce = 18,
+    SnowCover = 19,
+    SeaIce = 20,
+    IceShelf = 21,
+    Permafrost = 22,
+    ActiveLayer = 23,
+    LiquidWater = 24,
+    LakeIce = 25,
+    LiquidDischarge = 26,
 }
 
 impl Channel {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 27] = [
         Self::Elevation,
         Self::CrustThickness,
         Self::CrustType,
@@ -125,6 +134,15 @@ impl Channel {
         Self::PotentialEvaporation,
         Self::Aridity,
         Self::FlowReceiver,
+        Self::LandIce,
+        Self::SnowCover,
+        Self::SeaIce,
+        Self::IceShelf,
+        Self::Permafrost,
+        Self::ActiveLayer,
+        Self::LiquidWater,
+        Self::LakeIce,
+        Self::LiquidDischarge,
     ];
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|ch| ch.name() == name)
@@ -149,6 +167,15 @@ impl Channel {
             Channel::PotentialEvaporation => "potential_evaporation",
             Channel::Aridity => "aridity",
             Channel::FlowReceiver => "flow_receiver",
+            Channel::LandIce => "land_ice_m",
+            Channel::SnowCover => "snow_cover",
+            Channel::SeaIce => "sea_ice_cover",
+            Channel::IceShelf => "ice_shelf_m",
+            Channel::Permafrost => "permafrost",
+            Channel::ActiveLayer => "active_layer_m",
+            Channel::LiquidWater => "liquid_water_mm",
+            Channel::LakeIce => "lake_ice_cover",
+            Channel::LiquidDischarge => "liquid_discharge_m3_s",
         }
     }
 }
