@@ -20,6 +20,8 @@ fn write(path: &Path, data: &[f32]) {
     .unwrap();
 }
 fn stats(grid: &impl GridOps, f: &WorldFields) -> serde_json::Value {
+    let marine = tf_sim::lakes::marine_cells(grid, &f.elevation);
+    let enclosed_subsea = (0..grid.cell_count()).filter(|&i| f.elevation[i] <= 0. && !marine[i]).count();
     let land = (0..grid.cell_count())
         .filter(|&i| f.elevation[i] > 0.)
         .collect::<Vec<_>>();
@@ -54,7 +56,7 @@ fn stats(grid: &impl GridOps, f: &WorldFields) -> serde_json::Value {
         sizes.push(count);
     }
     sizes.sort_unstable();
-    serde_json::json!({"land_cells":land.len(),"lake_cells":wet.len(),"lake_area_fraction":wet_area/area.max(1.),"lake_components":sizes.len(),"one_cell_lakes":sizes.iter().filter(|&&s|s==1).count(),"median_lake_depth_m":depth.get(depth.len()/2),"maximum_depth_m":depth.last()})
+    serde_json::json!({"land_cells":land.len(),"enclosed_subsea_cells":enclosed_subsea,"lake_cells":wet.len(),"lake_area_fraction":wet_area/area.max(1.),"lake_components":sizes.len(),"one_cell_lakes":sizes.iter().filter(|&&s|s==1).count(),"median_lake_depth_m":depth.get(depth.len()/2),"maximum_depth_m":depth.last()})
 }
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();

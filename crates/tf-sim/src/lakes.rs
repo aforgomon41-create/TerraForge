@@ -10,6 +10,48 @@ use tf_grid::GridOps;
 
 const OUT: usize = usize::MAX;
 
+/// Marine outlets for sediment transport: below-sea-level pits enclosed by land
+/// are sediment traps, not unlimited exports. Keep the largest connected sea
+/// and every water component touching an open map boundary.
+pub fn marine_cells<G: GridOps>(grid: &G, elevation: &[f32]) -> Vec<bool> {
+    let n = grid.cell_count();
+    let mut labels = vec![OUT; n];
+    let mut seas = Vec::new();
+    let boundary = grid.boundary_mask();
+    for i in 0..n {
+        if elevation[i] > 0. || labels[i] != OUT {
+            continue;
+        }
+        let id = seas.len();
+        let mut cells = vec![i];
+        labels[i] = id;
+        let (mut area, mut open, mut cursor) = (0., false, 0);
+        while cursor < cells.len() {
+            let cell = cells[cursor];
+            cursor += 1;
+            area += grid.area_m2(cell);
+            open |= boundary[cell];
+            for &j in grid.neighbors(cell) {
+                let j = j as usize;
+                if elevation[j] <= 0. && labels[j] == OUT {
+                    labels[j] = id;
+                    cells.push(j);
+                }
+            }
+        }
+        seas.push((area, open));
+    }
+    let largest = if boundary.any() {
+        None
+    } else {
+        (0..seas.len()).max_by(|&a, &b| seas[a].0.total_cmp(&seas[b].0))
+    };
+    labels
+        .into_iter()
+        .map(|id| id != OUT && (Some(id) == largest || seas[id].1))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LakeBudget {
     pub precipitation_m3_yr: f64,
@@ -81,7 +123,7 @@ fn find(parent: &mut [usize], mut cell: usize) -> usize {
 }
 
 impl Hierarchy {
-    fn build<G: GridOps>(grid: &G, elevation: &[f32]) -> Self {
+    fn build<G: GridOps>(grid: &G, elevation: &[f32], trap_subsea_sediment: bool) -> Self {
         let n = grid.cell_count();
         let mut h = Self {
             nodes: Vec::new(),
@@ -98,7 +140,11 @@ impl Hierarchy {
             return h;
         }
         let mut parent: Vec<usize> = (0..n).collect();
-        let mut active: Vec<bool> = elevation.iter().map(|&z| z <= 0.).collect();
+        let mut active: Vec<bool> = if trap_subsea_sediment {
+            marine_cells(grid, elevation)
+        } else {
+            elevation.iter().map(|&z| z <= 0.).collect()
+        };
         let mut component = vec![OUT; n];
         let boundary = grid.boundary_mask();
         // Preserve the existing no-ocean/closed-domain terminal convention.
@@ -107,7 +153,7 @@ impl Hierarchy {
         } else {
             None
         };
-        let mut order: Vec<usize> = (0..n).filter(|&i| elevation[i] > 0.).collect();
+        let mut order: Vec<usize> = (0..n).filter(|&i| !active[i]).collect();
         order.sort_unstable_by(|&a, &b| elevation[a].total_cmp(&elevation[b]).then(a.cmp(&b)));
         for i in order {
             let z = h.height[i];
@@ -378,7 +424,7 @@ pub fn balance<G: GridOps>(grid: &G, fields: &mut WorldFields) -> (Vec<f64>, Lak
             LakeBudget::default(),
         );
     }
-    let mut tree = Hierarchy::build(grid, &fields.elevation);
+    let mut tree = Hierarchy::build(grid, &fields.elevation, false);
     let n = grid.cell_count();
     let mut source = vec![0.; n];
     let mut loss = vec![0.; n];
@@ -431,15 +477,19 @@ pub fn deposit<G: GridOps>(
     if !source_m3.iter().any(|&s| s > 0.) {
         return (0., 0., 0.);
     }
-    let mut tree = Hierarchy::build(grid, &fields.elevation);
+    let mut tree = Hierarchy::build(grid, &fields.elevation, true);
     tree.prepare(source_m3, &vec![0.; grid.cell_count()], true);
     tree.solve();
     let surfaces = tree.surfaces();
     let mut deposited = 0.;
     for (i, &height) in surfaces.iter().enumerate() {
         let mut new = height as f32;
-        if new > 0. && new as f64 > height {
-            new = f32::from_bits(new.to_bits() - 1);
+        if new as f64 > height {
+            new = f32::from_bits(if new > 0. {
+                new.to_bits() - 1
+            } else {
+                new.to_bits() + 1
+            });
         }
         deposited += (new - fields.elevation[i]).max(0.) as f64 * tree.area[i];
         fields.elevation[i] = new;
@@ -459,6 +509,11 @@ mod tests {
     }
     impl Line {
         fn new(n: usize) -> Self {
+            let mut boundary = bitvec![0;n];
+            if n > 0 {
+                boundary.set(0, true);
+                boundary.set(n - 1, true);
+            }
             Self {
                 neighbors: (0..n)
                     .map(|i| {
@@ -468,7 +523,7 @@ mod tests {
                             .collect()
                     })
                     .collect(),
-                boundary: bitvec![0;n],
+                boundary,
             }
         }
     }
@@ -576,6 +631,23 @@ mod tests {
         assert!(f.elevation.iter().zip(before).all(|(&now, old)| now >= old));
         assert!((d + e + u - source.iter().sum::<f64>()).abs() < 1e-6);
         assert_eq!(e, 0.);
+    }
+    #[test]
+    fn enclosed_subsea_pits_trap_sediment_but_connected_seas_do_not() {
+        let g = Line::new(7);
+        let mut f = WorldFields::with_capacity(7);
+        f.elevation = vec![-10., 9., 6., -2., -2., 5., -10.];
+        assert_eq!(
+            marine_cells(&g, &f.elevation),
+            vec![true, false, false, false, false, false, true]
+        );
+        let mut source = vec![0.; 7];
+        source[2] = 10e6;
+        let (d, e, u) = deposit(&g, &mut f, &source);
+        assert!(f.elevation[3] > 0. && f.elevation[4] > 0.);
+        assert_eq!(f.elevation[0], -10.);
+        assert_eq!(f.elevation[6], -10.);
+        assert!((d + e + u - 10e6).abs() < 1e-6);
     }
     #[test]
     fn zero_depth_flats_and_deep_hierarchies_do_not_create_water_or_recurse() {
