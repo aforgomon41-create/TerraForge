@@ -27,11 +27,17 @@ impl Fixture {
             session_ttl: std::time::Duration::from_secs(60),
             admin_token: Some("test-admin-token-with-at-least-32-characters".into()),
         };
+        let exports = Arc::new(tokio::sync::Semaphore::new(1));
         let state = api::AppState {
-            jobs: JobManager::new(store.clone(), 1),
+            jobs: JobManager::with_memory_budget(
+                store.clone(),
+                1,
+                4,
+                (!desktop).then(|| exports.clone()),
+            ),
             store,
             config: Arc::new(config),
-            exports: Arc::new(tokio::sync::Semaphore::new(1)),
+            exports,
             reads: Arc::new(tokio::sync::Semaphore::new(8)),
             streams: Arc::new(tokio::sync::Semaphore::new(32)),
             admission: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -1279,4 +1285,79 @@ async fn plane_coast_preference_is_saved_and_missing_values_keep_legacy_cropping
         assert_eq!(p.world_shape, tf_core::params::WorldShape::Plane);
         assert_eq!(p.allow_land_at_edge, setting.unwrap_or(true));
     }
+}
+
+#[tokio::test]
+async fn busy_import_does_not_buffer_body_and_waiting_generation_can_be_cancelled() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let world = f.world(&token).await;
+    let memory = f.state.exports.clone().acquire_owned().await.unwrap();
+    let polled = Arc::new(AtomicBool::new(false));
+    let body_polled = polled.clone();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/projects/import")
+        .header("host", "test.local")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from_stream(futures::stream::once(async move {
+            body_polled.store(true, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{}"))
+        })))
+        .unwrap();
+    assert_eq!(
+        f.app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "busy import read its request body"
+    );
+    let (status, submitted) = f
+        .request(
+            "POST",
+            &format!("/api/v1/worlds/{world}/generate"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{submitted}");
+    let id = submitted["job_id"].as_str().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.state.jobs.counts().await.0 == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.state.store.get_job(id).unwrap().unwrap().state, "queued");
+    assert!(f.state.jobs.latest_frame(id).is_none());
+    assert!(f.state.jobs.cancel(id).await);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.state.jobs.counts().await != (0, 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.state.store.get_job(id).unwrap().unwrap().state,
+        "cancelled"
+    );
+    // The cancelled waiter neither stole nor leaked the data operation's permit.
+    assert_eq!(f.state.exports.available_permits(), 0);
+    drop(memory);
+    assert_eq!(f.state.exports.available_permits(), 1);
+    assert_eq!(
+        f.request(
+            "POST",
+            "/api/v1/projects/import",
+            Some(&token),
+            Some(json!({}))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
 }

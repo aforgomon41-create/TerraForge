@@ -5,7 +5,7 @@ use std::sync::{
     Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{broadcast, Mutex, Notify, Semaphore};
 use tracing::{error, info};
 /// 作业事件，广播给 SSE 订阅者。
 #[derive(Debug, Clone)]
@@ -104,6 +104,7 @@ struct Inner {
     tx: broadcast::Sender<JobEvent>,
     max_queue: usize,
     frames: FrameCache,
+    memory: Option<Arc<Semaphore>>,
 }
 
 impl JobManager {
@@ -111,6 +112,14 @@ impl JobManager {
         Self::with_limits(store, limit, 16)
     }
     pub fn with_limits(store: Store, limit: usize, max_queue: usize) -> Self {
+        Self::with_memory_budget(store, limit, max_queue, None)
+    }
+    pub fn with_memory_budget(
+        store: Store,
+        limit: usize,
+        max_queue: usize,
+        memory: Option<Arc<Semaphore>>,
+    ) -> Self {
         let (tx, _) = broadcast::channel(16);
         Self {
             inner: Arc::new(Inner {
@@ -124,6 +133,7 @@ impl JobManager {
                 tx,
                 max_queue,
                 frames: Default::default(),
+                memory,
             }),
         }
     }
@@ -270,6 +280,23 @@ impl JobManager {
             self.inner.state.lock().await.tickets.remove(&id);
             return;
         }
+        // Hosted generation shares the heavy-operation budget with imports and
+        // exports. Waiting does not allocate a simulation, and remains cancellable.
+        let memory_permit = if let Some(memory) = &self.inner.memory {
+            tokio::select! {
+                permit = memory.clone().acquire_owned() => permit.ok(),
+                _ = self.wait_cancelled(&cancel) => None,
+            }
+        } else {
+            None
+        };
+        if cancel.load(Ordering::Relaxed)
+            || (self.inner.memory.is_some() && memory_permit.is_none())
+        {
+            self.finish(&id, "cancelled", None);
+            self.release_slot(&id).await;
+            return;
+        }
         self.finish(&id, "running", None);
         let start = std::time::Instant::now();
         let store = self.inner.store.clone();
@@ -279,6 +306,7 @@ impl JobManager {
         let flag = cancel.clone();
         let frames = self.inner.frames.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let _memory_permit = memory_permit;
             if node.parent.is_none() {
                 crate::generate::run_generation(
                     &store, &tx, &frames, &jid, &mid, &node, &params, &flag,
@@ -318,10 +346,24 @@ impl JobManager {
                 }
             }
         }
+        self.release_slot(&id).await;
+    }
+    async fn wait_cancelled(&self, cancel: &AtomicBool) {
+        loop {
+            let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            notified.await;
+        }
+    }
+    async fn release_slot(&self, id: &str) {
         let mut st = self.inner.state.lock().await;
-        self.inner.frames.lock().remove(&id);
+        self.inner.frames.lock().remove(id);
         st.active = st.active.saturating_sub(1);
-        st.tickets.remove(&id);
+        st.tickets.remove(id);
         drop(st);
         self.inner.changed.notify_waiters();
     }

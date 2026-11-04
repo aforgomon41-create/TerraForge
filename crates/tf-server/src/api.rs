@@ -1171,7 +1171,7 @@ async fn export_json(
 async fn import_project(
     State(st): State<AppState>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    request: axum::extract::Request,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let owner = owner_from_headers(&headers);
     let _admission = st.admission.lock().await;
@@ -1184,9 +1184,21 @@ async fn import_project(
             "当前世界数量已达上限",
         ));
     }
-    let permit =
-        st.exports.clone().try_acquire_owned().map_err(|_| {
-            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "请等待另一项数据操作完成")
+    let permit = st.exports.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "生成或其他数据操作正在进行，请稍后重试",
+        )
+    })?;
+    // Admit before buffering a potentially 64 MiB request, not after it.
+    let limit = if st.config.desktop { 512 } else { 64 } * 1024 * 1024;
+    let body = axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "工程文件超过大小限制或读取失败",
+            )
         })?;
     let world = tokio::task::spawn_blocking(move || {
         let _permit = permit;

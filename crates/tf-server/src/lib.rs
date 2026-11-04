@@ -37,13 +37,19 @@ pub async fn serve_listener(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
     let store = Store::open(config.data_dir.join("terraforge.db"))?;
-    let jobs = JobManager::with_limits(store.clone(), config.max_jobs, config.max_queue);
+    let exports = Arc::new(tokio::sync::Semaphore::new(1));
+    let jobs = JobManager::with_memory_budget(
+        store.clone(),
+        config.max_jobs,
+        config.max_queue,
+        (!config.desktop).then(|| exports.clone()),
+    );
     jobs.recover()?;
     let state = AppState {
         store,
         jobs,
         config: Arc::new(config),
-        exports: Arc::new(tokio::sync::Semaphore::new(1)),
+        exports,
         reads: Arc::new(tokio::sync::Semaphore::new(8)),
         streams: Arc::new(tokio::sync::Semaphore::new(32)),
         admission: Arc::new(tokio::sync::Mutex::new(Vec::new())),

@@ -207,7 +207,10 @@ pub struct Store {
 impl Store {
     /// 打开或创建数据库。
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let db = Database::create(path)?;
+        // redb defaults to a 1 GiB cache, larger than the hosted service budget.
+        let db = Database::builder()
+            .set_cache_size(64 * 1024 * 1024)
+            .create(path)?;
         // 确保所有表都存在
         let write = db.begin_write()?;
         {

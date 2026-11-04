@@ -69,6 +69,7 @@ def main():
     parser.add_argument('--map-png', action='store_true', help='Keep the API map export for terrain inspection')
     parser.add_argument('--cryosphere', action='store_true', help='Check saved ice, seasonal rivers, privacy and import agreement')
     parser.add_argument('--ecosystems', action='store_true', help='Check taxonomy, six saved channels, privacy and import agreement')
+    parser.add_argument('--shared-memory-budget', action='store_true', help='Verify imports are rejected while hosted generation owns the heavy budget')
     parser.add_argument('--out', default='artifacts/geography-acceptance')
     args = parser.parse_args()
     base = args.base.rstrip('/') + '/api/v1'
@@ -146,6 +147,10 @@ def main():
             state = call('/jobs/' + job['job_id'], token)
             if poll%30==0: print(json.dumps({'shape':args.shape,'seconds':round(time.monotonic()-started,1),'stage':state.get('stage'),'progress':state.get('progress')},ensure_ascii=False),flush=True)
             assert state['state'] not in ['failed', 'cancelled'], state
+            if args.shared_memory_budget and state['state'] == 'running' and 'memory_budget' not in report:
+                call('/projects/import', other, 'POST', {}, expected=429)
+                assert call('/health')['status'] == 'ok'
+                report['memory_budget'] = {'import_during_generation': 429, 'health_available': True}
             if state['state'] == 'done':
                 break
             time.sleep(1)
