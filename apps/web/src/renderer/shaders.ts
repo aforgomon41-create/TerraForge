@@ -1,7 +1,7 @@
 /** Shared vertices form a continuous surface; hex outlines are a separate pass. */
 export const VERT = `#version 300 es
 precision highp float;
-layout(location=14)in vec3 aEcosystemColor;layout(location=15)in vec3 aEcosystemPaint;uniform bool uHasEcosystems;
+layout(location=14)in vec3 aEcosystemColor;layout(location=15)in vec3 aEcosystemPaint;uniform bool uHasEcosystems;uniform highp int uLayer;
 layout(location=12)in vec4 aCryosphere;layout(location=13)in vec2 aFrozen;out vec4 vCryosphere;out vec2 vFrozen;
 layout(location=10)in float aLake;out float vLake;out vec3 vMapPosition;
 layout(location=8)in float aGeography;out float vGeography;
@@ -42,7 +42,7 @@ void main(){
   vVegetation=uPreviewMode?vec2(0.):vec2((b==3||b==4||b==9||b==10)?1.:0.,b==1?1.:0.);
   vPaintColor=uPreviewMode?mix(vec3(.80,.70,.40),vec3(.35,.53,.30),clamp(vPrecip/1800.,0.,1.)):paintedBiome(aBiome);
   if(uHasEcosystems&&!uPreviewMode)vPaintColor=mix(vPaintColor,aEcosystemPaint,.28);
-  vNormal=n;vPosition=uPlanarMode?aCenter:n;vBiomeColor=uPreviewMode?mix(vec3(.79,.72,.52),vec3(.42,.59,.39),clamp(vPrecip/1800.,0.,1.)):(uHasEcosystems?aEcosystemColor:biome(aBiome));
+  vNormal=n;vPosition=uPlanarMode?aCenter:n;vBiomeColor=uPreviewMode?mix(vec3(.79,.72,.52),vec3(.42,.59,.39),clamp(vPrecip/1800.,0.,1.)):(uHasEcosystems&&uLayer==3?aEcosystemColor:biome(aBiome));
   gl_Position=uViewProj*vec4(pos,1.);
 }`
 export const FRAG = `#version 300 es
@@ -56,7 +56,7 @@ in vec2 vAtlasPosition;
 in vec3 vPaintColor;in vec2 vVegetation;
 in vec3 vHeightGradient;uniform bool uPreviewMode;
 uniform sampler2D uPigmentTex;
-uniform bool uPlanarMode,uWorldFlatMode;uniform float uMapMetres;uniform vec3 uLightDir;uniform int uStyle,uLayer,uProjection;out vec4 fragColor;
+uniform bool uPlanarMode,uWorldFlatMode;uniform float uMapMetres;uniform vec3 uLightDir;uniform highp int uStyle,uLayer,uProjection;out vec4 fragColor;
 vec3 biome(float value){int b=int(value+.5);
 if(b==1)return vec3(.91,.93,.90);if(b==2)return vec3(.65,.69,.58);if(b==3)return vec3(.30,.43,.32);if(b==4)return vec3(.40,.54,.34);if(b==5)return vec3(.66,.71,.43);if(b==6)return vec3(.65,.67,.44);if(b==7)return vec3(.81,.71,.50);if(b==8)return vec3(.73,.71,.45);if(b==9)return vec3(.25,.46,.32);if(b==10)return vec3(.37,.55,.34);if(b==11)return vec3(.67,.69,.55);if(b==12)return vec3(.36,.52,.44);if(b==13)return vec3(.20,.55,.63);return vec3(.55,.64,.56);}
 vec3 ocean(float h){return mix(vec3(.60,.73,.72),vec3(.30,.48,.53),clamp(-h/6500.,0.,1.));}

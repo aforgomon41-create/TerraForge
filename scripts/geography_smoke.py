@@ -238,7 +238,7 @@ def main():
         vector_fields = {}
         ecosystem_raw = None
         if args.ecosystems:
-            taxonomy = call('/ecosystem-catalogue')
+            taxonomy = call('/ecosystem-catalogue', token)
             ecosystem_raw = call('/maps/'+map_id+'/ecosystems', token, binary=True)
             columns, report['ecosystems'] = ecosystem_packet(ecosystem_raw, node['cells'], taxonomy)
             for name, values in zip(ECOSYSTEM_CHANNELS, columns):
