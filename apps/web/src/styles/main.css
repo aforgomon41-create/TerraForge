@@ -669,6 +669,25 @@ details > label + label {
 .layers-panel {
   padding: 17px 17px 14px;
 }
+.right-stack.ecosystem-open {
+  width: min(340px, calc(100vw - 40px));
+}
+.right-stack.ecosystem-open > aside {
+  flex-shrink: 0;
+}
+.selection-facts .ecosystem-fact {
+  grid-column: 1/-1;
+  min-width: 0;
+}
+.selection-facts .ecosystem-fact dd {
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.selection-facts .ecosystem-fact dd small {
+  display: block;
+}
 .layers-panel > .eyebrow {
   padding: 0 4px;
   margin-bottom: 12px;

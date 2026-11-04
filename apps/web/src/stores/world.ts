@@ -11,6 +11,7 @@ import {
 import { openEventStream, type DecodedFrameEvent } from '@/api/sse'
 import type { Geography } from '@/geography/catalog'
 import type { IceResponse } from '@/cryosphere/data'
+import type { EcosystemResponse } from '@/ecosystems/data'
 export const useWorldStore = defineStore('world', () => {
   const session = ref<Session | null>(null),
     worlds = ref<World[]>([]),
@@ -31,6 +32,7 @@ export const useWorldStore = defineStore('world', () => {
     plateIds = shallowRef<Float32Array | null>(null)
   const indices = shallowRef<Uint32Array | null>(null)
   const cryosphere = shallowRef<IceResponse | null>(null)
+  const ecosystems = shallowRef<EcosystemResponse | null>(null)
   const geography = shallowRef<Geography | null>(null),
     geographyLoading = ref(false),
     geographyError = ref('')
@@ -56,6 +58,7 @@ export const useWorldStore = defineStore('world', () => {
     plateIds.value = null
     lakeDepth.value = null
     cryosphere.value = null
+    ecosystems.value = null
     biome.value = null
     indices.value = null
     geography.value = null
@@ -143,6 +146,22 @@ export const useWorldStore = defineStore('world', () => {
       lakeDepth.value = lakes
       plateIds.value = ids
       currentMap.value = node
+      ecosystems.value = null
+      void api
+        .ecosystems(id, node.cells, controller.signal)
+        .then((value) => {
+          if (!controller.signal.aborted && currentMap.value?.id === id) ecosystems.value = value
+        })
+        .catch((e: Error & { status?: number }) => {
+          if (!controller.signal.aborted && currentMap.value?.id === id)
+            ecosystems.value = {
+              available: false,
+              reason:
+                e.status === 404
+                  ? '此工程没有生态细分类，仍显示原生态；重新生成可补齐。'
+                  : e.message,
+            }
+        })
       cryosphere.value = null
       void api
         .cryosphere(id, node.cells, 0, controller.signal)
@@ -290,6 +309,7 @@ export const useWorldStore = defineStore('world', () => {
     lakeDepth,
     plateIds,
     cryosphere,
+    ecosystems,
     init,
     refreshWorlds,
     refreshMaps,

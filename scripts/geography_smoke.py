@@ -25,6 +25,40 @@ def float_field(raw, offset=0, count=None):
     return values
 
 
+ECOSYSTEM_CHANNELS = ['ecosystem_biome', 'ecosystem_group', 'ecosystem_habitat_biome',
+                      'ecosystem_habitat_group', 'ecosystem_variant', 'ecosystem_evidence']
+
+
+def ecosystem_packet(raw, count, catalogue):
+    size = struct.unpack_from('<I', raw)[0]
+    assert size <= 65536 and len(raw) == 4 + size + count * 24
+    header = json.loads(raw[4:4+size])
+    assert header['available'] and header['count'] == count
+    assert header['version'] == catalogue['version'] and header['channels'] == ECOSYSTEM_CHANNELS
+    columns = [float_field(raw, 4+size+i*count*4, count) for i in range(6)]
+    biomes = {item['id']: item for item in catalogue['biomes']}
+    groups = {item['id']: item for item in catalogue['groups']}
+    assert len(biomes) == 25 and len(groups) == 110
+    for parent, child in [(columns[0], columns[1]), (columns[2], columns[3])]:
+        for b, g in zip(parent, child):
+            assert b.is_integer() and (b == 0 or b in biomes)
+            assert g.is_integer() and (g == 0 or (g in groups and groups[g]['biome_id'] == b))
+            if g:
+                assert groups[g]['support'] == 'environment_estimate'
+    assert all(v.is_integer() and 0 <= v <= 63 for v in columns[4])
+    assert all(v.is_integer() and v >= 0 and int(v) & ~831 == 0 for v in columns[5])
+    return columns, {
+        'catalogue': [len(biomes), len(groups)], 'version': header['version'],
+        'resolved_ground_cells': sum(g > 0 for g in columns[1]),
+        'pending_ground_cells': sum(g == 0 for g in columns[1]),
+        'ground_types': {groups[g]['code']: n for g, n in collections.Counter(columns[1]).items() if g},
+        'habitat_types': {groups[g]['code']: n for g, n in collections.Counter(columns[3]).items() if g},
+        'distinct_local_variants': len(set(columns[4])),
+        'u16_ids_preserved': any(g > 255 for g in columns[1]),
+        'packet_sha256': hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base', default='http://127.0.0.1:18795/terraforge')
@@ -34,6 +68,7 @@ def main():
     parser.add_argument('--live', action='store_true', help='Verify changing solver frames in the same generation')
     parser.add_argument('--map-png', action='store_true', help='Keep the API map export for terrain inspection')
     parser.add_argument('--cryosphere', action='store_true', help='Check saved ice, seasonal rivers, privacy and import agreement')
+    parser.add_argument('--ecosystems', action='store_true', help='Check taxonomy, six saved channels, privacy and import agreement')
     parser.add_argument('--out', default='artifacts/geography-acceptance')
     args = parser.parse_args()
     base = args.base.rstrip('/') + '/api/v1'
@@ -196,6 +231,21 @@ def main():
             report['actual_lakes'] = {'cells':lake_cells, 'land_cell_fraction':lake_cells/max(1,sum(h>0 for h in height)),
                                       'water_budget':water, 'sediment':sediment}
         vector_fields = {}
+        ecosystem_raw = None
+        if args.ecosystems:
+            taxonomy = call('/ecosystem-catalogue')
+            ecosystem_raw = call('/maps/'+map_id+'/ecosystems', token, binary=True)
+            columns, report['ecosystems'] = ecosystem_packet(ecosystem_raw, node['cells'], taxonomy)
+            for name, values in zip(ECOSYSTEM_CHANNELS, columns):
+                assert values == float_field(call('/maps/'+map_id+'/field/'+name, token, binary=True)), name
+            assert metadata['ecosystem_model']['version'] == taxonomy['version']
+            assert metadata['ecosystem_model']['resolved_ground_cells'] == report['ecosystems']['resolved_ground_cells']
+            call('/maps/'+map_id+'/ecosystems', other, expected=404)
+            saved = Path(args.out)
+            saved.mkdir(parents=True, exist_ok=True)
+            (saved/'ecosystems.bin').write_bytes(ecosystem_raw)
+            (saved/'surface.bin').write_bytes(call('/maps/'+map_id+'/surface', token, binary=True))
+            del columns
         ice_packets, seasonal_rivers = {}, {}
         if args.cryosphere:
             assert 'cryosphere_atlas' not in metadata
@@ -284,6 +334,10 @@ def main():
             assert image.startswith(b'\x89PNG\r\n\x1a\n')
             image_out=Path(args.out); image_out.mkdir(parents=True,exist_ok=True)
             (image_out/(args.shape+'.png')).write_bytes(image)
+            if args.ecosystems:
+                ecological_image = call('/maps/'+map_id+'/export.png?size=2048&ecosystem=group', token, binary=True)
+                assert ecological_image.startswith(b'\x89PNG\r\n\x1a\n') and ecological_image != image
+                (image_out/(args.shape+'-ecosystems.png')).write_bytes(ecological_image)
         if args.vectors:
             saved = Path(args.out)
             saved.mkdir(parents=True, exist_ok=True)
@@ -291,6 +345,9 @@ def main():
         imported = call('/projects/import', token, 'POST', project)
         imported_maps = call('/worlds/' + imported['id'] + '/maps', token)
         assert len(imported_maps) == 1
+        if ecosystem_raw is not None:
+            assert call('/maps/'+imported_maps[0]['id']+'/ecosystems', token, binary=True) == ecosystem_raw
+            report['ecosystems']['round_trip_exact'] = True
         for suffix, data in vector_fields.items():
             assert call('/maps/' + imported_maps[0]['id'] + suffix, token) == data
         if args.vectors and metadata.get('tectonic_history',{}).get('lifecycle',{}).get('identities'):

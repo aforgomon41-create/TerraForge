@@ -1,6 +1,7 @@
 /** Shared vertices form a continuous surface; hex outlines are a separate pass. */
 export const VERT = `#version 300 es
 precision highp float;
+layout(location=14)in vec3 aEcosystemColor;layout(location=15)in vec3 aEcosystemPaint;uniform bool uHasEcosystems;
 layout(location=12)in vec4 aCryosphere;layout(location=13)in vec2 aFrozen;out vec4 vCryosphere;out vec2 vFrozen;
 layout(location=10)in float aLake;out float vLake;out vec3 vMapPosition;
 layout(location=8)in float aGeography;out float vGeography;
@@ -40,12 +41,13 @@ void main(){
   int b=int(aBiome+.5);
   vVegetation=uPreviewMode?vec2(0.):vec2((b==3||b==4||b==9||b==10)?1.:0.,b==1?1.:0.);
   vPaintColor=uPreviewMode?mix(vec3(.80,.70,.40),vec3(.35,.53,.30),clamp(vPrecip/1800.,0.,1.)):paintedBiome(aBiome);
-  vNormal=n;vPosition=uPlanarMode?aCenter:n;vBiomeColor=uPreviewMode?mix(vec3(.79,.72,.52),vec3(.42,.59,.39),clamp(vPrecip/1800.,0.,1.)):biome(aBiome);
+  if(uHasEcosystems&&!uPreviewMode)vPaintColor=mix(vPaintColor,aEcosystemPaint,.28);
+  vNormal=n;vPosition=uPlanarMode?aCenter:n;vBiomeColor=uPreviewMode?mix(vec3(.79,.72,.52),vec3(.42,.59,.39),clamp(vPrecip/1800.,0.,1.)):(uHasEcosystems?aEcosystemColor:biome(aBiome));
   gl_Position=uViewProj*vec4(pos,1.);
 }`
 export const FRAG = `#version 300 es
 precision highp float;
-in vec4 vCryosphere;in vec2 vFrozen;uniform bool uHasCryosphere;
+in vec4 vCryosphere;in vec2 vFrozen;uniform bool uHasCryosphere,uHasEcosystems;
 in float vLake;in vec3 vMapPosition;
 in float vGeography;uniform bool uGeographyActive;
 in vec3 vPartitionColor;in float vPartitionPresent;
@@ -116,7 +118,7 @@ vec3 gameMap(){
   return mix(color,vec3(.96,.93,.82),.018);
 }
 void main(){if(uWorldFlatMode && (abs(vAtlasPosition.x)>2.00001 || abs(vAtlasPosition.y)>1.00001 || (uProjection==1 && abs(vAtlasPosition.y)>.9450125416934075)))discard;vec3 color;
-if(uLayer==10)color=gameMap();else if(uLayer==7)color=vHeight<=0.?mix(ocean(vHeight),vec3(.87,.90,.87),.35):mix(vec3(.89,.88,.82),vPartitionColor,smoothstep(.25,.75,vPartitionPresent));else if(uLayer==6)color=vPlateColor;else if(uLayer==1)color=temperature(vTemp);else if(uLayer==2)color=precipitation(vPrecip);else if(uLayer==3)color=vHeight<=0.?ocean(vHeight):vBiomeColor;else if(uLayer==4)color=elevation(vHeight);else if(uLayer==5){float flow=clamp((log(max(vFlow,1.))-log(1.e9))/(log(1.e12)-log(1.e9)),0.,1.);color=vHeight<=0.?ocean(vHeight):mix(vec3(.84,.84,.71),vec3(.16,.40,.55),flow);}
+if(uLayer==10)color=gameMap();else if(uLayer==7)color=vHeight<=0.?mix(ocean(vHeight),vec3(.87,.90,.87),.35):mix(vec3(.89,.88,.82),vPartitionColor,smoothstep(.25,.75,vPartitionPresent));else if(uLayer==6)color=vPlateColor;else if(uLayer==1)color=temperature(vTemp);else if(uLayer==2)color=precipitation(vPrecip);else if(uLayer==3)color=uHasEcosystems&&!uPreviewMode?vBiomeColor:(vHeight<=0.?ocean(vHeight):vBiomeColor);else if(uLayer==4)color=elevation(vHeight);else if(uLayer==5){float flow=clamp((log(max(vFlow,1.))-log(1.e9))/(log(1.e12)-log(1.e9)),0.,1.);color=vHeight<=0.?ocean(vHeight):mix(vec3(.84,.84,.71),vec3(.16,.40,.55),flow);}
 else{
   color=vHeight<=0.?ocean(vHeight):vBiomeColor;
   if(vBiome<-.5&&vHeight>0.)color=mix(vec3(.79,.72,.52),vec3(.42,.59,.39),clamp(vPrecip/1800.,0.,1.));

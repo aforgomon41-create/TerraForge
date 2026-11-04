@@ -10,6 +10,8 @@ import pigmentUrl from '../assets/atlas-pigment.png'
 import { heightGradients } from './relief'
 import { lakeShoreDepths } from './lakeShore'
 import { iceAttributes, type IceData } from '../cryosphere/data'
+import { ecosystemAttributes } from '../ecosystems/view'
+import type { EcosystemData } from '../ecosystems/data'
 
 export interface CellData {
   /** 格子中心方向 xyz 交错，长度 = count * 3 */
@@ -25,6 +27,8 @@ export interface CellData {
   flows?: Float32Array
   lakeDepths?: Float32Array
   cryosphere?: IceData
+  ecosystems?: EcosystemData
+  ecosystemMode?: number
   plateIds?: Float32Array
   indices: Uint32Array
   count: number
@@ -71,6 +75,9 @@ export class HexSphereRenderer {
   private iceBuf: WebGLBuffer | null = null
   private frozenBuf: WebGLBuffer | null = null
   private hasCryosphere = false
+  private ecosystemColorBuf: WebGLBuffer | null = null
+  private ecosystemPaintBuf: WebGLBuffer | null = null
+  private hasEcosystems = false
   private disposed = false
   private geographyBuf: WebGLBuffer | null = null
   private geographySourceIds: Uint32Array | undefined
@@ -378,6 +385,37 @@ export class HexSphereRenderer {
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
     gl.bindVertexArray(null)
     this.setCryosphere(data.cryosphere)
+    this.setEcosystems(data.ecosystems, data.ecosystemMode ?? 1)
+  }
+
+  setEcosystems(data?: EcosystemData, mode = 1) {
+    if (this.disposed || !this.vao) return
+    const gl = this.gl
+    const packed = data
+      ? ecosystemAttributes(data, this.cellCount, this.geographySourceIds, mode)
+      : null
+    this.hasEcosystems = !!packed
+    gl.bindVertexArray(this.vao)
+    if (!packed) {
+      for (const location of [14, 15]) {
+        gl.disableVertexAttribArray(location)
+        gl.vertexAttrib3f(location, 0, 0, 0)
+      }
+      gl.bindVertexArray(null)
+      return
+    }
+    this.ecosystemColorBuf ||= gl.createBuffer()
+    this.ecosystemPaintBuf ||= gl.createBuffer()
+    for (const [buffer, location, values] of [
+      [this.ecosystemColorBuf, 14, packed.colors],
+      [this.ecosystemPaintBuf, 15, packed.paint],
+    ] as const) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+      gl.bufferData(gl.ARRAY_BUFFER, values, gl.DYNAMIC_DRAW)
+      gl.enableVertexAttribArray(location)
+      gl.vertexAttribPointer(location, 3, gl.FLOAT, false, 0, 0)
+    }
+    gl.bindVertexArray(null)
   }
 
   setCryosphere(ice?: IceData) {
@@ -612,6 +650,8 @@ export class HexSphereRenderer {
       this.gradientBuf,
       this.iceBuf,
       this.frozenBuf,
+      this.ecosystemColorBuf,
+      this.ecosystemPaintBuf,
       this.instPlateBuf,
       this.geographyBuf,
       this.partitionBuf,
@@ -737,6 +777,7 @@ export class HexSphereRenderer {
     // 预览模式：绑定帧纹理
     gl.uniform1i(u('uPreviewMode'), this.previewMode ? 1 : 0)
     gl.uniform1i(u('uHasCryosphere'), this.hasCryosphere ? 1 : 0)
+    gl.uniform1i(u('uHasEcosystems'), this.hasEcosystems ? 1 : 0)
     if (this.previewMode && this.frameTexture) {
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, this.frameTexture)

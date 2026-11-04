@@ -34,6 +34,8 @@ def main():
     parser.add_argument('--center', nargs=2, type=float, default=[0.,0.])
     parser.add_argument('--material-fallback', action='store_true')
     parser.add_argument('--ice-month',type=int,choices=range(13),default=0)
+    parser.add_argument('--eco-mode',type=int,choices=range(3),default=1)
+    parser.add_argument('--no-ecosystems',action='store_true')
     parser.add_argument('--offline-artifacts', help='Folder containing surface.bin and hydrology.json from offline_world_qa; no network access')
     args = parser.parse_args()
     if not 64 <= args.width <= 8192 or not 0.5 <= args.zoom <= 30:
@@ -82,15 +84,18 @@ def main():
         has_ice='land_ice_m' in source_map['channels'] and 'cryosphere_atlas' in source_map.get('metadata',{})
         ice_bytes=((Path(args.offline_artifacts)/f'ice-{args.ice_month}.bin').read_bytes() if args.offline_artifacts else call('/maps/'+node['id']+f'/cryosphere?month={args.ice_month}',binary=True)) if has_ice else b''
         (out/'ice.bin').write_bytes(ice_bytes)
+        has_ecosystems=not args.no_ecosystems and 'ecosystem_biome' in source_map['channels']
+        eco_bytes=((Path(args.offline_artifacts)/'ecosystems.bin').read_bytes() if args.offline_artifacts else call('/maps/'+node['id']+'/ecosystems',binary=True)) if has_ecosystems else b''
+        (out/'ecosystems.bin').write_bytes(eco_bytes)
         node_exe = shutil.which('node') or r'C:\Program Files\nodejs\node.exe'
         bundle="""import {createRequire} from 'node:module';
 const [root,out]=process.argv.slice(1);const req=createRequire(root+'/apps/web/package.json');
 const local=createRequire(req.resolve('vite/package.json'));const {build}=local('esbuild');
-await build({stdin:{contents:"export * from './surface.ts'; export * from './math.ts'; export * from './projections.ts'; export * from './relief.ts'; export * from './lakeShore.ts'; export * from '../cryosphere/data.ts';",resolveDir:root+'/apps/web/src/renderer'},bundle:true,platform:'node',format:'esm',outfile:out+'/surface.mjs'});"""
+await build({stdin:{contents:"export * from './surface.ts'; export * from './math.ts'; export * from './projections.ts'; export * from './relief.ts'; export * from './lakeShore.ts'; export * from '../cryosphere/data.ts'; export * from '../ecosystems/data.ts'; export * from '../ecosystems/view.ts';",resolveDir:root+'/apps/web/src/renderer'},bundle:true,platform:'node',format:'esm',outfile:out+'/surface.mjs'});"""
         subprocess.run([node_exe,'--input-type=module','-e',bundle,str(root),str(out)],check=True)
         javascript = """
 import fs from 'node:fs'; import {pathToFileURL} from 'node:url';
-const [directory,spherical,view,normalization]=process.argv.slice(1);
+const [directory,spherical,view,normalization,ecoMode]=process.argv.slice(1);
 const geometry=await import(pathToFileURL(directory+'/surface.mjs').href);
 const bytes=fs.readFileSync(directory+'/surface.bin');
 const surfaceView=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
@@ -112,6 +117,11 @@ const ice=iceBytes.length?geometry.decodeIce(iceBytes.buffer.slice(iceBytes.byte
 const iceAttributes=geometry.iceAttributes(ice,n,atlas.sourceIds);
 fs.writeFileSync(directory+'/cryocover.bin',Buffer.from(iceAttributes.cover.buffer));
 fs.writeFileSync(directory+'/cryoground.bin',Buffer.from(iceAttributes.ground.buffer));
+const ecoBytes=fs.readFileSync(directory+'/ecosystems.bin');
+const eco=ecoBytes.length?geometry.decodeEcosystems(ecoBytes.buffer.slice(ecoBytes.byteOffset,ecoBytes.byteOffset+ecoBytes.byteLength),n):undefined;
+const packedEco=geometry.ecosystemAttributes(eco,n,atlas.sourceIds,Number(ecoMode));
+fs.writeFileSync(directory+'/ecocolors.bin',Buffer.from(packedEco.colors.buffer));
+fs.writeFileSync(directory+'/ecopaint.bin',Buffer.from(packedEco.paint.buffer));
 const mappedGradient=Float32Array.from({length:atlas.sourceIds.length*3},(_,i)=>gradient[atlas.sourceIds[Math.floor(i/3)]*3+i%3]);
 fs.writeFileSync(directory+'/gradients.bin',Buffer.from(mappedGradient.buffer));
 fs.writeFileSync(directory+'/geoPositions.bin',Buffer.from(atlas.positions.buffer));
@@ -130,7 +140,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
         sphere = node['grid']['type']=='sphere'
         globe = sphere and args.view == 'globe'
         atlas = sphere and not globe
-        subprocess.run([node_exe,'--input-type=module','-e',javascript,str(out),str(sphere).lower(),args.view,str(1 if sphere else 2/node['grid']['width_m'])],check=True)
+        subprocess.run([node_exe,'--input-type=module','-e',javascript,str(out),str(sphere).lower(),args.view,str(1 if sphere else 2/node['grid']['width_m']),str(args.eco_mode)],check=True)
         positions = np.fromfile(out/'positions.bin',dtype='<f4').reshape(-1,3)
         source_ids = np.fromfile(out/'sourceIds.bin',dtype='<u4')
         indices = np.fromfile(out/'indices.bin',dtype='<u4')
@@ -174,7 +184,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
             matrix[3,0]=-args.center[0]*matrix[0,0];matrix[3,1]=-args.center[1]*matrix[1,1]
         program['uViewProj'].write(matrix.tobytes())
         uniforms={'uRadius':1.,'uHeightScale':.00001,'uMapMetres':node['grid'].get('radius_m') if sphere else node['grid']['width_m']/2,
-                  'uPlanarMode':not globe,'uWorldFlatMode':atlas,'uProjection':camera['projection'],'uPreviewMode':False,'uHasCryosphere':has_ice,'uStyle':2,'uGeographyActive':False,
+                  'uPlanarMode':not globe,'uWorldFlatMode':atlas,'uProjection':camera['projection'],'uPreviewMode':False,'uHasCryosphere':has_ice,'uHasEcosystems':has_ecosystems,'uStyle':2,'uGeographyActive':False,
                   'uLightDir':(-.45,.55,.7)}
         for name,value in uniforms.items():
             if name in program: program[name].value=value
@@ -184,6 +194,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
                     'aPlate':channel('plate_id'),'aTemperature':channel('temperature'),'aPrecipitation':channel('precipitation'),
                     'aFlow':channel('flow_accumulation'),'aLake':np.fromfile(out/'shore.bin',dtype='<f4'),
                     'aCryosphere':np.fromfile(out/'cryocover.bin',dtype='<f4').reshape(-1,4),'aFrozen':np.fromfile(out/'cryoground.bin',dtype='<f4').reshape(-1,2),
+                    'aEcosystemColor':np.fromfile(out/'ecocolors.bin',dtype='<f4').reshape(-1,3),'aEcosystemPaint':np.fromfile(out/'ecopaint.bin',dtype='<f4').reshape(-1,3),
                     'aGeography':np.zeros(len(source_ids),dtype='f4'),'aPartition':np.zeros(len(source_ids),dtype='f4')}
         program['uHeightScale'].value=.025/max(float(attributes['aHeight'].max()),1.)
         for name,values in attributes.items():
@@ -200,7 +211,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
             line['uViewProj'].write(matrix.tobytes())
             for name,value in {'uSphere':globe,'uWorldFlatMode':atlas,'uProjection':camera['projection'],'uEye':tuple(camera['eye']),'uRadius':1.,'uColor':(.18,.46,.57,.84)}.items():
                 if name in line: line[name].value=value
-        for layer,label in [(0,'terrain'),(4,'elevation'),(10,'game'),(11,'cryosphere')]:
+        for layer,label in [(0,'terrain'),(3,'ecosystems'),(4,'elevation'),(10,'game'),(11,'cryosphere')]:
             frame.clear(.96,.95,.91)
             ctx.enable(moderngl.DEPTH_TEST)
             program['uLayer'].value=layer;vao.render(moderngl.TRIANGLES)
@@ -218,6 +229,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
         report={'result':'passed','exact_es300_sources':True,'browser_ui_checked':False,'renderer':ctx.info['GL_RENDERER'],
                 'offline_artifacts':bool(args.offline_artifacts),
                 'cryosphere_available':has_ice,'ice_month':args.ice_month,
+                'ecosystems_available':has_ecosystems,'ecosystem_mode':args.eco_mode,
                 'view':args.view if sphere else 'plane','pixels':[width,height],'material_fallback':args.material_fallback,
                 'zoom':args.zoom,'center':args.center,
                 'material_sha256':hashlib.sha256(pigment_path.read_bytes()).hexdigest(),'gl_error':gl_error,

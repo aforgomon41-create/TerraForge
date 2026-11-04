@@ -297,8 +297,14 @@ export const api = {
     })
     return r.json() as Promise<World>
   },
-  async download(id: string, format: 'png' | 'json', filename: string) {
-    const res = await authorizedFetch(`/api/v1/maps/${id}/export.${format}`)
+  async download(
+    id: string,
+    format: 'png' | 'json',
+    filename: string,
+    ecosystem?: 'biome' | 'group' | 'variant',
+  ) {
+    const query = format === 'png' && ecosystem ? `?ecosystem=${ecosystem}` : ''
+    const res = await authorizedFetch(`/api/v1/maps/${id}/export.${format}${query}`)
     const url = URL.createObjectURL(await res.blob())
     const a = document.createElement('a')
     a.href = url

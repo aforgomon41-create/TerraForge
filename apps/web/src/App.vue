@@ -41,6 +41,8 @@ import {
   type PartitionMode,
 } from '@/geography/view'
 import AgentPanel from '@/components/AgentPanel.vue'
+import EcosystemPanel from '@/components/EcosystemPanel.vue'
+import { ecosystemAt, ecosystemModes } from '@/ecosystems/view'
 const store = useWorldStore(),
   canvas = ref<HTMLCanvasElement | null>(null),
   fileInput = ref<HTMLInputElement | null>(null)
@@ -117,6 +119,10 @@ const style = ref(MapStyle.Parchment),
   pin = ref<{ x: number; y: number } | null>(null)
 const partitionMode = ref<PartitionMode>('region'),
   partitionTruncated = ref(false)
+const ecosystemMode = ref(1)
+const selectedEcosystem = computed(() =>
+  ecosystemAt(store.ecosystems?.available ? store.ecosystems : null, selection.value?.cell),
+)
 const partitionHint = computed(() => partitionModes.find((p) => p.id === partitionMode.value)!.hint)
 const manualLat = ref('0'),
   manualLon = ref('0'),
@@ -334,7 +340,7 @@ const layers = [
     id: 3,
     name: '生态',
     icon: '❋',
-    unit: '14 类生物群系',
+    unit: '分层生态 · 大类 / 细类 / 地方变体',
     ends: ['冰原', '森林', '荒漠'],
     gradient: 'linear-gradient(90deg,#e8ede5,#597b56,#cfb580)',
   },
@@ -706,6 +712,8 @@ function applyMap() {
     flows: store.flow || undefined,
     lakeDepths: store.lakeDepth || undefined,
     cryosphere: visibleIce.value?.available ? visibleIce.value : undefined,
+    ecosystems: store.ecosystems?.available ? store.ecosystems : undefined,
+    ecosystemMode: ecosystemMode.value,
     plateIds: store.plateIds || undefined,
     count: node.cells,
   })
@@ -732,6 +740,13 @@ function applyMap() {
   refine.value = false
 }
 watch(() => store.currentMap, applyMap)
+watch([() => store.ecosystems, ecosystemMode], () => {
+  if (!store.generating)
+    renderer?.setEcosystems(
+      store.ecosystems?.available ? store.ecosystems : undefined,
+      ecosystemMode.value,
+    )
+})
 watch(worldProjection, () => {
   const selected = selection.value
   const feature = activeFeatureId.value
@@ -935,6 +950,9 @@ async function exportFile(format: 'png' | 'json') {
       store.currentMap.id,
       format,
       (store.current?.name || 'TerraForge') + (format === 'png' ? '.png' : '.tfworld'),
+      layer.value === 3 && store.ecosystems?.available
+        ? (['biome', 'group', 'variant'] as const)[ecosystemMode.value]
+        : undefined,
     )
   } finally {
     busy.value = false
@@ -985,6 +1003,11 @@ const toolCtx: ToolContext = {
   maps: () => store.maps,
   elevation: () => store.elevation,
   biome: () => store.biome,
+  ecosystems: () => store.ecosystems,
+  setEcosystemMode: (mode) => {
+    ecosystemMode.value = mode
+    layer.value = 3
+  },
   selection: () => selection.value,
   geography: () => store.geography,
   selectFeature: selectGeographic,
@@ -1591,7 +1614,11 @@ onBeforeUnmount(() => {
       <i />
       <span>{{ selection?.lat.toFixed(2) }}°, {{ selection?.lon.toFixed(2) }}°</span>
     </div>
-    <div v-if="panel !== 'ai'" class="right-stack" :class="{ 'mobile-hidden': panel !== 'layers' }">
+    <div
+      v-if="panel !== 'ai'"
+      class="right-stack"
+      :class="{ 'mobile-hidden': panel !== 'layers', 'ecosystem-open': layer === 3 }"
+    >
       <aside class="paper-panel layers-panel" aria-label="地图图层">
         <span class="eyebrow">MAP LAYERS / 图层</span>
         <div role="radiogroup" aria-label="地图图层">
@@ -1609,6 +1636,13 @@ onBeforeUnmount(() => {
             <i v-if="layer === l.id">●</i>
           </button>
         </div>
+        <EcosystemPanel
+          v-if="layer === 3"
+          v-model:mode="ecosystemMode"
+          :data="store.ecosystems"
+          :generating="store.generating"
+          :has-map="hasMap"
+        />
         <p v-if="layer === 10" class="layer-help" role="status">
           {{
             store.generating
@@ -1782,10 +1816,44 @@ onBeforeUnmount(() => {
                 <small>mm</small>
               </dd>
             </div>
-            <div>
+            <div v-if="!selectedEcosystem">
               <dt>生态</dt>
               <dd>{{ selectedFacts.biome }}</dd>
             </div>
+            <template v-if="selectedEcosystem">
+              <div class="ecosystem-fact">
+                <dt>群系大类</dt>
+                <dd>{{ selectedEcosystem.biome }}</dd>
+              </div>
+              <div class="ecosystem-fact">
+                <dt>详细类型</dt>
+                <dd>
+                  {{ selectedEcosystem.group }}
+                  <small v-if="selectedEcosystem.group_code">
+                    {{ selectedEcosystem.group_code }}
+                  </small>
+                </dd>
+              </div>
+              <div class="ecosystem-fact">
+                <dt>地方环境</dt>
+                <dd>{{ selectedEcosystem.environment }}</dd>
+              </div>
+              <div class="ecosystem-fact">
+                <dt>识别程度</dt>
+                <dd>{{ selectedEcosystem.identification }}</dd>
+              </div>
+              <div v-if="selectedEcosystem.habitat" class="ecosystem-fact">
+                <dt>局部生境</dt>
+                <dd>
+                  {{ selectedEcosystem.habitat.biome }} · {{ selectedEcosystem.habitat.group }}
+                  <small>{{ selectedEcosystem.habitat.code }}</small>
+                </dd>
+              </div>
+              <div class="ecosystem-fact">
+                <dt>可用依据</dt>
+                <dd>{{ selectedEcosystem.basis.join('；') }}</dd>
+              </div>
+            </template>
             <template v-if="selectedIce">
               <div v-if="selectedIce.land > 0.1">
                 <dt>陆冰厚度估计</dt>
@@ -1932,15 +2000,22 @@ onBeforeUnmount(() => {
             ? '本月累计降水（mm；求解中）'
             : liveLayer === 11 && iceMonth
               ? `${iceMonth}月冰雪 · 冻土估计`
-              : activeLayer.unit
+              : liveLayer === 3
+                ? store.ecosystems?.available
+                  ? `${ecosystemModes[ecosystemMode].name}生态 · 图例见图层面板`
+                  : '原14类兼容生态'
+                : activeLayer.unit
         }}
       </span>
       <p v-if="liveLayer === 7" class="partition-key">
         <i />
         相邻区域分色 · 细线为边界
       </p>
-      <i v-else :style="{ background: activeLayer.gradient }" />
-      <div v-if="liveLayer !== 7">
+      <i
+        v-else-if="liveLayer !== 3 || !store.ecosystems?.available"
+        :style="{ background: activeLayer.gradient }"
+      />
+      <div v-if="liveLayer !== 7 && (liveLayer !== 3 || !store.ecosystems?.available)">
         <span v-for="end in activeLayer.ends" :key="end">{{ end }}</span>
       </div>
       <small>
