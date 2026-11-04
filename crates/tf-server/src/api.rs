@@ -72,6 +72,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/maps/{id}/climate", get(get_monthly_climate))
         .route(
+            "/api/v1/ecosystem-catalogue",
+            get(crate::ecosystems::catalogue),
+        )
+        .route("/api/v1/maps/{id}/ecosystems", get(crate::ecosystems::get))
+        .route(
             "/api/v1/maps/{id}/cryosphere",
             get(crate::cryosphere::get_cryosphere),
         )
@@ -449,7 +454,7 @@ async fn generate_world(
         created_at: now_millis() as i64,
         completed_at: None,
         seed: params.seed,
-        generator_version: "tf-0.4".into(),
+        generator_version: "tf-0.6".into(),
     };
 
     let job_id = st
@@ -615,6 +620,12 @@ async fn sample_map(
             Channel::LiquidWater,
             Channel::LakeIce,
             Channel::LiquidDischarge,
+            Channel::EcosystemBiome,
+            Channel::EcosystemGroup,
+            Channel::EcosystemHabitatBiome,
+            Channel::EcosystemHabitatGroup,
+            Channel::EcosystemVariant,
+            Channel::EcosystemEvidence,
         ] {
             if let Some(data) = store.get_field(&id, ch)? {
                 if let Some(value) = data.get(cell) {
@@ -1042,7 +1053,7 @@ async fn generate_child(
         completed_at: None,
         grid: Some(grid),
         seed: params.seed,
-        generator_version: "tf-0.4".into(),
+        generator_version: "tf-0.6".into(),
     };
     let job_id = st
         .jobs
@@ -1197,6 +1208,13 @@ async fn export_png(
         .get("size")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(2048);
+    let ecosystem_mode = match params.get("ecosystem").map(String::as_str) {
+        None | Some("group") => Some(1),
+        Some("biome") => Some(0),
+        Some("variant") => Some(2),
+        Some("legacy") => None,
+        _ => return Err(ApiError::bad_request("生态导出模式无效")),
+    };
     if !(256..=max).contains(&size) {
         return Err(ApiError::bad_request(format!(
             "当前模式导出宽度须为 256～{max} 像素"
@@ -1231,12 +1249,19 @@ async fn export_png(
             .map(|&ch| st.store.get_field(&map_id, ch))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let ice: Option<Vec<_>> = ice.into_iter().collect();
-        crate::render::render_map_png_with_ice(
+        let ecosystems = if ecosystem_mode.is_some() {
+            crate::ecosystems::load(&st.store, &map_id, node.cells as usize)?
+        } else {
+            None
+        };
+        crate::render::render_map_png_with_ecosystems(
             &elevation,
             &biome,
             &descriptor,
             size,
             ice.as_deref(),
+            ecosystems.as_ref(),
+            ecosystem_mode.unwrap_or(1),
         )
     })
     .await??;

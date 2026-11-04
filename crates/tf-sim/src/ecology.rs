@@ -91,6 +91,7 @@ pub struct EcologyResult {
     pub biome: Vec<u8>,
     pub soil: Vec<u8>,
     pub soil_depth_m: Vec<f32>,
+    pub ecosystems: crate::ecosystems::Ecosystems,
 }
 
 /// 运行生态模拟。
@@ -190,10 +191,12 @@ pub fn run_ecology_with_diversity<G: GridOps>(
     }
 
     let _ = grid;
+    let ecosystems = crate::ecosystems::classify(grid, fields, &biome, &soil);
     EcologyResult {
         biome,
         soil,
         soil_depth_m: soil_depth,
+        ecosystems,
     }
 }
 

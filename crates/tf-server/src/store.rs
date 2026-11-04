@@ -112,10 +112,16 @@ pub enum Channel {
     LiquidWater = 24,
     LakeIce = 25,
     LiquidDischarge = 26,
+    EcosystemBiome = 27,
+    EcosystemGroup = 28,
+    EcosystemHabitatBiome = 29,
+    EcosystemHabitatGroup = 30,
+    EcosystemVariant = 31,
+    EcosystemEvidence = 32,
 }
 
 impl Channel {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 33] = [
         Self::Elevation,
         Self::CrustThickness,
         Self::CrustType,
@@ -143,6 +149,12 @@ impl Channel {
         Self::LiquidWater,
         Self::LakeIce,
         Self::LiquidDischarge,
+        Self::EcosystemBiome,
+        Self::EcosystemGroup,
+        Self::EcosystemHabitatBiome,
+        Self::EcosystemHabitatGroup,
+        Self::EcosystemVariant,
+        Self::EcosystemEvidence,
     ];
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|ch| ch.name() == name)
@@ -176,6 +188,12 @@ impl Channel {
             Channel::LiquidWater => "liquid_water_mm",
             Channel::LakeIce => "lake_ice_cover",
             Channel::LiquidDischarge => "liquid_discharge_m3_s",
+            Channel::EcosystemBiome => "ecosystem_biome",
+            Channel::EcosystemGroup => "ecosystem_group",
+            Channel::EcosystemHabitatBiome => "ecosystem_habitat_biome",
+            Channel::EcosystemHabitatGroup => "ecosystem_habitat_group",
+            Channel::EcosystemVariant => "ecosystem_variant",
+            Channel::EcosystemEvidence => "ecosystem_evidence",
         }
     }
 }
@@ -264,7 +282,7 @@ impl Store {
         {
             let mut t = write.open_table(FIELDS)?;
             for map_id in &map_ids {
-                for ch in 0u8..=31 {
+                for ch in 0u8..=u8::MAX {
                     t.remove((map_id.as_str(), ch))?;
                 }
             }
@@ -574,7 +592,7 @@ impl Store {
                 write.open_table(META)?.remove(job.map_id.as_str())?;
             }
             let mut fields = write.open_table(FIELDS)?;
-            for ch in 0u8..=31 {
+            for ch in 0u8..=u8::MAX {
                 fields.remove((job.map_id.as_str(), ch))?;
             }
         }

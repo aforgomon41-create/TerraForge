@@ -228,7 +228,7 @@ pub fn run_child_generation(
     for (channel, data) in &inherited {
         channels.push((*channel, data.as_slice()));
     }
-    let mut metadata = serde_json::json!({"generator_version":"tf-0.4","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
+    let mut metadata = serde_json::json!({"generator_version":"tf-0.6","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
     let discharge = fields
         .cryosphere
         .as_ref()
@@ -244,6 +244,13 @@ pub fn run_child_generation(
     if let Some(q) = &discharge {
         channels.push((Channel::LiquidDischarge, q));
     }
+    let ecosystems = ecology.ecosystems.channels();
+    crate::ecosystems::attach(&mut metadata, &ecology.ecosystems);
+    channels.extend(
+        crate::ecosystems::CHANNELS
+            .into_iter()
+            .zip(ecosystems.iter().map(Vec::as_slice)),
+    );
     metadata["hydrology_model"] = serde_json::json!({"name":"depression-hierarchy-annual-balance-v1","lake_depth":"actual_supported_water","water":water.lake_budget,"sediment":erosion_result.sediment});
     metadata["planar_spin_rad_myr"] = parent_meta
         .get("planar_spin_rad_myr")

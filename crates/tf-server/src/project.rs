@@ -77,7 +77,7 @@ pub fn export(store: &Store, world_id: &str) -> anyhow::Result<Vec<u8>> {
     );
     Ok(serde_json::to_vec(&Project {
         format: FORMAT.into(),
-        generator_version: "tf-0.4".into(),
+        generator_version: "tf-0.6".into(),
         world,
         maps,
     })?)
@@ -105,7 +105,7 @@ pub fn import(
         project.format == FORMAT
             && matches!(
                 project.generator_version.as_str(),
-                "tf-0.2" | "tf-0.3" | "tf-0.4"
+                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6"
             ),
         "不支持的工程版本"
     );
@@ -174,7 +174,7 @@ pub fn import(
         anyhow::ensure!(
             matches!(
                 node.generator_version.as_str(),
-                "tf-0.2" | "tf-0.3" | "tf-0.4"
+                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6"
             ) && node.status == "done",
             "地图版本或状态无效"
         );
@@ -261,7 +261,10 @@ pub fn import(
                 _ => anyhow::bail!("父子图的空间形状不一致"),
             }
         }
-        if matches!(node.generator_version.as_str(), "tf-0.3" | "tf-0.4") {
+        if matches!(
+            node.generator_version.as_str(),
+            "tf-0.3" | "tf-0.4" | "tf-0.6"
+        ) {
             let spacing = match descriptor {
                 tf_grid::GridDescriptor::Plane { width_m, size, .. }
                 | tf_grid::GridDescriptor::Patch { width_m, size, .. } => *width_m / *size as f64,
@@ -276,6 +279,7 @@ pub fn import(
             );
         }
         let mut channels = Vec::new();
+        let mut ecosystem_fields: [Option<Vec<f32>>; 6] = std::array::from_fn(|_| None);
         for (name, field) in m.channels {
             let ch = Channel::parse(&name).ok_or_else(|| anyhow::anyhow!("未知数据通道"))?;
             anyhow::ensure!(
@@ -329,7 +333,26 @@ pub fn import(
                     "冰雪及液态水不能为负数"
                 );
             }
+            if let Some(index) = crate::ecosystems::CHANNELS.iter().position(|&c| c == ch) {
+                ecosystem_fields[index] = Some(
+                    data.chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                        .collect(),
+                );
+            }
             channels.push((ch, compressed));
+        }
+        let has_ecosystems = ecosystem_fields.iter().any(Option::is_some);
+        if has_ecosystems {
+            anyhow::ensure!(
+                ecosystem_fields.iter().all(Option::is_some),
+                "生态分级字段不完整"
+            );
+            let values = ecosystem_fields
+                .into_iter()
+                .map(Option::unwrap)
+                .collect::<Vec<_>>();
+            crate::ecosystems::from_channels(&values, node.cells as usize)?;
         }
         for required in [
             Channel::Elevation,
@@ -349,6 +372,12 @@ pub fn import(
         node.parent = node.parent.map(|p| ids[&p].clone());
         node.world_id = world.id.clone();
         let mut metadata: serde_json::Value = serde_json::from_str(m.metadata.get())?;
+        if has_ecosystems {
+            anyhow::ensure!(
+                metadata["ecosystem_model"]["version"] == tf_sim::ecosystems::VERSION,
+                "生态名录版本不匹配"
+            );
+        }
         if let Some(value) = metadata.pointer("/tectonic_history/lifecycle") {
             let life: tf_sim::lifecycle::Lifecycle = serde_json::from_value(value.clone())?;
             let count = metadata

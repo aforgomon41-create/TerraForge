@@ -147,7 +147,17 @@ async fn terminal_event_reconnects_finish_and_release_the_stream_capacity() {
                 .publish_fields(&map_id, &[(Channel::Elevation, &[1.; 16])], &json!({}))
                 .unwrap();
         } else {
+            f.state
+                .store
+                .put_field(&map_id, Channel::EcosystemEvidence, &[275.; 16])
+                .unwrap();
             f.state.store.transition_job(&job_id, state, None).unwrap();
+            assert!(f
+                .state
+                .store
+                .get_field(&map_id, Channel::EcosystemEvidence)
+                .unwrap()
+                .is_none());
         }
         // More than the global capacity: every completed body must drop its permit.
         for _ in 0..33 {
@@ -803,6 +813,127 @@ async fn complete_project_round_trip_preserves_fields_and_rebinds_identity() {
         &f.state.config
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn ecosystem_hierarchy_is_private_preserves_u16_ids_and_deletes_channel_32() {
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let other = f.session().await;
+    let (status, world) = f
+        .request(
+            "POST",
+            "/api/v1/worlds",
+            Some(&token),
+            Some(json!({"name":"Eco test","seed":42,"params":{"world_shape":"plane"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let w = world["id"].as_str().unwrap().to_owned();
+    let descriptor = tf_grid::GridDescriptor::plane(0., 0., 4000., 4, 4, 6371000.);
+    let count = descriptor.cell_count();
+    let mut map = node(&w, "eco-root");
+    map.cells = count as u32;
+    map.cell_size_m = 1000.;
+    map.grid = Some(descriptor);
+    map.status = "done".into();
+    map.generator_version = "tf-0.6".into();
+    f.state.store.put_map_node(&map).unwrap();
+    for (ch, value) in [
+        (Channel::Elevation, 200.),
+        (Channel::Temperature, 10.),
+        (Channel::Precipitation, 900.),
+        (Channel::Biome, 4.),
+        (Channel::DistanceToSea, 1e5),
+    ] {
+        f.state
+            .store
+            .put_field(&map.id, ch, &vec![value; count])
+            .unwrap();
+    }
+    let e = tf_sim::ecosystems::Ecosystems {
+        biome: vec![19; count],
+        group: vec![306; count],
+        habitat_biome: vec![1; count],
+        habitat_group: vec![19; count],
+        variant: vec![21; count],
+        evidence: vec![275; count],
+    };
+    for (ch, values) in crate::ecosystems::CHANNELS.into_iter().zip(e.channels()) {
+        f.state.store.put_field(&map.id, ch, &values).unwrap();
+    }
+    let mut metadata = json!({});
+    crate::ecosystems::attach(&mut metadata, &e);
+    f.state
+        .store
+        .publish_fields(&map.id, &[], &metadata)
+        .unwrap();
+    let (status, body) = f
+        .request("GET", "/api/v1/ecosystem-catalogue", Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["groups"].as_array().unwrap().len(), 110);
+    assert_eq!(
+        f.request(
+            "GET",
+            "/api/v1/maps/eco-root/ecosystems",
+            Some(&other),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/maps/eco-root/ecosystems")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
+    );
+    let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+    let header = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    assert_eq!(bytes.len(), 4 + header + count * 24);
+    assert_eq!(
+        f32::from_le_bytes(
+            bytes[4 + header + count * 4..8 + header + count * 4]
+                .try_into()
+                .unwrap()
+        ),
+        306.
+    );
+    let saved = project::export(&f.state.store, &w).unwrap();
+    let imported = project::import(&f.state.store, &saved, "new-owner", &f.state.config).unwrap();
+    let restored = f
+        .state
+        .store
+        .list_map_nodes(&imported.id)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        crate::ecosystems::load(&f.state.store, &restored.id, count)
+            .unwrap()
+            .unwrap()
+            .group,
+        e.group
+    );
+    f.state.store.delete_world(&w).unwrap();
+    assert!(f
+        .state
+        .store
+        .get_field(&map.id, Channel::EcosystemEvidence)
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

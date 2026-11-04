@@ -1,0 +1,1204 @@
+{
+  "version": "iucn-get-v2.1-tf1",
+  "source": {
+    "url": "https://github.com/red-list-ecosystem/typology-map-data",
+    "commit": "c245ee11f58528a9cfdcb44dc8fd75253f08ac15",
+    "license": "MIT",
+    "classification": "IUCN GET v2.1",
+    "extract": "Only codes, hierarchy and English titles; no maps, photographs or descriptions"
+  },
+  "biomes": [
+    {
+      "code": "F1",
+      "name_en": "Rivers and streams biome",
+      "realm": "F",
+      "id": 1,
+      "name_zh": "河流与溪流",
+      "color": "#548ca1"
+    },
+    {
+      "code": "F2",
+      "name_en": "Lakes biome",
+      "realm": "F",
+      "id": 2,
+      "name_zh": "湖泊",
+      "color": "#4c91aa"
+    },
+    {
+      "code": "F3",
+      "name_en": "Artificial wetlands biome",
+      "realm": "F",
+      "id": 3,
+      "name_zh": "人工湿地",
+      "color": "#8e9eaa"
+    },
+    {
+      "code": "FM1",
+      "name_en": "Semi-confined transitional waters biome",
+      "realm": "FM",
+      "id": 4,
+      "name_zh": "半封闭过渡水域",
+      "color": "#629f9e"
+    },
+    {
+      "code": "M1",
+      "name_en": "Marine shelf biome",
+      "realm": "M",
+      "id": 5,
+      "name_zh": "海洋陆架",
+      "color": "#578e9a"
+    },
+    {
+      "code": "M2",
+      "name_en": "Pelagic ocean waters biome",
+      "realm": "M",
+      "id": 6,
+      "name_zh": "远洋水体",
+      "color": "#376e87"
+    },
+    {
+      "code": "M3",
+      "name_en": "Deep sea floors biome",
+      "realm": "M",
+      "id": 7,
+      "name_zh": "深海海底",
+      "color": "#3a526e"
+    },
+    {
+      "code": "M4",
+      "name_en": "Anthropogenic marine biome",
+      "realm": "M",
+      "id": 8,
+      "name_zh": "人工海洋生态",
+      "color": "#8c899e"
+    },
+    {
+      "code": "MFT1",
+      "name_en": "Brackish tidal biome",
+      "realm": "MFT",
+      "id": 9,
+      "name_zh": "咸淡水潮汐带",
+      "color": "#729678"
+    },
+    {
+      "code": "MT1",
+      "name_en": "Shorelines biome",
+      "realm": "MT",
+      "id": 10,
+      "name_zh": "海岸线",
+      "color": "#b5ae8d"
+    },
+    {
+      "code": "MT2",
+      "name_en": "Supralittoral coastal biome",
+      "realm": "MT",
+      "id": 11,
+      "name_zh": "潮上带沿海生态",
+      "color": "#a3ae79"
+    },
+    {
+      "code": "MT3",
+      "name_en": "Anthropogenic shorelines biome",
+      "realm": "MT",
+      "id": 12,
+      "name_zh": "人工海岸",
+      "color": "#ad9e98"
+    },
+    {
+      "code": "S1",
+      "name_en": "Subterranean lithic biome",
+      "realm": "S",
+      "id": 13,
+      "name_zh": "地下岩质生态",
+      "color": "#777783"
+    },
+    {
+      "code": "S2",
+      "name_en": "Anthropogenic subterranean voids biome",
+      "realm": "S",
+      "id": 14,
+      "name_zh": "人工地下空间",
+      "color": "#8a7f82"
+    },
+    {
+      "code": "SF1",
+      "name_en": "Subterranean freshwaters biome",
+      "realm": "SF",
+      "id": 15,
+      "name_zh": "地下淡水",
+      "color": "#64828b"
+    },
+    {
+      "code": "SF2",
+      "name_en": "Anthropogenic subterranean freshwaters biome",
+      "realm": "SF",
+      "id": 16,
+      "name_zh": "人工地下淡水",
+      "color": "#8a969f"
+    },
+    {
+      "code": "SM1",
+      "name_en": "Subterranean tidal biome",
+      "realm": "SM",
+      "id": 17,
+      "name_zh": "地下潮汐生态",
+      "color": "#6d7c90"
+    },
+    {
+      "code": "T1",
+      "name_en": "Tropical-subtropical forests biome",
+      "realm": "T",
+      "id": 18,
+      "name_zh": "热带—亚热带森林",
+      "color": "#327347"
+    },
+    {
+      "code": "T2",
+      "name_en": "Temperate-boreal forests and woodlands biome",
+      "realm": "T",
+      "id": 19,
+      "name_zh": "温带—寒带森林与疏林",
+      "color": "#4e784e"
+    },
+    {
+      "code": "T3",
+      "name_en": "Shrublands and shrubby woodlands biome",
+      "realm": "T",
+      "id": 20,
+      "name_zh": "灌丛与灌木疏林",
+      "color": "#89935a"
+    },
+    {
+      "code": "T4",
+      "name_en": "Savannas and grasslands biome",
+      "realm": "T",
+      "id": 21,
+      "name_zh": "稀树草原与草地",
+      "color": "#b2b368"
+    },
+    {
+      "code": "T5",
+      "name_en": "Deserts and semi-deserts biome",
+      "realm": "T",
+      "id": 22,
+      "name_zh": "荒漠与半荒漠",
+      "color": "#c9b383"
+    },
+    {
+      "code": "T6",
+      "name_en": "Polar/alpine (cryogenic) biome",
+      "realm": "T",
+      "id": 23,
+      "name_zh": "极地与高山寒冻生态",
+      "color": "#d9e4dc"
+    },
+    {
+      "code": "T7",
+      "name_en": "Intensive land-use biome",
+      "realm": "T",
+      "id": 24,
+      "name_zh": "集约土地利用",
+      "color": "#b19b70"
+    },
+    {
+      "code": "TF1",
+      "name_en": "Palustrine wetlands biome",
+      "realm": "TF",
+      "id": 25,
+      "name_zh": "沼泽湿地",
+      "color": "#5d9985"
+    }
+  ],
+  "groups": [
+    {
+      "code": "F1.1",
+      "name_en": "Permanent upland streams",
+      "biome": "F1",
+      "id": 17,
+      "biome_id": 1,
+      "name_zh": "常流水高地溪流",
+      "support": "additional_process"
+    },
+    {
+      "code": "F1.2",
+      "name_en": "Permanent lowland rivers",
+      "biome": "F1",
+      "id": 18,
+      "biome_id": 1,
+      "name_zh": "常流水低地河流",
+      "support": "additional_process"
+    },
+    {
+      "code": "F1.3",
+      "name_en": "Freeze-thaw rivers and streams",
+      "biome": "F1",
+      "id": 19,
+      "biome_id": 1,
+      "name_zh": "冻融河流与溪流",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "F1.4",
+      "name_en": "Seasonal upland streams",
+      "biome": "F1",
+      "id": 20,
+      "biome_id": 1,
+      "name_zh": "季节性高地溪流",
+      "support": "additional_process"
+    },
+    {
+      "code": "F1.5",
+      "name_en": "Seasonal lowland rivers",
+      "biome": "F1",
+      "id": 21,
+      "biome_id": 1,
+      "name_zh": "季节性低地河流",
+      "support": "additional_process"
+    },
+    {
+      "code": "F1.6",
+      "name_en": "Episodic arid rivers",
+      "biome": "F1",
+      "id": 22,
+      "biome_id": 1,
+      "name_zh": "干旱区偶发河流",
+      "support": "additional_process"
+    },
+    {
+      "code": "F1.7",
+      "name_en": "Large lowland rivers",
+      "biome": "F1",
+      "id": 23,
+      "biome_id": 1,
+      "name_zh": "大型低地河流",
+      "support": "additional_process"
+    },
+    {
+      "code": "F2.1",
+      "name_en": "Large permanent freshwater lakes",
+      "biome": "F2",
+      "id": 33,
+      "biome_id": 2,
+      "name_zh": "大型常年淡水湖",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "F2.2",
+      "name_en": "Small permanent freshwater lakes",
+      "biome": "F2",
+      "id": 34,
+      "biome_id": 2,
+      "name_zh": "小型常年淡水湖",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "F2.3",
+      "name_en": "Seasonal freshwater lakes",
+      "biome": "F2",
+      "id": 35,
+      "biome_id": 2,
+      "name_zh": "季节性淡水湖",
+      "support": "additional_process"
+    },
+    {
+      "code": "F2.4",
+      "name_en": "Freeze-thaw freshwater lakes",
+      "biome": "F2",
+      "id": 36,
+      "biome_id": 2,
+      "name_zh": "冻融淡水湖",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "F2.5",
+      "name_en": "Ephemeral freshwater lakes",
+      "biome": "F2",
+      "id": 37,
+      "biome_id": 2,
+      "name_zh": "短暂性淡水湖",
+      "support": "additional_process"
+    },
+    {
+      "code": "F2.6",
+      "name_en": "Permanent salt and soda lakes",
+      "biome": "F2",
+      "id": 38,
+      "biome_id": 2,
+      "name_zh": "常年盐湖与碱湖",
+      "support": "additional_process"
+    },
+    {
+      "code": "F2.7",
+      "name_en": "Ephemeral salt lakes",
+      "biome": "F2",
+      "id": 39,
+      "biome_id": 2,
+      "name_zh": "短暂性盐湖",
+      "support": "additional_process"
+    },
+    {
+      "code": "F2.8",
+      "name_en": "Artesian springs and oases",
+      "biome": "F2",
+      "id": 40,
+      "biome_id": 2,
+      "name_zh": "承压泉与绿洲",
+      "support": "additional_process"
+    },
+    {
+      "code": "F2.9",
+      "name_en": "Geothermal pools and wetlands",
+      "biome": "F2",
+      "id": 41,
+      "biome_id": 2,
+      "name_zh": "地热水池与湿地",
+      "support": "additional_process"
+    },
+    {
+      "code": "F2.10",
+      "name_en": "Subglacial lakes",
+      "biome": "F2",
+      "id": 42,
+      "biome_id": 2,
+      "name_zh": "冰下湖",
+      "support": "additional_process"
+    },
+    {
+      "code": "F3.1",
+      "name_en": "Large reservoirs",
+      "biome": "F3",
+      "id": 49,
+      "biome_id": 3,
+      "name_zh": "大型水库",
+      "support": "human_activity"
+    },
+    {
+      "code": "F3.2",
+      "name_en": "Constructed lacustrine wetlands",
+      "biome": "F3",
+      "id": 50,
+      "biome_id": 3,
+      "name_zh": "人工湖泊湿地",
+      "support": "human_activity"
+    },
+    {
+      "code": "F3.3",
+      "name_en": "Rice paddies",
+      "biome": "F3",
+      "id": 51,
+      "biome_id": 3,
+      "name_zh": "稻田",
+      "support": "human_activity"
+    },
+    {
+      "code": "F3.4",
+      "name_en": "Freshwater aquafarms",
+      "biome": "F3",
+      "id": 52,
+      "biome_id": 3,
+      "name_zh": "淡水养殖场",
+      "support": "human_activity"
+    },
+    {
+      "code": "F3.5",
+      "name_en": "Canals, ditches and drains",
+      "biome": "F3",
+      "id": 53,
+      "biome_id": 3,
+      "name_zh": "运河、沟渠与排水道",
+      "support": "human_activity"
+    },
+    {
+      "code": "FM1.1",
+      "name_en": "Deepwater coastal inlets",
+      "biome": "FM1",
+      "id": 65,
+      "biome_id": 4,
+      "name_zh": "深水沿海海湾",
+      "support": "additional_process"
+    },
+    {
+      "code": "FM1.2",
+      "name_en": "Permanently open riverine estuaries and bays",
+      "biome": "FM1",
+      "id": 66,
+      "biome_id": 4,
+      "name_zh": "常开口河口与海湾",
+      "support": "additional_process"
+    },
+    {
+      "code": "FM1.3",
+      "name_en": "Intermittently closed and open lakes and lagoons",
+      "biome": "FM1",
+      "id": 67,
+      "biome_id": 4,
+      "name_zh": "间歇开闭的沿海湖泊与潟湖",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.1",
+      "name_en": "Seagrass meadows",
+      "biome": "M1",
+      "id": 81,
+      "biome_id": 5,
+      "name_zh": "海草床",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.2",
+      "name_en": "Kelp forests",
+      "biome": "M1",
+      "id": 82,
+      "biome_id": 5,
+      "name_zh": "海藻林",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.3",
+      "name_en": "Photic coral reefs",
+      "biome": "M1",
+      "id": 83,
+      "biome_id": 5,
+      "name_zh": "透光带珊瑚礁",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.4",
+      "name_en": "Shellfish beds and reefs",
+      "biome": "M1",
+      "id": 84,
+      "biome_id": 5,
+      "name_zh": "贝类床与贝礁",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.5",
+      "name_en": "Photo-limited marine animal forests",
+      "biome": "M1",
+      "id": 85,
+      "biome_id": 5,
+      "name_zh": "弱光海洋动物林",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.6",
+      "name_en": "Subtidal rocky reefs",
+      "biome": "M1",
+      "id": 86,
+      "biome_id": 5,
+      "name_zh": "潮下带岩礁",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.7",
+      "name_en": "Subtidal sand beds",
+      "biome": "M1",
+      "id": 87,
+      "biome_id": 5,
+      "name_zh": "潮下带沙底",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.8",
+      "name_en": "Subtidal mud plains",
+      "biome": "M1",
+      "id": 88,
+      "biome_id": 5,
+      "name_zh": "潮下带泥质平原",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.9",
+      "name_en": "Upwelling zones",
+      "biome": "M1",
+      "id": 89,
+      "biome_id": 5,
+      "name_zh": "上升流区",
+      "support": "additional_process"
+    },
+    {
+      "code": "M1.10",
+      "name_en": "Rhodolith/Maërl beds",
+      "biome": "M1",
+      "id": 90,
+      "biome_id": 5,
+      "name_zh": "钙化红藻床",
+      "support": "additional_process"
+    },
+    {
+      "code": "M2.1",
+      "name_en": "Epipelagic ocean waters",
+      "biome": "M2",
+      "id": 97,
+      "biome_id": 6,
+      "name_zh": "表层远洋水体",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "M2.2",
+      "name_en": "Mesopelagic ocean water",
+      "biome": "M2",
+      "id": 98,
+      "biome_id": 6,
+      "name_zh": "中层远洋水体",
+      "support": "additional_process"
+    },
+    {
+      "code": "M2.3",
+      "name_en": "Bathypelagic ocean waters",
+      "biome": "M2",
+      "id": 99,
+      "biome_id": 6,
+      "name_zh": "深层远洋水体",
+      "support": "additional_process"
+    },
+    {
+      "code": "M2.4",
+      "name_en": "Abyssopelagic ocean waters",
+      "biome": "M2",
+      "id": 100,
+      "biome_id": 6,
+      "name_zh": "深渊远洋水体",
+      "support": "additional_process"
+    },
+    {
+      "code": "M2.5",
+      "name_en": "Sea ice",
+      "biome": "M2",
+      "id": 101,
+      "biome_id": 6,
+      "name_zh": "海冰生态",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "M3.1",
+      "name_en": "Continental and island slopes",
+      "biome": "M3",
+      "id": 113,
+      "biome_id": 7,
+      "name_zh": "大陆与岛屿斜坡",
+      "support": "additional_process"
+    },
+    {
+      "code": "M3.2",
+      "name_en": "Submarine canyons",
+      "biome": "M3",
+      "id": 114,
+      "biome_id": 7,
+      "name_zh": "海底峡谷",
+      "support": "additional_process"
+    },
+    {
+      "code": "M3.3",
+      "name_en": "Abyssal plains",
+      "biome": "M3",
+      "id": 115,
+      "biome_id": 7,
+      "name_zh": "深海平原",
+      "support": "additional_process"
+    },
+    {
+      "code": "M3.4",
+      "name_en": "Seamounts, ridges and plateaus",
+      "biome": "M3",
+      "id": 116,
+      "biome_id": 7,
+      "name_zh": "海山、洋脊与海台",
+      "support": "additional_process"
+    },
+    {
+      "code": "M3.5",
+      "name_en": "Deepwater biogenic beds",
+      "biome": "M3",
+      "id": 117,
+      "biome_id": 7,
+      "name_zh": "深水生物成因底栖床",
+      "support": "additional_process"
+    },
+    {
+      "code": "M3.6",
+      "name_en": "Hadal trenches and troughs",
+      "biome": "M3",
+      "id": 118,
+      "biome_id": 7,
+      "name_zh": "超深海沟与海槽",
+      "support": "additional_process"
+    },
+    {
+      "code": "M3.7",
+      "name_en": "Chemosynthetic-based-ecosystems (CBE)",
+      "biome": "M3",
+      "id": 119,
+      "biome_id": 7,
+      "name_zh": "化能合成生态系统",
+      "support": "additional_process"
+    },
+    {
+      "code": "M4.1",
+      "name_en": "Submerged artificial structures",
+      "biome": "M4",
+      "id": 129,
+      "biome_id": 8,
+      "name_zh": "水下人工结构",
+      "support": "human_activity"
+    },
+    {
+      "code": "M4.2",
+      "name_en": "Marine aquafarms",
+      "biome": "M4",
+      "id": 130,
+      "biome_id": 8,
+      "name_zh": "海水养殖场",
+      "support": "human_activity"
+    },
+    {
+      "code": "MFT1.1",
+      "name_en": "Coastal river deltas",
+      "biome": "MFT1",
+      "id": 145,
+      "biome_id": 9,
+      "name_zh": "沿海河流三角洲",
+      "support": "additional_process"
+    },
+    {
+      "code": "MFT1.2",
+      "name_en": "Intertidal forests and shrublands",
+      "biome": "MFT1",
+      "id": 146,
+      "biome_id": 9,
+      "name_zh": "潮间带森林与灌丛",
+      "support": "additional_process"
+    },
+    {
+      "code": "MFT1.3",
+      "name_en": "Coastal saltmarshes and reedbeds",
+      "biome": "MFT1",
+      "id": 147,
+      "biome_id": 9,
+      "name_zh": "沿海盐沼与芦苇湿地",
+      "support": "additional_process"
+    },
+    {
+      "code": "MT1.1",
+      "name_en": "Rocky Shorelines",
+      "biome": "MT1",
+      "id": 161,
+      "biome_id": 10,
+      "name_zh": "岩质海岸",
+      "support": "additional_process"
+    },
+    {
+      "code": "MT1.2",
+      "name_en": "Muddy Shorelines",
+      "biome": "MT1",
+      "id": 162,
+      "biome_id": 10,
+      "name_zh": "泥质海岸",
+      "support": "additional_process"
+    },
+    {
+      "code": "MT1.3",
+      "name_en": "Sandy Shorelines",
+      "biome": "MT1",
+      "id": 163,
+      "biome_id": 10,
+      "name_zh": "沙质海岸",
+      "support": "additional_process"
+    },
+    {
+      "code": "MT1.4",
+      "name_en": "Boulder and cobble shores",
+      "biome": "MT1",
+      "id": 164,
+      "biome_id": 10,
+      "name_zh": "巨砾与卵石海岸",
+      "support": "additional_process"
+    },
+    {
+      "code": "MT2.1",
+      "name_en": "Coastal shrublands and grasslands",
+      "biome": "MT2",
+      "id": 177,
+      "biome_id": 11,
+      "name_zh": "沿海灌丛与草地",
+      "support": "additional_process"
+    },
+    {
+      "code": "MT2.2",
+      "name_en": "Large seabird and pinniped colonies",
+      "biome": "MT2",
+      "id": 178,
+      "biome_id": 11,
+      "name_zh": "大型海鸟与鳍足类聚居地",
+      "support": "additional_process"
+    },
+    {
+      "code": "MT3.1",
+      "name_en": "Artificial shorelines",
+      "biome": "MT3",
+      "id": 193,
+      "biome_id": 12,
+      "name_zh": "人工海岸线",
+      "support": "human_activity"
+    },
+    {
+      "code": "S1.1",
+      "name_en": "Aerobic caves",
+      "biome": "S1",
+      "id": 209,
+      "biome_id": 13,
+      "name_zh": "有氧洞穴",
+      "support": "subsurface"
+    },
+    {
+      "code": "S1.2",
+      "name_en": "Endolithic systems",
+      "biome": "S1",
+      "id": 210,
+      "biome_id": 13,
+      "name_zh": "岩内生态",
+      "support": "subsurface"
+    },
+    {
+      "code": "S2.1",
+      "name_en": "Anthropogenic subterranean voids",
+      "biome": "S2",
+      "id": 225,
+      "biome_id": 14,
+      "name_zh": "人工地下洞室",
+      "support": "human_activity"
+    },
+    {
+      "code": "SF1.1",
+      "name_en": "Underground streams and pools",
+      "biome": "SF1",
+      "id": 241,
+      "biome_id": 15,
+      "name_zh": "地下溪流与水池",
+      "support": "subsurface"
+    },
+    {
+      "code": "SF1.2",
+      "name_en": "Groundwater ecosystems",
+      "biome": "SF1",
+      "id": 242,
+      "biome_id": 15,
+      "name_zh": "地下水生态",
+      "support": "subsurface"
+    },
+    {
+      "code": "SF2.1",
+      "name_en": "Water pipes and subterranean canals",
+      "biome": "SF2",
+      "id": 257,
+      "biome_id": 16,
+      "name_zh": "水管与地下运河",
+      "support": "human_activity"
+    },
+    {
+      "code": "SF2.2",
+      "name_en": "Flooded mines and other voids",
+      "biome": "SF2",
+      "id": 258,
+      "biome_id": 16,
+      "name_zh": "淹水矿井与其他洞室",
+      "support": "human_activity"
+    },
+    {
+      "code": "SM1.1",
+      "name_en": "Anchialine caves",
+      "biome": "SM1",
+      "id": 273,
+      "biome_id": 17,
+      "name_zh": "陆海连通咸水洞穴",
+      "support": "subsurface"
+    },
+    {
+      "code": "SM1.2",
+      "name_en": "Anchialine pools",
+      "biome": "SM1",
+      "id": 274,
+      "biome_id": 17,
+      "name_zh": "陆海连通咸水池",
+      "support": "subsurface"
+    },
+    {
+      "code": "SM1.3",
+      "name_en": "Sea caves",
+      "biome": "SM1",
+      "id": 275,
+      "biome_id": 17,
+      "name_zh": "海蚀洞穴",
+      "support": "subsurface"
+    },
+    {
+      "code": "T1.1",
+      "name_en": "Tropical/Subtropical lowland rainforests",
+      "biome": "T1",
+      "id": 289,
+      "biome_id": 18,
+      "name_zh": "热带—亚热带低地雨林",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T1.2",
+      "name_en": "Tropical/Subtropical dry forests and thickets",
+      "biome": "T1",
+      "id": 290,
+      "biome_id": 18,
+      "name_zh": "热带—亚热带干旱林与密灌丛",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T1.3",
+      "name_en": "Tropical/Subtropical montane rainforests",
+      "biome": "T1",
+      "id": 291,
+      "biome_id": 18,
+      "name_zh": "热带—亚热带山地雨林",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T1.4",
+      "name_en": "Tropical heath forests",
+      "biome": "T1",
+      "id": 292,
+      "biome_id": 18,
+      "name_zh": "热带石南林",
+      "support": "additional_process"
+    },
+    {
+      "code": "T2.1",
+      "name_en": "Boreal and temperate high montane forests and woodlands",
+      "biome": "T2",
+      "id": 305,
+      "biome_id": 19,
+      "name_zh": "寒带及温带高山森林与疏林",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T2.2",
+      "name_en": "Deciduous temperate forests",
+      "biome": "T2",
+      "id": 306,
+      "biome_id": 19,
+      "name_zh": "温带落叶林",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T2.3",
+      "name_en": "Oceanic cool temperate rainforests",
+      "biome": "T2",
+      "id": 307,
+      "biome_id": 19,
+      "name_zh": "海洋性冷温带雨林",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T2.4",
+      "name_en": "Warm temperate laurophyll forests",
+      "biome": "T2",
+      "id": 308,
+      "biome_id": 19,
+      "name_zh": "暖温带照叶林",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T2.5",
+      "name_en": "Temperate pyric humid forests",
+      "biome": "T2",
+      "id": 309,
+      "biome_id": 19,
+      "name_zh": "温带火适应湿润林",
+      "support": "additional_process"
+    },
+    {
+      "code": "T2.6",
+      "name_en": "Temperate pyric sclerophyll forests and woodlands",
+      "biome": "T2",
+      "id": 310,
+      "biome_id": 19,
+      "name_zh": "温带火适应硬叶林与疏林",
+      "support": "additional_process"
+    },
+    {
+      "code": "T3.1",
+      "name_en": "Seasonally dry tropical shrublands",
+      "biome": "T3",
+      "id": 321,
+      "biome_id": 20,
+      "name_zh": "季节干旱热带灌丛",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T3.2",
+      "name_en": "Seasonally dry temperate heath and shrublands",
+      "biome": "T3",
+      "id": 322,
+      "biome_id": 20,
+      "name_zh": "季节干旱温带石南与灌丛",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T3.3",
+      "name_en": "Cool temperate heathlands",
+      "biome": "T3",
+      "id": 323,
+      "biome_id": 20,
+      "name_zh": "冷温带石南荒原",
+      "support": "additional_process"
+    },
+    {
+      "code": "T3.4",
+      "name_en": "Young rocky pavements, lava flows and screes",
+      "biome": "T3",
+      "id": 324,
+      "biome_id": 20,
+      "name_zh": "新生岩面、熔岩流与碎石坡",
+      "support": "additional_process"
+    },
+    {
+      "code": "T4.1",
+      "name_en": "Trophic savannas",
+      "biome": "T4",
+      "id": 337,
+      "biome_id": 21,
+      "name_zh": "养分与食草作用主导的稀树草原",
+      "support": "additional_process"
+    },
+    {
+      "code": "T4.2",
+      "name_en": "Pyric tussock savannas",
+      "biome": "T4",
+      "id": 338,
+      "biome_id": 21,
+      "name_zh": "火作用主导的丛生草稀树草原",
+      "support": "additional_process"
+    },
+    {
+      "code": "T4.3",
+      "name_en": "Hummock savannas",
+      "biome": "T4",
+      "id": 339,
+      "biome_id": 21,
+      "name_zh": "丘状草稀树草原",
+      "support": "additional_process"
+    },
+    {
+      "code": "T4.4",
+      "name_en": "Temperate woodlands",
+      "biome": "T4",
+      "id": 340,
+      "biome_id": 21,
+      "name_zh": "温带疏林",
+      "support": "additional_process"
+    },
+    {
+      "code": "T4.5",
+      "name_en": "Temperate subhumid grasslands",
+      "biome": "T4",
+      "id": 341,
+      "biome_id": 21,
+      "name_zh": "温带半湿润草地",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T5.1",
+      "name_en": "Semi-desert steppe",
+      "biome": "T5",
+      "id": 353,
+      "biome_id": 22,
+      "name_zh": "半荒漠草原",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T5.2",
+      "name_en": "Succulent or Thorny deserts and semi-deserts",
+      "biome": "T5",
+      "id": 354,
+      "biome_id": 22,
+      "name_zh": "多肉或多刺植被荒漠与半荒漠",
+      "support": "additional_process"
+    },
+    {
+      "code": "T5.3",
+      "name_en": "Sclerophyll hot deserts and semi-deserts",
+      "biome": "T5",
+      "id": 355,
+      "biome_id": 22,
+      "name_zh": "硬叶热荒漠与半荒漠",
+      "support": "additional_process"
+    },
+    {
+      "code": "T5.4",
+      "name_en": "Cool deserts and semi-deserts",
+      "biome": "T5",
+      "id": 356,
+      "biome_id": 22,
+      "name_zh": "冷荒漠与半荒漠",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T5.5",
+      "name_en": "Hyper-arid deserts",
+      "biome": "T5",
+      "id": 357,
+      "biome_id": 22,
+      "name_zh": "极端干旱荒漠",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T6.1",
+      "name_en": "Ice sheets, glaciers and perennial snowfields",
+      "biome": "T6",
+      "id": 369,
+      "biome_id": 23,
+      "name_zh": "冰盖、冰川与常年雪原",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T6.2",
+      "name_en": "Polar/alpine cliffs, screes, outcrops and lava flows",
+      "biome": "T6",
+      "id": 370,
+      "biome_id": 23,
+      "name_zh": "极地—高山崖壁、碎石坡、露岩与熔岩流",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T6.3",
+      "name_en": "Polar tundra and deserts",
+      "biome": "T6",
+      "id": 371,
+      "biome_id": 23,
+      "name_zh": "极地苔原与荒漠",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T6.4",
+      "name_en": "Temperate alpine grasslands and shrublands",
+      "biome": "T6",
+      "id": 372,
+      "biome_id": 23,
+      "name_zh": "温带高山草地与灌丛",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T6.5",
+      "name_en": "Tropical alpine grasslands and herbfields",
+      "biome": "T6",
+      "id": 373,
+      "biome_id": 23,
+      "name_zh": "热带高山草地与草本群落",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "T7.1",
+      "name_en": "Annual croplands",
+      "biome": "T7",
+      "id": 385,
+      "biome_id": 24,
+      "name_zh": "一年生作物农田",
+      "support": "human_activity"
+    },
+    {
+      "code": "T7.2",
+      "name_en": "Sown livestock pastures",
+      "biome": "T7",
+      "id": 386,
+      "biome_id": 24,
+      "name_zh": "人工播种牧草地",
+      "support": "human_activity"
+    },
+    {
+      "code": "T7.3",
+      "name_en": "Plantations",
+      "biome": "T7",
+      "id": 387,
+      "biome_id": 24,
+      "name_zh": "人工种植园",
+      "support": "human_activity"
+    },
+    {
+      "code": "T7.4",
+      "name_en": "Urban and industrial ecosystems",
+      "biome": "T7",
+      "id": 388,
+      "biome_id": 24,
+      "name_zh": "城市与工业生态",
+      "support": "human_activity"
+    },
+    {
+      "code": "T7.5",
+      "name_en": "Derived semi-natural pastures and old fields",
+      "biome": "T7",
+      "id": 389,
+      "biome_id": 24,
+      "name_zh": "次生半自然牧场与弃耕地",
+      "support": "human_activity"
+    },
+    {
+      "code": "TF1.1",
+      "name_en": "Tropical flooded forests and peat forests",
+      "biome": "TF1",
+      "id": 401,
+      "biome_id": 25,
+      "name_zh": "热带淹水林与泥炭林",
+      "support": "additional_process"
+    },
+    {
+      "code": "TF1.2",
+      "name_en": "Subtropical/temperate forested wetlands",
+      "biome": "TF1",
+      "id": 402,
+      "biome_id": 25,
+      "name_zh": "亚热带—温带森林湿地",
+      "support": "additional_process"
+    },
+    {
+      "code": "TF1.3",
+      "name_en": "Permanent marshes",
+      "biome": "TF1",
+      "id": 403,
+      "biome_id": 25,
+      "name_zh": "常年沼泽",
+      "support": "environment_estimate"
+    },
+    {
+      "code": "TF1.4",
+      "name_en": "Seasonal floodplain marshes",
+      "biome": "TF1",
+      "id": 404,
+      "biome_id": 25,
+      "name_zh": "季节性洪泛沼泽",
+      "support": "additional_process"
+    },
+    {
+      "code": "TF1.5",
+      "name_en": "Episodic arid floodplains",
+      "biome": "TF1",
+      "id": 405,
+      "biome_id": 25,
+      "name_zh": "干旱区偶发洪泛地",
+      "support": "additional_process"
+    },
+    {
+      "code": "TF1.6",
+      "name_en": "Boreal, temperate and montane peat bogs",
+      "biome": "TF1",
+      "id": 406,
+      "biome_id": 25,
+      "name_zh": "寒带、温带与山地高位泥炭沼泽",
+      "support": "additional_process"
+    },
+    {
+      "code": "TF1.7",
+      "name_en": "Boreal and temperate fens",
+      "biome": "TF1",
+      "id": 407,
+      "biome_id": 25,
+      "name_zh": "寒带与温带低位泥炭沼泽",
+      "support": "additional_process"
+    }
+  ]
+}

@@ -111,7 +111,89 @@ async fn main() -> anyhow::Result<()> {
     let session: Value =
         serde_json::from_slice(&call(&app, "/api/v1/session", None, Some(json!({}))).await?)?;
     let token = session["token"].as_str().unwrap();
-    let world: Value = serde_json::from_slice(
+    let start = Instant::now();
+    let map = if let Some(source) = args.get(4) {
+        // Targeted ecology replay after a rule change: retain all authoritative
+        // terrain/climate/water channels from the real seed-generated project.
+        let input: Value = serde_json::from_slice(&std::fs::read(source)?)?;
+        let imported: Value = serde_json::from_slice(
+            &call(&app, "/api/v1/projects/import", Some(token), Some(input)).await?,
+        )?;
+        let maps: Value = serde_json::from_slice(
+            &call(
+                &app,
+                &format!("/api/v1/worlds/{}/maps", imported["id"].as_str().unwrap()),
+                Some(token),
+                None,
+            )
+            .await?,
+        )?;
+        let id = maps
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["parent"].is_null())
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let node = state.store.get_map_node(&id)?.unwrap();
+        let grid = node.grid.as_ref().unwrap().build();
+        let n = node.cells as usize;
+        let field = |channel| {
+            state
+                .store
+                .get_field(&id, channel)?
+                .ok_or_else(|| anyhow::anyhow!("missing replay field"))
+        };
+        use tf_server::store::Channel;
+        let mut f = tf_sim::WorldFields::with_capacity(n);
+        f.elevation = field(Channel::Elevation)?;
+        f.temperature = field(Channel::Temperature)?;
+        f.precipitation = field(Channel::Precipitation)?;
+        f.lake_depth = field(Channel::LakeDepth)?;
+        f.flow_accumulation = field(Channel::FlowAccumulation)?;
+        f.distance_to_sea = field(Channel::DistanceToSea)?;
+        f.climate = tf_server::climatology::for_map(&state.store, &node)?;
+        if let Some(atlas) = tf_server::cryosphere::for_map(&state.store, &node)? {
+            f.cryosphere = Some(tf_sim::cryosphere::Cryosphere {
+                atlas,
+                land_ice_m: field(Channel::LandIce)?,
+                snow_cover: field(Channel::SnowCover)?,
+                sea_ice_cover: field(Channel::SeaIce)?,
+                shelf_ice_m: field(Channel::IceShelf)?,
+                permafrost: field(Channel::Permafrost)?,
+                active_layer_m: field(Channel::ActiveLayer)?,
+                liquid_water_mm: field(Channel::LiquidWater)?,
+                lake_ice_cover: field(Channel::LakeIce)?,
+                pet_mm_year: vec![0.; n],
+            });
+        }
+        let legacy = field(Channel::Biome)?
+            .iter()
+            .map(|&v| v as u8)
+            .collect::<Vec<_>>();
+        let soil = field(Channel::Soil)?
+            .iter()
+            .map(|&v| v as u8)
+            .collect::<Vec<_>>();
+        let e = tf_sim::ecosystems::classify(&grid, &f, &legacy, &soil);
+        let channels = e.channels();
+        let mut metadata = state.store.get_metadata(&id)?.unwrap();
+        tf_server::ecosystems::attach(&mut metadata, &e);
+        state.store.publish_fields(
+            &id,
+            &tf_server::ecosystems::CHANNELS
+                .into_iter()
+                .zip(channels.iter().map(Vec::as_slice))
+                .collect::<Vec<_>>(),
+            &metadata,
+        )?;
+        assert_eq!(field(Channel::Elevation)?, f.elevation);
+        println!("Replayed ecology only from {source}");
+        id
+    } else {
+        let world: Value = serde_json::from_slice(
         &call(
             &app,
             "/api/v1/worlds",
@@ -122,56 +204,58 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?,
     )?;
-    let job: Value = serde_json::from_slice(
-        &call(
-            &app,
-            &format!("/api/v1/worlds/{}/generate", world["id"].as_str().unwrap()),
-            Some(token),
-            Some(json!({})),
-        )
-        .await?,
-    )?;
-    let start = Instant::now();
-    let mut poll = 0;
-    loop {
-        let status: Value = serde_json::from_slice(
+        let job: Value = serde_json::from_slice(
             &call(
                 &app,
-                &format!("/api/v1/jobs/{}", job["job_id"].as_str().unwrap()),
+                &format!("/api/v1/worlds/{}/generate", world["id"].as_str().unwrap()),
                 Some(token),
-                None,
+                Some(json!({})),
             )
             .await?,
         )?;
-        anyhow::ensure!(
-            status["state"] != "failed" && status["state"] != "cancelled",
-            "generation: {status}"
-        );
-        if poll % 15 == 0 {
-            println!(
-                "{}s {} {}",
-                start.elapsed().as_secs(),
-                status["stage"],
-                status["progress"]
+        let mut poll = 0;
+        loop {
+            let status: Value = serde_json::from_slice(
+                &call(
+                    &app,
+                    &format!("/api/v1/jobs/{}", job["job_id"].as_str().unwrap()),
+                    Some(token),
+                    None,
+                )
+                .await?,
+            )?;
+            anyhow::ensure!(
+                status["state"] != "failed" && status["state"] != "cancelled",
+                "generation: {status}"
             );
+            if poll % 15 == 0 {
+                println!(
+                    "{}s {} {}",
+                    start.elapsed().as_secs(),
+                    status["stage"],
+                    status["progress"]
+                );
+            }
+            if status["state"] == "done" {
+                break;
+            }
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(1800),
+                "generation timeout"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            poll += 1;
         }
-        if status["state"] == "done" {
-            break;
-        }
-        anyhow::ensure!(
-            start.elapsed() < Duration::from_secs(1800),
-            "generation timeout"
-        );
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        poll += 1;
-    }
-    let map = job["map_id"].as_str().unwrap();
+        job["map_id"].as_str().unwrap().to_owned()
+    };
     for (suffix, file) in [
         ("export.json", "world.terraforge.json"),
         ("metadata", "metadata.json"),
         ("hydrology", "hydrology.json"),
         ("surface", "surface.bin"),
         ("geography", "geography.bin"),
+        ("ecosystems", "ecosystems.bin"),
+        ("export.png?size=1024&ecosystem=group", "ecosystems.png"),
         ("cryosphere?month=0", "ice-0.bin"),
         ("cryosphere?month=1", "ice-1.bin"),
         ("cryosphere?month=7", "ice-7.bin"),
@@ -209,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
         ("cryosphere?month=7", "ice-7.bin"),
         ("hydrology", "hydrology.json"),
         ("geography", "geography.bin"),
+        ("ecosystems", "ecosystems.bin"),
     ] {
         let actual = call(
             &app,
@@ -230,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(
         out.join("report.json"),
         serde_json::to_vec_pretty(
-            &json!({"shape":shape,"seed":seed,"seconds":start.elapsed().as_secs_f64(),"result":"passed","transport":"in-process production router; no TCP listener"}),
+            &json!({"shape":shape,"seed":seed,"seconds":start.elapsed().as_secs_f64(),"replayed_ecology_from":args.get(4),"result":"passed","transport":"in-process production router; no TCP listener"}),
         )?,
     )?;
     println!("Full project written: {}", out.display());

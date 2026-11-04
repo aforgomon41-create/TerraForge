@@ -17,6 +17,7 @@ pub mod climate;
 pub mod cryosphere;
 pub mod downscale;
 pub mod ecology;
+pub mod ecosystems;
 pub mod erosion;
 pub mod evolution;
 pub mod fields;

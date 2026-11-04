@@ -1,6 +1,7 @@
 /** Same-origin API. Every tab gets a server-issued, temporary capability. */
 import { decodeGeography } from '@/geography/catalog'
 import { decodeIce, type IceResponse } from '@/cryosphere/data'
+import { decodeEcosystems, type EcosystemResponse } from '@/ecosystems/data'
 export const API_BASE = import.meta.env.DEV
   ? ''
   : new URL(import.meta.env.BASE_URL, window.location.href).pathname.replace(/\/$/, '')
@@ -196,6 +197,11 @@ export const api = {
     const response = await geometryRequest(`/maps/${id}/cryosphere?month=${month}`, signal)
     if (response.headers.get('content-type')?.includes('application/json')) return response.json()
     return decodeIce(await response.arrayBuffer(), count)
+  },
+  async ecosystems(id: string, count: number, signal?: AbortSignal): Promise<EcosystemResponse> {
+    const response = await geometryRequest(`/maps/${id}/ecosystems`, signal)
+    if (response.headers.get('content-type')?.includes('application/json')) return response.json()
+    return decodeEcosystems(await response.arrayBuffer(), count)
   },
   async vectors(
     id: string,

@@ -21,6 +21,18 @@ pub fn render_map_png_with_ice(
     width: u32,
     ice: Option<&[Vec<f32>]>,
 ) -> anyhow::Result<Vec<u8>> {
+    render_map_png_with_ecosystems(elevation, biome, descriptor, width, ice, None, 1)
+}
+
+pub fn render_map_png_with_ecosystems(
+    elevation: &[f32],
+    biome: &[f32],
+    descriptor: &tf_grid::GridDescriptor,
+    width: u32,
+    ice: Option<&[Vec<f32>]>,
+    ecosystems: Option<&tf_sim::ecosystems::Ecosystems>,
+    mode: u8,
+) -> anyhow::Result<Vec<u8>> {
     use std::io::Write;
     use tf_grid::{GridOps, MapGrid};
     anyhow::ensure!(
@@ -28,6 +40,10 @@ pub fn render_map_png_with_ice(
         "字段与网格尺寸不一致"
     );
     anyhow::ensure!((16..=8192).contains(&width), "导出尺寸无效");
+    anyhow::ensure!(
+        ecosystems.is_none_or(|e| e.validate(elevation.len())),
+        "生态字段无效"
+    );
     if let Some(ice) = ice {
         anyhow::ensure!(
             ice.len() == 8 && ice.iter().all(|c| c.len() == elevation.len()),
@@ -44,7 +60,10 @@ pub fn render_map_png_with_ice(
     };
     let colors: Vec<_> = (0..elevation.len())
         .map(|i| {
-            let mut color = color_for(elevation[i], biome[i] as u8);
+            let mut color = ecosystems.map_or_else(
+                || color_for(elevation[i], biome[i] as u8),
+                |e| tf_sim::ecosystems::color(e.biome[i], e.group[i], e.variant[i], mode),
+            );
             if elevation[i] > 0. {
                 let (east, north) = grid.center_dir(i).tangent_frame();
                 let mut slope = 0.;
