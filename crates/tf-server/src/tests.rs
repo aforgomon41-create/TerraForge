@@ -1361,3 +1361,38 @@ async fn busy_import_does_not_buffer_body_and_waiting_generation_can_be_cancelle
         StatusCode::BAD_REQUEST
     );
 }
+
+#[tokio::test]
+async fn slow_import_body_keeps_session_admission_available_and_releases_budget_on_abort() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let polled = Arc::new(AtomicBool::new(false));
+    let body_polled = polled.clone();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/projects/import")
+        .header("host", "test.local")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from_stream(futures::stream::once(async move {
+            body_polled.store(true, Ordering::SeqCst);
+            futures::future::pending::<Result<axum::body::Bytes, std::io::Error>>().await
+        })))
+        .unwrap();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move { app.oneshot(req).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !polled.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.state.exports.available_permits(), 0);
+    tokio::time::timeout(std::time::Duration::from_secs(1), f.session())
+        .await
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(f.state.exports.available_permits(), 1);
+}
