@@ -153,6 +153,10 @@ async fn main() -> anyhow::Result<()> {
         f.precipitation = field(Channel::Precipitation)?;
         f.lake_depth = field(Channel::LakeDepth)?;
         f.flow_accumulation = field(Channel::FlowAccumulation)?;
+        f.liquid_discharge = state
+            .store
+            .get_field(&id, Channel::LiquidDischarge)?
+            .unwrap_or_default();
         f.distance_to_sea = field(Channel::DistanceToSea)?;
         f.climate = tf_server::climatology::for_map(&state.store, &node)?;
         if let Some(atlas) = tf_server::cryosphere::for_map(&state.store, &node)? {

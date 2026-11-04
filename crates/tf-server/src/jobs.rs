@@ -402,6 +402,10 @@ pub fn persist_fields<G: tf_grid::GridOps>(
     if let Some(q) = &discharge {
         channels.push((Channel::LiquidDischarge, q));
     }
+    anyhow::ensure!(
+        world.ecology.ecosystems.validate(f.elevation.len()),
+        "生态分类结果无效"
+    );
     let ecosystems = world.ecology.ecosystems.channels();
     crate::ecosystems::attach(&mut metadata, &world.ecology.ecosystems);
     channels.extend(

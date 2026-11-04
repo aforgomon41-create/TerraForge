@@ -313,7 +313,7 @@ pub fn classify<G: GridOps>(grid: &G, f: &WorldFields, legacy: &[u8], soil: &[u8
                 } else {
                     0
                 }
-                | if near_sea { 32 } else { 0 };
+                | if h > 0. && near_sea { 32 } else { 0 };
             let (mut biome, mut efg) = if h <= 0. {
                 // Stage 3 needs seabed morphology, substrate and ocean processes.
                 // Depth alone cannot turn an entire deep basin into a hadal trench.
@@ -381,7 +381,9 @@ pub fn classify<G: GridOps>(grid: &G, f: &WorldFields, legacy: &[u8], soil: &[u8
                             0
                         };
                     }
-                } else if f.flow_accumulation[i] as f64 >= (grid.area_m2(i) * 40.).max(1e6) {
+                } else if f.flow_accumulation[i] as f64 >= (grid.area_m2(i) * 40.).max(100.)
+                    && f.liquid_discharge.get(i).is_some_and(|&q| q > 0.01)
+                {
                     habitat = 1;
                     habitat_group = if c.as_ref().is_some_and(|c| c.cold < 0. && c.warm > 0.) {
                         group(1, 3)
@@ -390,7 +392,7 @@ pub fn classify<G: GridOps>(grid: &G, f: &WorldFields, legacy: &[u8], soil: &[u8
                     };
                     evidence |= 4;
                 }
-                if !thick_ice && f.lake_depth[i] < 0.1 && near_sea && h < 5. {
+                if !thick_ice && f.lake_depth[i] < 0.1 && near_sea && h < 5. && habitat == 0 {
                     habitat = 10;
                     habitat_group = 0;
                     evidence |= 32;
@@ -490,6 +492,11 @@ mod tests {
         assert_eq!(c.biomes.len(), 25);
         assert_eq!(c.groups.len(), 110);
         assert_eq!(c.version, VERSION);
+        for b in &c.biomes {
+            assert_eq!(b.color.len(), 7);
+            assert!(b.color.starts_with('#'));
+            assert!(b.color[1..].bytes().all(|c| c.is_ascii_hexdigit()));
+        }
         let mut ids = std::collections::HashSet::new();
         for g in &c.groups {
             assert!(ids.insert(g.id));
@@ -527,15 +534,46 @@ mod tests {
         f.temperature.fill(20.);
         f.precipitation.fill(900.);
         f.flow_accumulation.fill(1e13);
+        f.liquid_discharge = vec![1.; n];
         let e = classify(&grid, &f, &vec![4; n], &vec![1; n]);
         assert!(e.validate(n));
         assert!(e.biome.iter().all(|&b| b == 19));
         assert!(e.group.iter().all(|&g| g == 0));
         assert!(e.habitat_biome.iter().all(|&b| b == 1));
+        f.liquid_discharge.fill(0.);
+        assert!(classify(&grid, &f, &vec![4; n], &vec![1; n])
+            .habitat_biome
+            .iter()
+            .all(|&b| b == 0));
+        f.liquid_discharge.fill(1.);
+        f.lake_depth.fill(0.);
+        f.elevation.fill(100.);
+        let mouth = n / 2;
+        let sea = grid.neighbors(mouth)[0] as usize;
+        f.elevation[mouth] = 1.;
+        f.elevation[sea] = -10.;
+        let e = classify(&grid, &f, &vec![4; n], &vec![1; n]);
+        assert_eq!(e.habitat_biome[mouth], 1);
+        assert_ne!(e.evidence[mouth] & 32, 0);
+        assert_eq!(e.evidence[sea] & 32, 0);
+        f.elevation.fill(100.);
         f.lake_depth.fill(20.);
         let e = classify(&grid, &f, &vec![13; n], &vec![0; n]);
         assert!(e.biome.iter().all(|&b| b == 2));
         assert!(e.group.iter().all(|&g| g == 0));
+        assert!(e.evidence.iter().all(|&v| v & 32 == 0));
+        let local = tf_grid::GridDescriptor::plane(0., 0., 1000., 20, 20, 6371000.).build();
+        let n = local.cell_count();
+        let mut f = WorldFields::with_capacity(n);
+        f.elevation.fill(100.);
+        f.temperature.fill(20.);
+        f.precipitation.fill(900.);
+        f.flow_accumulation.fill(500000.);
+        f.liquid_discharge = vec![0.011; n];
+        assert!(classify(&local, &f, &vec![4; n], &vec![1; n])
+            .habitat_biome
+            .iter()
+            .all(|&b| b == 1));
     }
 
     #[test]
@@ -554,5 +592,24 @@ mod tests {
         let e = classify(&grid, &f, &vec![0; n], &vec![0; n]);
         assert!(e.biome.iter().all(|&b| b == 7));
         assert!(e.group.iter().all(|&g| g == 0));
+        assert!(e.evidence.iter().all(|&v| v & 32 == 0));
+    }
+
+    #[test]
+    fn only_an_actual_lake_outlet_supports_the_flushing_freshwater_proxy() {
+        let grid = tf_grid::GridDescriptor::plane(0., 0., 20000., 20, 20, 6371000.).build();
+        let n = grid.cell_count();
+        let mut f = WorldFields::with_capacity(n);
+        f.elevation.fill(100.);
+        let center = n / 2;
+        f.elevation[center] = 20.;
+        f.lake_depth[center] = 5.;
+        let (areas, fresh) = lakes(&grid, &f);
+        assert_eq!(areas[center], grid.area_m2(center));
+        assert!(!fresh[center]);
+        let outlet = grid.neighbors(center)[0] as usize;
+        f.elevation[outlet] = 25.;
+        let (_, fresh) = lakes(&grid, &f);
+        assert!(fresh[center]);
     }
 }

@@ -1209,10 +1209,10 @@ async fn export_png(
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(2048);
     let ecosystem_mode = match params.get("ecosystem").map(String::as_str) {
-        None | Some("group") => Some(1),
+        Some("group") => Some(1),
         Some("biome") => Some(0),
         Some("variant") => Some(2),
-        Some("legacy") => None,
+        None | Some("legacy") => None,
         _ => return Err(ApiError::bad_request("生态导出模式无效")),
     };
     if !(256..=max).contains(&size) {

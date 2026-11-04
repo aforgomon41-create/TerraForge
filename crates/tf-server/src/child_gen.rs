@@ -151,6 +151,7 @@ pub fn run_child_generation(
     }
     let water = tf_sim::erosion::refresh_hydrology(&patch, &mut fields);
     tf_sim::cryosphere::update_water_surfaces(&patch, &mut fields);
+    fields.liquid_discharge = tf_sim::cryosphere::annual_discharge(&patch, &fields, &water);
     tf_sim::erosion::compute_distance_to_sea(&patch, &mut fields);
     let ecology =
         tf_sim::ecology::run_ecology_with_diversity(&patch, &fields, params.biome_diversity);
@@ -244,6 +245,10 @@ pub fn run_child_generation(
     if let Some(q) = &discharge {
         channels.push((Channel::LiquidDischarge, q));
     }
+    anyhow::ensure!(
+        ecology.ecosystems.validate(fields.elevation.len()),
+        "生态分类结果无效"
+    );
     let ecosystems = ecology.ecosystems.channels();
     crate::ecosystems::attach(&mut metadata, &ecology.ecosystems);
     channels.extend(

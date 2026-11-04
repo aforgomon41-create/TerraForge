@@ -47,6 +47,8 @@ pub struct WorldFields {
     pub distance_to_sea: Vec<f32>,
     /// 河流流量（上游汇流面积，平方米）。
     pub flow_accumulation: Vec<f32>,
+    /// Final liquid-supported discharge (m³/s), empty until final hydrology.
+    pub liquid_discharge: Vec<f32>,
     /// 年度水量平衡支持的实际湖深，米。0 表示无水，不是地形填洼容量。
     pub lake_depth: Vec<f32>,
 }
@@ -74,6 +76,7 @@ impl WorldFields {
             precipitation: vec![0.0; n],
             distance_to_sea: vec![0.0; n],
             flow_accumulation: vec![0.0; n],
+            liquid_discharge: Vec::new(),
             lake_depth: vec![0.0; n],
         }
     }

@@ -8,7 +8,7 @@ import struct
 import numpy as np
 import zstandard
 
-def audit(project_path, packet_path):
+def audit(project_path, packet_path, source_path=None):
     raw=Path(project_path).read_bytes();project=json.loads(raw)
     root=next(m for m in project['maps'] if m['node']['parent'] is None)
     catalog=json.loads((Path(__file__).resolve().parent.parent/'data/ecosystems/catalogue.json').read_text(encoding='utf8'))
@@ -41,8 +41,15 @@ def audit(project_path, packet_path):
         'habitat_types':{groups[int(g)]['code']:int((fields[3]==g).sum()) for g in np.unique(fields[3]) if g},
         'biomes':{biomes[int(b)]['code']:int((fields[0]==b).sum()) for b in np.unique(fields[0]) if b},
         'distinct_local_variants':len(np.unique(fields[4])),'u16_ids_preserved':bool((fields[1]>255).any())}
+    if source_path:
+        source=json.loads(Path(source_path).read_bytes());before=next(m for m in source['maps'] if m['node']['parent'] is None)
+        physical=[name for name in before['channels'] if name not in names]
+        assert all(before['channels'][name]==root['channels'][name] for name in physical),'ecology replay changed physical channels'
+        assert before['metadata']['climate_atlas']==root['metadata']['climate_atlas']
+        assert before['metadata']['cryosphere_atlas']==root['metadata']['cryosphere_atlas']
+        result['unchanged_physical_channels']=physical
     return result
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--project',required=True);p.add_argument('--packet');p.add_argument('--out',required=True);args=p.parse_args()
-    report=audit(args.project,args.packet);Path(args.out).write_text(json.dumps(report,indent=2),encoding='utf8');print(json.dumps(report))
+    p=argparse.ArgumentParser();p.add_argument('--project',required=True);p.add_argument('--packet');p.add_argument('--source-project');p.add_argument('--out',required=True);args=p.parse_args()
+    report=audit(args.project,args.packet,args.source_project);Path(args.out).write_text(json.dumps(report,indent=2),encoding='utf8');print(json.dumps(report))

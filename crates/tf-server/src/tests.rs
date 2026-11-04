@@ -913,6 +913,29 @@ async fn ecosystem_hierarchy_is_private_preserves_u16_ids_and_deletes_channel_32
         306.
     );
     let saved = project::export(&f.state.store, &w).unwrap();
+    let mut pngs = Vec::new();
+    for suffix in [
+        "export.png?size=256",
+        "export.png?size=256&ecosystem=legacy",
+        "export.png?size=256&ecosystem=group",
+    ] {
+        let response = f
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/maps/eco-root/{suffix}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        pngs.push(to_bytes(response.into_body(), 1_000_000).await.unwrap());
+    }
+    assert_eq!(pngs[0], pngs[1]);
+    assert_ne!(pngs[0], pngs[2]);
     let imported = project::import(&f.state.store, &saved, "new-owner", &f.state.config).unwrap();
     let restored = f
         .state

@@ -73,8 +73,8 @@ pub fn from_channels(d: &[Vec<f32>], n: usize) -> anyhow::Result<Ecosystems> {
     Ok(e)
 }
 
-pub async fn catalogue() -> Json<Value> {
-    Json(serde_json::to_value(tf_sim::ecosystems::catalogue()).expect("static catalogue"))
+pub async fn catalogue() -> Json<&'static tf_sim::ecosystems::Catalogue> {
+    Json(tf_sim::ecosystems::catalogue())
 }
 pub async fn get(
     State(st): State<AppState>,
