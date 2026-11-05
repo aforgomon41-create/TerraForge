@@ -111,14 +111,17 @@ export function buildSphereGrid(freq: number): SphereGrid {
           pos = slerp(a, c, j / freq)
         } else {
           key = `i${f}_${i}_${j}`
-          // 面内点：线性插值后归一化
+          // Match the final v3 mesh: symmetric sine weights meet edge slerp
+          // continuously. A different interior projection creates thin seams.
           const wa = k / freq
           const wb = i / freq
           const wc = j / freq
+          const angle = Math.acos(a[0] * b[0] + a[1] * b[1] + a[2] * b[2])
+          const weights = [wa, wb, wc].map((w) => Math.sin(angle * w))
           pos = norm([
-            a[0] * wa + b[0] * wb + c[0] * wc,
-            a[1] * wa + b[1] * wb + c[1] * wc,
-            a[2] * wa + b[2] * wb + c[2] * wc,
+            a[0] * weights[0] + b[0] * weights[1] + c[0] * weights[2],
+            a[1] * weights[0] + b[1] * weights[1] + c[1] * weights[2],
+            a[2] * weights[0] + b[2] * weights[1] + c[2] * weights[2],
           ])
         }
 

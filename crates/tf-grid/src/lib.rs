@@ -18,7 +18,7 @@ pub use plane_hex::{AxialCoord, HexGrid2D};
 pub use sphere_hex::{GridStats, SphereHexGrid};
 
 pub mod descriptor;
-pub use descriptor::{GridDescriptor, MapGrid, GRID_VERSION};
+pub use descriptor::{GridDescriptor, MapGrid, GRID_VERSION, SPHERE_GRID_VERSION};
 
 pub mod flat_grid;
 pub use flat_grid::FlatGrid;

@@ -466,11 +466,14 @@ mod regression {
             }
             areas.sort_by(|a, b| b.total_cmp(a));
             let total = areas.iter().sum::<f64>();
-            let top = areas.iter().take(3).sum::<f64>() / total;
+            // After 4.6 Gyr of rifting/merging the final number need not be the
+            // initial requested count. Test fragmentation directly: most land
+            // belongs to substantial connected masses, rather than tiny islets.
+            let substantial = areas.iter().filter(|&&a| a >= total * 0.01).sum::<f64>() / total;
             let largest = areas[0] / total;
             assert!(
-                top > 0.70 && largest > 0.20 && largest < 0.85,
-                "seed {seed}: largest {largest}, top3 {top}"
+                substantial > 0.80 && largest > 0.20 && largest < 0.85,
+                "seed {seed}: largest {largest}, substantial {substantial}"
             );
             let second = generate(&grid, &params, &mut |_, _| {});
             assert_eq!(f.elevation, second.fields.elevation);

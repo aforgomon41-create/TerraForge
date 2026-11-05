@@ -24,6 +24,28 @@ test('shared preview mesh is closed, without duplicated faces or unused vertices
   assert.ok([...edges.values()].every((n) => n === 2))
   assert.equal(g.count - edges.size + g.indices.length / 3, 2)
 })
+
+test('fine preview mesh joins icosahedral faces without elongated triangles', () => {
+  const g = buildSphereGrid(128)
+  for (let i = 0; i < g.indices.length; i += 3) {
+    const [a, b, c] = Array.from(g.indices.subarray(i, i + 3), (id) =>
+      Array.from(g.centers.subarray(id * 3, id * 3 + 3)),
+    )
+    const ab = b.map((v, k) => v - a[k]),
+      ac = c.map((v, k) => v - a[k])
+    const area2 = Math.hypot(
+      ab[1] * ac[2] - ab[2] * ac[1],
+      ab[2] * ac[0] - ab[0] * ac[2],
+      ab[0] * ac[1] - ab[1] * ac[0],
+    )
+    const longest2 = Math.max(
+      Math.hypot(...ab) ** 2,
+      Math.hypot(...ac) ** 2,
+      Math.hypot(...b.map((v, k) => v - c[k])) ** 2,
+    )
+    assert.ok(longest2 / area2 < 1.6, `stretched face ${i / 3}`)
+  }
+})
 test('atlas seam triangles retain field IDs and are drawn on both sides', () => {
   const centers = Float32Array.from(
     [direction(5, 179), direction(8, -179), direction(0, -178)].flat(),

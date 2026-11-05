@@ -32,6 +32,9 @@ def main():
     parser.add_argument('--width', type=int, default=2048)
     parser.add_argument('--zoom', type=float, default=1.)
     parser.add_argument('--center', nargs=2, type=float, default=[0.,0.])
+    parser.add_argument('--globe-lat', type=float, default=20.0535228296)
+    parser.add_argument('--globe-lon', type=float, default=90.)
+    parser.add_argument('--globe-distance', type=float, default=3.2)
     parser.add_argument('--material-fallback', action='store_true')
     parser.add_argument('--ice-month',type=int,choices=range(13),default=0)
     parser.add_argument('--eco-mode',type=int,choices=range(3),default=1)
@@ -40,6 +43,8 @@ def main():
     args = parser.parse_args()
     if not 64 <= args.width <= 8192 or not 0.5 <= args.zoom <= 30:
         parser.error('width must be 64..8192 and zoom must be 0.5..30')
+    if not (-89.9 <= args.globe_lat <= 89.9 and -180 <= args.globe_lon <= 180 and 1.04 <= args.globe_distance <= 10):
+        parser.error('globe latitude/longitude/distance outside supported QA range')
     root = Path(__file__).resolve().parent.parent
     out = Path(args.out).resolve(); out.mkdir(parents=True, exist_ok=True)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -95,7 +100,7 @@ await build({stdin:{contents:"export * from './surface.ts'; export * from './mat
         subprocess.run([node_exe,'--input-type=module','-e',bundle,str(root),str(out)],check=True)
         javascript = """
 import fs from 'node:fs'; import {pathToFileURL} from 'node:url';
-const [directory,spherical,view,normalization,ecoMode]=process.argv.slice(1);
+const [directory,spherical,view,normalization,ecoMode,globeLat,globeLon,globeDistance]=process.argv.slice(1);
 const geometry=await import(pathToFileURL(directory+'/surface.mjs').href);
 const bytes=fs.readFileSync(directory+'/surface.bin');
 const surfaceView=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
@@ -134,13 +139,14 @@ const riverGeo=new Float32Array(first*3);let offset=0;for(const group of groups)
 fs.writeFileSync(directory+'/riverGroups.json',JSON.stringify(ranges));
 fs.writeFileSync(directory+'/riverGeo.bin',Buffer.from(riverGeo.buffer));
 fs.writeFileSync(directory+'/rivers.bin',Buffer.from((flat?geometry.projectAtlasPositions(riverGeo,view):riverGeo).buffer));
-const eye=[0,Math.sin(.35)*3.2,Math.cos(.35)*3.2];
+const lat=Number(globeLat)*Math.PI/180,lon=Number(globeLon)*Math.PI/180,d=Number(globeDistance);
+const eye=[Math.cos(lat)*Math.cos(lon)*d,Math.sin(lat)*d,Math.cos(lat)*Math.sin(lon)*d];
 fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.projectionBounds(view),projection:geometry.projectionIndex(view),matrix:Array.from(geometry.mat4Mul(geometry.perspective(Math.PI/4,1,.01,100),geometry.lookAt(eye,[0,0,0],[0,1,0])))}));
 """
         sphere = node['grid']['type']=='sphere'
         globe = sphere and args.view == 'globe'
         atlas = sphere and not globe
-        subprocess.run([node_exe,'--input-type=module','-e',javascript,str(out),str(sphere).lower(),args.view,str(1 if sphere else 2/node['grid']['width_m']),str(args.eco_mode)],check=True)
+        subprocess.run([node_exe,'--input-type=module','-e',javascript,str(out),str(sphere).lower(),args.view,str(1 if sphere else 2/node['grid']['width_m']),str(args.eco_mode),str(args.globe_lat),str(args.globe_lon),str(args.globe_distance)],check=True)
         positions = np.fromfile(out/'positions.bin',dtype='<f4').reshape(-1,3)
         source_ids = np.fromfile(out/'sourceIds.bin',dtype='<u4')
         indices = np.fromfile(out/'indices.bin',dtype='<u4')
@@ -232,6 +238,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
                 'ecosystems_available':has_ecosystems,'ecosystem_mode':args.eco_mode,
                 'view':args.view if sphere else 'plane','pixels':[width,height],'material_fallback':args.material_fallback,
                 'zoom':args.zoom,'center':args.center,
+                'globe_camera':{'lat':args.globe_lat,'lon':args.globe_lon,'distance':args.globe_distance},
                 'material_sha256':hashlib.sha256(pigment_path.read_bytes()).hexdigest(),'gl_error':gl_error,
                 'cells':node['cells'],'river_segments':len(rivers)//2,'shader_sha256':hashlib.sha256(shader_source.encode()).hexdigest(),
                 'project_sha256':hashlib.sha256(project_bytes).hexdigest()}

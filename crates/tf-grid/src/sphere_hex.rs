@@ -168,7 +168,7 @@ fn edge_key(va: usize, vb: usize, steps_from_a: u32, freq: u32) -> PointKey {
 ///
 /// 这个函数只依赖键本身，不依赖调用方来自哪个三角面。
 /// 这是整个网格几何正确性的基石。
-fn position_for_key(key: PointKey, freq: u32, verts: &[DVec3; 12]) -> DVec3 {
+fn position_for_key(key: PointKey, freq: u32, verts: &[DVec3; 12], legacy: bool) -> DVec3 {
     let f = freq as f64;
     match key {
         PointKey::Vertex(v) => verts[v as usize],
@@ -188,9 +188,19 @@ fn position_for_key(key: PointKey, freq: u32, verts: &[DVec3; 12]) -> DVec3 {
             let wb = i as f64 / f;
             let wc = j as f64 / f;
 
-            // 用 Snyder 等面积逆投影。它要求 beta 是平面三角形的重心坐标，
-            // 与上面的 (wa, wb, wc) 一一对应。
-            crate::snyder::snyder_inverse(a, b, c, [wa, wb, wc])
+            if legacy {
+                // Version 2 must retain its original positions for saved fields.
+                crate::snyder::snyder_inverse(a, b, c, [wa, wb, wc])
+            } else {
+                // Symmetric spherical barycentric interpolation. On every edge
+                // this reduces exactly to the canonical slerp above. Unlike the
+                // old face-local area map, its limit agrees from BOTH faces.
+                // This is not an exact equal-area projection; physical solvers
+                // use the explicitly computed cell areas below.
+                let angle = a.dot(b).clamp(-1., 1.).acos();
+                (a * (angle * wa).sin() + b * (angle * wb).sin() + c * (angle * wc).sin())
+                    .normalize()
+            }
         }
     }
 }
@@ -235,6 +245,15 @@ pub struct GridStats {
 
 impl SphereHexGrid {
     pub fn build(freq: u32, radius_m: f64, rotation: (DVec3, f64)) -> Self {
+        Self::build_geometry(freq, radius_m, rotation, false)
+    }
+
+    /// Preserve version-2 coordinates when reading an existing saved world.
+    pub fn build_legacy(freq: u32, radius_m: f64, rotation: (DVec3, f64)) -> Self {
+        Self::build_geometry(freq, radius_m, rotation, true)
+    }
+
+    fn build_geometry(freq: u32, radius_m: f64, rotation: (DVec3, f64), legacy: bool) -> Self {
         assert!(freq >= 1, "freq must be at least 1");
         let verts = icosahedron_vertices();
 
@@ -257,7 +276,7 @@ impl SphereHexGrid {
                     let id = if let Some(&existing) = key_to_id.get(&packed) {
                         existing
                     } else {
-                        let pos = position_for_key(key, freq, &verts);
+                        let pos = position_for_key(key, freq, &verts, legacy);
                         let new_id = centers.len() as u32;
                         centers.push(UnitVec3::from_normalized(pos.normalize()));
                         key_to_id.insert(packed, new_id);
@@ -950,13 +969,18 @@ mod tests {
         let verts = icosahedron_vertices();
         for ki in 1..freq {
             let k = face_point_key(0, FACES[0], freq, ki, 0, freq - ki);
-            let p1 = position_for_key(k, freq, &verts);
-            let p2 = position_for_key(k, freq, &verts);
+            let p1 = position_for_key(k, freq, &verts, false);
+            let p2 = position_for_key(k, freq, &verts, false);
             assert!((p1 - p2).length() < 1e-15);
         }
         // 顶点 a 对应 (i=0, j=0, k=freq)
-        let v1 = position_for_key(PointKey::Vertex(0), freq, &verts);
-        let v2 = position_for_key(face_point_key(0, FACES[0], freq, 0, 0, freq), freq, &verts);
+        let v1 = position_for_key(PointKey::Vertex(0), freq, &verts, false);
+        let v2 = position_for_key(
+            face_point_key(0, FACES[0], freq, 0, 0, freq),
+            freq,
+            &verts,
+            false,
+        );
         assert!(
             (v1 - v2).length() < 1e-15,
             "vertex a mismatch: {:?} vs {:?}",
@@ -964,13 +988,74 @@ mod tests {
             v2
         );
         // 顶点 b 对应 (i=freq, j=0, k=0)
-        let vb1 = position_for_key(PointKey::Vertex(11), freq, &verts);
-        let vb2 = position_for_key(face_point_key(0, FACES[0], freq, freq, 0, 0), freq, &verts);
+        let vb1 = position_for_key(PointKey::Vertex(11), freq, &verts, false);
+        let vb2 = position_for_key(
+            face_point_key(0, FACES[0], freq, freq, 0, 0),
+            freq,
+            &verts,
+            false,
+        );
         assert!(
             (vb1 - vb2).length() < 1e-15,
             "vertex b mismatch: {:?} vs {:?}",
             vb1,
             vb2
+        );
+    }
+
+    #[test]
+    fn fine_mesh_has_no_stretched_seam_triangles() {
+        // Low-resolution topology tests missed this: the old map develops
+        // ever-longer slivers as frequency increases (aspect > 30 at f=256).
+        for freq in [64, 256] {
+            let grid = SphereHexGrid::build(freq, 6371000., unit_rot());
+            for t in crate::mesh::triangles(&grid).chunks_exact(3) {
+                let [a, b, c] = [t[0], t[1], t[2]].map(|id| grid.center(id as usize).as_vec());
+                let area2 = (b - a).cross(c - a).length();
+                let longest2 = (b - a)
+                    .length_squared()
+                    .max((c - b).length_squared())
+                    .max((a - c).length_squared());
+                assert!(longest2 / area2 < 1.6, "f={freq} stretched face {t:?}");
+                assert!((b - a).cross(c - a).dot(a) > 0.);
+            }
+            let stats = grid.stats();
+            assert!(
+                stats.area_ratio < 1.4,
+                "f={freq} area ratio {}",
+                stats.area_ratio
+            );
+            assert!(stats.total_area_error_pct.abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn legacy_descriptor_preserves_saved_cell_positions() {
+        let descriptor = crate::GridDescriptor::Sphere {
+            frequency: 256,
+            radius_m: 6371000.,
+            version: 2,
+        };
+        descriptor.validate().unwrap();
+        let grid = descriptor.build();
+        // Actual v2 surface packet from the existing seed-42 project.
+        assert_eq!(
+            grid.render_center(33560),
+            [0.08440112, 0.996422, 0.004432864]
+        );
+        assert_eq!(
+            grid.render_center(33561),
+            [0.08871206, 0.99604744, 0.004429686]
+        );
+        let current = crate::GridDescriptor::sphere(256, 6371000.);
+        current.validate().unwrap();
+        assert!(matches!(
+            current,
+            crate::GridDescriptor::Sphere { version: 3, .. }
+        ));
+        assert_ne!(
+            current.build().render_center(33560),
+            grid.render_center(33560)
         );
     }
 }

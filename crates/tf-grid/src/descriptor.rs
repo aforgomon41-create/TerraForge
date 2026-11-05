@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use tf_core::geo::UnitVec3;
 
 pub const GRID_VERSION: u32 = 2;
+/// Version 3 joins spherical faces continuously; version 2 stays readable.
+pub const SPHERE_GRID_VERSION: u32 = 3;
 pub const PLANE_GRID_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,7 +42,7 @@ impl GridDescriptor {
         Self::Sphere {
             frequency,
             radius_m,
-            version: GRID_VERSION,
+            version: SPHERE_GRID_VERSION,
         }
     }
     pub fn patch(lat: f64, lon: f64, width: f64, size: u32, radius: f64) -> Self {
@@ -121,7 +123,9 @@ impl GridDescriptor {
             Self::Sphere {
                 frequency, version, ..
             } => {
-                if *version != GRID_VERSION || ![256, 512, 768].contains(frequency) {
+                if ![GRID_VERSION, SPHERE_GRID_VERSION].contains(version)
+                    || ![256, 512, 768].contains(frequency)
+                {
                     return Err("不支持的球面网格版本或频率".into());
                 }
             }
@@ -172,12 +176,12 @@ impl GridDescriptor {
             Self::Sphere {
                 frequency,
                 radius_m,
-                ..
-            } => MapGrid::Sphere(SphereHexGrid::build(
-                frequency,
-                radius_m,
-                (glam::DVec3::Z, 0.),
-            )),
+                version,
+            } => MapGrid::Sphere(if version == GRID_VERSION {
+                SphereHexGrid::build_legacy(frequency, radius_m, (glam::DVec3::Z, 0.))
+            } else {
+                SphereHexGrid::build(frequency, radius_m, (glam::DVec3::Z, 0.))
+            }),
             Self::Patch {
                 center_lat,
                 center_lon,

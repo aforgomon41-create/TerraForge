@@ -541,7 +541,7 @@ impl CryosphereAtlas {
             } if (4..=32).contains(frequency)
                 && radius_m.is_finite()
                 && (1e6..=5e7).contains(radius_m)
-                && *version == tf_grid::GRID_VERSION => {}
+                && [tf_grid::GRID_VERSION, tf_grid::SPHERE_GRID_VERSION].contains(version) => {}
             GridDescriptor::Plane { .. } | GridDescriptor::Patch { .. } => self.grid.validate()?,
             _ => return Err("冰雪网格无效".into()),
         }

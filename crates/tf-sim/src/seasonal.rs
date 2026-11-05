@@ -495,7 +495,7 @@ impl ClimateAtlas {
                 radius_m,
                 version,
             } => {
-                if *version != tf_grid::GRID_VERSION
+                if ![tf_grid::GRID_VERSION, tf_grid::SPHERE_GRID_VERSION].contains(version)
                     || !(4..=56).contains(frequency)
                     || !radius_m.is_finite()
                     || !(1e6..=5e7).contains(radius_m)
