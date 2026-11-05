@@ -31,3 +31,13 @@
 ## 核查边界
 
 DSH只读调研任务`ea0db48b-b80c-482d-b389-443ef5f932f7`确认分段、内部步长与帧成本路径，主代理核对了源码和实际帧时刻。阶段权重不等于实际耗时，不能据权重断言后续气候比构造更重；这里以实际观察记录为准。预览抽样、减少只读快照复制、优化输运循环都可能在保持物理条件下改善速度，需要另做计时对照，不能把放宽稳定步长当作唯一优化途径。
+
+## 上线与验证
+
+2026-11-05已部署到`https://aforgomon.win/terraforge/`，发布目录`/www/terraforge/releases/20261105-startfix-0fa9428`，前端源码`0fa9428b37ebbc64e9408dff99166133475f1db9`。Rust、依赖与共享分类资料未变，复用此前完整验收的同一程序，SHA-256仍为`688d18df74ffce791ea310b2be6d7e9f55af88154c8829f710d8ca00d1fae612`；不是重新生成了另一套物理结果。
+
+50项前端测试、类型、生产构建与格式检查通过。线上Edge确认默认轴倾角显示23.44、实际HTML步长0.01；未编辑任何默认参数，收起更多参数后直接点击开始，真实655362格世界进入生成，并显示“近期精细演化9.9/120.0百万年”等动态说明。随后主动取消本次测试，已观察到取消终态，活动作业回到0。截图为`references/generation-default-start.jpg`。
+
+实际进程167889，自动重启0、OOM0，600MiB限制保持。源站证书、5项静态文件与清单、公网直连和配置代理两路检查通过，当前JS为`index-FXWX2tDv.js`；Nginx及原8790服务保持原状态。发布前保存了旧unit，切换与回退演练通过；没有中断用户正在运行的作业。
+
+本机发布证据位于`artifacts/startfix-release`、`startfix-server-*`、`startfix-public-https.json`、`startfix-runtime-verified.json`、`generation-start-progress-tests.log`。
