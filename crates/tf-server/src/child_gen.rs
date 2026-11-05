@@ -147,7 +147,10 @@ pub fn run_child_generation(
                 cancel.load(Ordering::Relaxed)
             });
         if fields.cryosphere.is_none() {
-            anyhow::ensure!(cancel.load(Ordering::Relaxed), "局部冰雪求解未完成，请调整参数后重试");
+            anyhow::ensure!(
+                cancel.load(Ordering::Relaxed),
+                "局部冰雪求解未完成，请调整参数后重试"
+            );
             return Ok(());
         }
     }

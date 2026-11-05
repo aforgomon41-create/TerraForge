@@ -403,7 +403,10 @@ pub fn import(
                 );
                 for channel in crate::cryosphere::CHANNELS {
                     // These are compressed bytes; decoded counts were checked above.
-                    anyhow::ensure!(channels.iter().any(|(c,_)|*c==channel),"新版工程缺少地图上的冰雪字段");
+                    anyhow::ensure!(
+                        channels.iter().any(|(c, _)| *c == channel),
+                        "新版工程缺少地图上的冰雪字段"
+                    );
                 }
             }
             anyhow::ensure!(

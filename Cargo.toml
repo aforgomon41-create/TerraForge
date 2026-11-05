@@ -14,7 +14,7 @@ edition = "2021"
 rust-version = "1.82"
 license = "AGPL-3.0-or-later"
 authors = ["kamisama <mzxl41@163.com>"]
-repository = "https://github.com/kamisama/terraforge"
+repository = "https://github.com/aforgomon41-create/TerraForge"
 
 [workspace.dependencies]
 tf-core = { path = "crates/tf-core" }

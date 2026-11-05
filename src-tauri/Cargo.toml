@@ -2,6 +2,7 @@
 name = "terraforge-desktop"
 version = "0.2.0"
 edition = "2021"
+license.workspace = true
 description = "TerraForge 世界生成器桌面版"
 
 [build-dependencies]

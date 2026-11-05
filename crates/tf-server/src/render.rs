@@ -83,7 +83,9 @@ pub fn render_map_png_with_ecosystems(
                 let snow = if elevation[i] > 0. {
                     (1. - (-ice[0][i] / 3.).exp()).max(ice[1][i]).max(ice[7][i])
                 } else {
-                    ice[2][i].max(1. - (-ice[3][i] / 30.).exp()).max(1. - (-ice[0][i] / 3.).exp())
+                    ice[2][i]
+                        .max(1. - (-ice[3][i] / 30.).exp())
+                        .max(1. - (-ice[0][i] / 3.).exp())
                 };
                 let white = [233., 245., 245.];
                 for c in 0..3 {

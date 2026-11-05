@@ -35,7 +35,8 @@ pub fn encode(atlas: &CryosphereAtlas) -> anyhow::Result<Value> {
 }
 pub fn decode(value: &Value) -> anyhow::Result<CryosphereAtlas> {
     anyhow::ensure!(
-        value["encoding"] == "cryosphere-v1+zstd+base64" || value["encoding"] == "cryosphere-v2+zstd+base64",
+        value["encoding"] == "cryosphere-v1+zstd+base64"
+            || value["encoding"] == "cryosphere-v2+zstd+base64",
         "冰雪编码无效"
     );
     let size = value["bytes"]
@@ -53,7 +54,11 @@ pub fn decode(value: &Value) -> anyhow::Result<CryosphereAtlas> {
     decoder.take(size + 1).read_to_end(&mut raw)?;
     anyhow::ensure!(raw.len() == size as usize, "冰雪资料长度不符");
     let atlas: CryosphereAtlas = serde_json::from_slice(&raw)?;
-    anyhow::ensure!((value["encoding"]=="cryosphere-v2+zstd+base64")== (atlas.model==tf_sim::cryosphere::MODEL),"冰雪编码与模型版本不一致");
+    anyhow::ensure!(
+        (value["encoding"] == "cryosphere-v2+zstd+base64")
+            == (atlas.model == tf_sim::cryosphere::MODEL),
+        "冰雪编码与模型版本不一致"
+    );
     atlas.validate().map_err(anyhow::Error::msg)?;
     Ok(atlas)
 }
@@ -87,8 +92,10 @@ pub fn for_map(
             .get_metadata(&current.id)?
             .and_then(|v| v.get("cryosphere_atlas").cloned())
         {
-            let atlas=decode(&value)?;
-            if atlas.model==tf_sim::cryosphere::MODEL && current.id!=node.id {return Ok(None);}
+            let atlas = decode(&value)?;
+            if atlas.model == tf_sim::cryosphere::MODEL && current.id != node.id {
+                return Ok(None);
+            }
             return Ok(Some(atlas));
         }
         let Some(parent) = &current.parent else {
