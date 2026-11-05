@@ -146,6 +146,10 @@ pub fn run_child_generation(
             tf_sim::cryosphere::solve(&patch, &fields, params.planet.surface_gravity(), &|| {
                 cancel.load(Ordering::Relaxed)
             });
+        if fields.cryosphere.is_none() {
+            anyhow::ensure!(cancel.load(Ordering::Relaxed), "局部冰雪求解未完成，请调整参数后重试");
+            return Ok(());
+        }
     }
     let water = tf_sim::erosion::refresh_hydrology(&patch, &mut fields);
     tf_sim::cryosphere::update_water_surfaces(&patch, &mut fields);
