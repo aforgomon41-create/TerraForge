@@ -43,6 +43,7 @@ import {
 import AgentPanel from '@/components/AgentPanel.vue'
 import EcosystemPanel from '@/components/EcosystemPanel.vue'
 import { ecosystemAt, ecosystemModes } from '@/ecosystems/view'
+import { evolutionClock } from '@/generation/progress'
 const store = useWorldStore(),
   canvas = ref<HTMLCanvasElement | null>(null),
   fileInput = ref<HTMLInputElement | null>(null)
@@ -78,7 +79,7 @@ const liveCaption = computed(() => {
   if (!meta) return '等待首个计算状态…'
   const clock =
     meta.elapsed_myr != null
-      ? `构造时间 ${meta.elapsed_myr.toFixed(1)} 百万年`
+      ? evolutionClock(meta.elapsed_myr, Number(store.current?.params?.tectonic_age_myr))
       : meta.year != null
         ? `求解第 ${meta.year} 年 / ${meta.month} 月`
         : `第 ${meta.step} 步`

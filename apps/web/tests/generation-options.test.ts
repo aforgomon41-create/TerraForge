@@ -1,6 +1,36 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { defaults, scopeDefaults, scopeParameters } from '../src/generation/options.ts'
+import {
+  defaults,
+  scopeDefaults,
+  scopeParameters,
+  extentFields,
+  terrainFields,
+  weatherFields,
+  localFields,
+  planetFields,
+} from '../src/generation/options.ts'
+
+test('all initial scope controls satisfy the native number input step and bounds', () => {
+  for (const scope of ['world', 'continent', 'region', 'site'] as const) {
+    const values = { ...defaults, ...scopeDefaults(scope) }
+    for (const fields of [extentFields, terrainFields, weatherFields, localFields, planetFields])
+      for (const { key, min, max, step } of fields) {
+        const value = values[key],
+          ticks = (value - min) / step
+        assert.ok(Number.isFinite(value) && value >= min && value <= max, `${scope}: ${key}`)
+        assert.ok(
+          Math.abs(ticks - Math.round(ticks)) < 1e-7,
+          `${scope}: ${key}=${value} violates step=${step}`,
+        )
+      }
+  }
+  const planet = scopeParameters('world', 'sphere', defaults, 'hills', true, true).planet as Record<
+    string,
+    number
+  >
+  assert.equal(planet.axial_tilt_deg, 23.44)
+})
 
 test('a local root uses its own terrain and weather without hidden planetary or plate controls', () => {
   const values = { ...defaults, ...scopeDefaults('site'), continent_count: NaN, radius_km: NaN }

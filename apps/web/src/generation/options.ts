@@ -79,7 +79,7 @@ export const localFields = [
 ]
 export const planetFields = [
   field('radius_km', '星球半径 · km', 1000, 50000, 1),
-  field('axial_tilt_deg', '轴倾角 · °', 0, 90),
+  field('axial_tilt_deg', '轴倾角 · °', 0, 90, 0.01),
   field('rotation_period_hours', '自转周期 · 小时', 1, 1000),
   field('solar_constant', '恒星辐射 · W/m²', 100, 4000, 1),
   field('atmosphere_density', '大气密度倍率', 0.05, 10, 0.05),
