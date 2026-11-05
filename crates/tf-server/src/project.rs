@@ -396,6 +396,16 @@ pub fn import(
         }
         if let Some(ice) = metadata.get("cryosphere_atlas") {
             let atlas = crate::cryosphere::decode(ice)?;
+            if atlas.model == tf_sim::cryosphere::MODEL {
+                anyhow::ensure!(
+                    atlas.ice_budget.solver_cells == node.cells as usize,
+                    "冰雪求解网格与地图不一致"
+                );
+                for channel in crate::cryosphere::CHANNELS {
+                    // These are compressed bytes; decoded counts were checked above.
+                    anyhow::ensure!(channels.iter().any(|(c,_)|*c==channel),"新版工程缺少地图上的冰雪字段");
+                }
+            }
             anyhow::ensure!(
                 (atlas.grid.radius_m() - params.planet.radius_m).abs() < 0.001,
                 "冰雪半径与工程不一致"

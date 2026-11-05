@@ -1,5 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { ecosystemPaint } from '../src/ecosystems/paint.ts'
+import palette from '../../../data/ecosystems/paint.json' with { type: 'json' }
 import {
   decodeEcosystems,
   ecosystemCatalogue,
@@ -41,6 +43,27 @@ test('shared 25/110 hierarchy preserves u16 ids above 255 and separate river hab
   assert.throws(() => decodeEcosystems(packet().slice(0, -1), 1))
   assert.throws(() => decodeEcosystems(packet(), 2))
 })
+
+test('every resolved ecosystem has explicit natural paint and structure, independent of diagnostic mode', () => {
+  for (const group of ecosystemCatalogue.groups.filter(
+    (g) => g.support === 'environment_estimate',
+  )) {
+    assert.ok(Object.hasOwn(palette.groups, group.code), group.code)
+    const paint = ecosystemPaint(group.biome_id, group.id, 2)
+    assert.equal(paint.length, 4)
+    assert.ok(paint.slice(0, 3).every((v) => Number.isFinite(v) && v >= 0 && v <= 1))
+    assert.ok(paint[3] >= 1 && paint[3] <= 23)
+  }
+  const deciduous = ecosystemPaint(19, 306, 2),
+    conifer = ecosystemPaint(19, 307, 2)
+  assert.notDeepEqual(deciduous, conifer)
+  assert.equal(deciduous[3], 4)
+  assert.equal(conifer[3], 5)
+  assert.notDeepEqual(ecosystemPaint(23, 370, 2), ecosystemPaint(23, 372, 2))
+  assert.notDeepEqual(ecosystemPaint(19, 306, 0), ecosystemPaint(19, 306, 3))
+  assert.equal(ecosystemPaint(0, 0, 0)[3], 0)
+  assert.ok(ecosystemCatalogue.groups.every((g) => g.id < 512))
+})
 test('local variants and unknown classes never masquerade as formal fine types', () => {
   assert.equal(identificationName(0, 275), '细类待定')
   assert.equal(identificationName(369, 512), '依据保存的冰雪状态')
@@ -76,6 +99,7 @@ test('legends include only present classes and keep unknown details and overlapp
   assert.deepEqual(a.paint, b.paint)
   assert.notDeepEqual(a.colors, b.colors)
   assert.deepEqual(a.colors.slice(0, 3), a.colors.slice(6, 9))
+  assert.deepEqual(a.paint.slice(0, 4), a.paint.slice(8, 12))
   assert.equal(data.group[2], 403)
   assert.throws(() => ecosystemAttributes(data, 3, new Uint32Array([3]), 1))
   assert.throws(() => ecosystemAttributes({ ...data, variant: new Uint8Array(1) }, 3))

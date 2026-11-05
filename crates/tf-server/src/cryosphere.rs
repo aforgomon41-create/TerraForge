@@ -30,12 +30,12 @@ pub fn encode(atlas: &CryosphereAtlas) -> anyhow::Result<Value> {
     let raw = serde_json::to_vec(atlas)?;
     anyhow::ensure!(raw.len() <= MAX_RAW, "冰雪资料过大");
     Ok(
-        json!({"encoding":"cryosphere-v1+zstd+base64","bytes":raw.len(),"data":STANDARD.encode(zstd::encode_all(raw.as_slice(),3)?)}),
+        json!({"encoding":if atlas.model==tf_sim::cryosphere::MODEL {"cryosphere-v2+zstd+base64"}else{"cryosphere-v1+zstd+base64"},"bytes":raw.len(),"data":STANDARD.encode(zstd::encode_all(raw.as_slice(),3)?)}),
     )
 }
 pub fn decode(value: &Value) -> anyhow::Result<CryosphereAtlas> {
     anyhow::ensure!(
-        value["encoding"] == "cryosphere-v1+zstd+base64",
+        value["encoding"] == "cryosphere-v1+zstd+base64" || value["encoding"] == "cryosphere-v2+zstd+base64",
         "冰雪编码无效"
     );
     let size = value["bytes"]
@@ -53,6 +53,7 @@ pub fn decode(value: &Value) -> anyhow::Result<CryosphereAtlas> {
     decoder.take(size + 1).read_to_end(&mut raw)?;
     anyhow::ensure!(raw.len() == size as usize, "冰雪资料长度不符");
     let atlas: CryosphereAtlas = serde_json::from_slice(&raw)?;
+    anyhow::ensure!((value["encoding"]=="cryosphere-v2+zstd+base64")== (atlas.model==tf_sim::cryosphere::MODEL),"冰雪编码与模型版本不一致");
     atlas.validate().map_err(anyhow::Error::msg)?;
     Ok(atlas)
 }
@@ -86,7 +87,9 @@ pub fn for_map(
             .get_metadata(&current.id)?
             .and_then(|v| v.get("cryosphere_atlas").cloned())
         {
-            return Ok(Some(decode(&value)?));
+            let atlas=decode(&value)?;
+            if atlas.model==tf_sim::cryosphere::MODEL && current.id!=node.id {return Ok(None);}
+            return Ok(Some(atlas));
         }
         let Some(parent) = &current.parent else {
             return Ok(None);
@@ -127,8 +130,11 @@ pub async fn get_cryosphere(
         let _permit=permit;
         let Some(atlas)=for_map(&st.store,&node)? else{return Ok(Json(json!({"available":false,"reason":"旧工程未保存冰雪状态，请重新生成后查看海冰、冰架与冻土"})).into_response());};
         let count=node.cells as usize;
+        let model=atlas.model.clone();
         let data:Vec<Vec<f32>>=if query.month==0 {
-            CHANNELS.iter().map(|&c|st.store.get_field(&id,c)?.ok_or_else(||anyhow::anyhow!("缺少冰雪字段，请重新生成"))).collect::<anyhow::Result<_>>()?
+            let mut values=Vec::with_capacity(CHANNELS.len());
+            for c in CHANNELS {let Some(v)=st.store.get_field(&id,c)? else{return Ok(Json(json!({"available":false,"reason":"此地图缺少保存的冰雪字段，请重新生成"})).into_response());};values.push(v);}
+            values
         } else {
             let grid=node.grid.as_ref().ok_or_else(||anyhow::anyhow!("缺少地图网格"))?.build();
             let mut f=tf_sim::WorldFields::with_capacity(count);
@@ -138,12 +144,15 @@ pub async fn get_cryosphere(
             f.lake_depth=st.store.get_field(&id,Channel::LakeDepth)?.unwrap_or_else(||vec![0.;count]);
             f.climate=crate::climatology::for_map(&st.store,&node)?;
             if f.climate.is_none(){return Ok(Json(json!({"available":false,"reason":"此工程缺少月气候，无法查看季节冰雪，请重新生成"})).into_response());}
-            let mut ice=tf_sim::cryosphere::sample(&grid,&f,atlas,query.month);
+            let ground=st.store.get_field(&id,Channel::LandIce)?;
+            let shelf=st.store.get_field(&id,Channel::IceShelf)?;
+            let canonical=if atlas.model==tf_sim::cryosphere::MODEL {ground.as_deref().zip(shelf.as_deref())} else {None};
+            let Some(mut ice)=tf_sim::cryosphere::sample(&grid,&f,atlas,query.month,canonical) else{return Ok(Json(json!({"available":false,"reason":"缺少与地图匹配的冰厚字段，请重新生成"})).into_response());};
             for i in 0..count {if f.lake_depth[i]>0.1 {ice.permafrost[i]=0.;ice.active_layer_m[i]=0.;}}
             fields(&ice).iter().map(|v|v.to_vec()).collect()
         };
         anyhow::ensure!(data.iter().all(|v|v.len()==count),"冰雪字段长度无效");
-        let header=serde_json::to_vec(&json!({"available":true,"model":tf_sim::cryosphere::MODEL,"month":query.month,
+        let header=serde_json::to_vec(&json!({"available":true,"model":model,"month":query.month,
             "count":count,"liquid_water_units":if query.month==0 {"mm/year"}else{"selected-month annualized mm/year"},"channels":CHANNELS.iter().map(|c|c.name()).collect::<Vec<_>>()}))?;
         let mut out=Vec::with_capacity(4+header.len()+count*32);out.extend_from_slice(&(header.len() as u32).to_le_bytes());out.extend_from_slice(&header);
         for channel in data {for v in channel {out.extend_from_slice(&v.to_le_bytes());}}

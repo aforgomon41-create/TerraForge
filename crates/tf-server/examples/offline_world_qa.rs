@@ -173,28 +173,89 @@ async fn main() -> anyhow::Result<()> {
                 pet_mm_year: vec![0.; n],
             });
         }
-        let legacy = field(Channel::Biome)?
+        let mut refreshed = Vec::<(Channel, Vec<f32>)>::new();
+        let mut metadata = state.store.get_metadata(&id)?.unwrap();
+        if args.get(5).is_some_and(|s| s == "cryosphere") {
+            f.cryosphere = tf_sim::cryosphere::solve(&grid, &f, 9.81, &|| false);
+            anyhow::ensure!(f.cryosphere.is_some(), "fine ice solve failed");
+            let water = tf_sim::erosion::refresh_hydrology(&grid, &mut f);
+            tf_sim::cryosphere::update_water_surfaces(&grid, &mut f);
+            f.liquid_discharge = tf_sim::cryosphere::annual_discharge(&grid, &f, &water);
+            let ecology = tf_sim::ecology::run_ecology(&grid, &f);
+            refreshed.push((
+                Channel::Biome,
+                ecology.biome.iter().map(|&v| v as u8 as f32).collect(),
+            ));
+            refreshed.push((
+                Channel::Soil,
+                ecology.soil.iter().map(|&v| v as u8 as f32).collect(),
+            ));
+            for (channel, values) in [
+                (Channel::LakeDepth, &f.lake_depth),
+                (Channel::FlowAccumulation, &f.flow_accumulation),
+                (Channel::LiquidDischarge, &f.liquid_discharge),
+                (Channel::PotentialEvaporation, &f.potential_evaporation),
+            ] {
+                refreshed.push((channel, values.clone()));
+            }
+            refreshed.push((
+                Channel::FlowReceiver,
+                water
+                    .flow_dir
+                    .iter()
+                    .map(|&v| if v == u32::MAX { -1. } else { v as f32 })
+                    .collect(),
+            ));
+            metadata["hydrology_model"]["water"] = serde_json::to_value(&water.lake_budget)?;
+            let ice = f.cryosphere.as_ref().unwrap();
+            tf_server::cryosphere::attach(&mut metadata, ice)?;
+            refreshed.extend(
+                tf_server::cryosphere::CHANNELS.into_iter().zip(
+                    tf_server::cryosphere::fields(ice)
+                        .into_iter()
+                        .map(|v| v.to_vec()),
+                ),
+            );
+            tf_server::geography::attach(&mut metadata, &grid, &f, &water, &|| false);
+            println!(
+                "Recomputed map-grid ice, water and ecology from {source}; budget {:?}",
+                ice.atlas.ice_budget
+            );
+        }
+        let legacy = refreshed
+            .iter()
+            .find(|(c, _)| *c == Channel::Biome)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(field(Channel::Biome)?)
             .iter()
             .map(|&v| v as u8)
             .collect::<Vec<_>>();
-        let soil = field(Channel::Soil)?
+        let soil = refreshed
+            .iter()
+            .find(|(c, _)| *c == Channel::Soil)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(field(Channel::Soil)?)
             .iter()
             .map(|&v| v as u8)
             .collect::<Vec<_>>();
         let e = tf_sim::ecosystems::classify(&grid, &f, &legacy, &soil);
         let channels = e.channels();
-        let mut metadata = state.store.get_metadata(&id)?.unwrap();
         tf_server::ecosystems::attach(&mut metadata, &e);
+        refreshed.extend(
+            tf_server::ecosystems::CHANNELS
+                .into_iter()
+                .zip(channels.iter().cloned()),
+        );
         state.store.publish_fields(
             &id,
-            &tf_server::ecosystems::CHANNELS
-                .into_iter()
-                .zip(channels.iter().map(Vec::as_slice))
+            &refreshed
+                .iter()
+                .map(|(c, v)| (*c, v.as_slice()))
                 .collect::<Vec<_>>(),
             &metadata,
         )?;
         assert_eq!(field(Channel::Elevation)?, f.elevation);
-        println!("Replayed ecology only from {source}");
+        println!("Replayed saved project and refreshed ecosystem classification from {source}");
         id
     } else {
         let world: Value = serde_json::from_slice(
@@ -319,7 +380,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(
         out.join("report.json"),
         serde_json::to_vec_pretty(
-            &json!({"shape":shape,"seed":seed,"seconds":start.elapsed().as_secs_f64(),"replayed_ecology_from":args.get(4),"result":"passed","transport":"in-process production router; no TCP listener"}),
+            &json!({"shape":shape,"seed":seed,"seconds":start.elapsed().as_secs_f64(),"replayed_from":args.get(4),"recomputed_cryosphere":args.get(5).is_some_and(|s|s=="cryosphere"),"result":"passed","transport":"in-process production router; no TCP listener"}),
         )?,
     )?;
     println!("Full project written: {}", out.display());

@@ -200,10 +200,11 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
                     'aPlate':channel('plate_id'),'aTemperature':channel('temperature'),'aPrecipitation':channel('precipitation'),
                     'aFlow':channel('flow_accumulation'),'aLake':np.fromfile(out/'shore.bin',dtype='<f4'),
                     'aCryosphere':np.fromfile(out/'cryocover.bin',dtype='<f4').reshape(-1,4),'aFrozen':np.fromfile(out/'cryoground.bin',dtype='<f4').reshape(-1,2),
-                    'aEcosystemColor':np.fromfile(out/'ecocolors.bin',dtype='<f4').reshape(-1,3),'aEcosystemPaint':np.fromfile(out/'ecopaint.bin',dtype='<f4').reshape(-1,3),
+                    'aEcosystemColor':np.fromfile(out/'ecocolors.bin',dtype='<f4').reshape(-1,3),'aEcosystemPaint':np.fromfile(out/'ecopaint.bin',dtype='<f4').reshape(-1,4),
                     'aGeography':np.zeros(len(source_ids),dtype='f4'),'aPartition':np.zeros(len(source_ids),dtype='f4')}
         program['uHeightScale'].value=.025/max(float(attributes['aHeight'].max()),1.)
         for name,values in attributes.items():
+            assert len(values)==len(source_ids),(name,'attribute row mismatch')
             if name not in program: continue
             buffer=ctx.buffer(values.astype('f4').tobytes());buffers.append(buffer)
             content.append((buffer,str(values.shape[1])+'f' if values.ndim==2 else '1f',name))

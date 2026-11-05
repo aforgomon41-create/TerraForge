@@ -495,7 +495,7 @@ async fn saved_cryosphere_binary_is_bounded_private_and_keeps_canonical_fields()
     let descriptor = tf_grid::GridDescriptor::plane(65., 0., 600000., 12, 8, 6371000.);
     let n = descriptor.cell_count();
     let atlas = tf_sim::cryosphere::CryosphereAtlas {
-        model: tf_sim::cryosphere::MODEL.into(),
+        model: tf_sim::cryosphere::LEGACY_MODEL.into(),
         grid: descriptor.clone(),
         spinup_years: 10000,
         gravity_m_s2: 9.81,

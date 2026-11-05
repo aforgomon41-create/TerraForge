@@ -41,6 +41,16 @@ test('unaligned binary ice data preserves physical values and rejects damaged bo
   v.setFloat32(start + 2 * 2 * 4, 2, true)
   assert.throws(() => decodeIce(bad, 2))
 })
+
+test('thin ice has a gradual appearance without changing physical thickness', () => {
+  const ice = decodeIce(packet(), 2)
+  ice.landIce[0] = 1
+  ice.landIce[1] = 10
+  const a = iceAttributes(ice, 2)
+  assert.ok(a.cover[0] > 0.25 && a.cover[0] < 0.3)
+  assert.ok(a.cover[4] > 0.95 && a.cover[4] < 1)
+  assert.deepEqual(ice.landIce, new Float32Array([1, 10]))
+})
 test('projection seam remapping keeps ice, water and ground categories independent', () => {
   const ice: IceData = decodeIce(packet(), 2),
     before = ice.landIce.slice()

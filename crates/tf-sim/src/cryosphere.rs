@@ -2,7 +2,9 @@
 //! PDD snow/melt, conservative shallow-ice transport, hydrostatic shelves,
 //! Stefan sea ice and an equilibrium TTOP/Stefan permafrost approximation.
 //! Equations/references and approximation boundaries: docs/cryosphere.md.
-use crate::{seasonal::ClimateAtlas, WorldFields};
+#[cfg(test)]
+use crate::seasonal::ClimateAtlas;
+use crate::WorldFields;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tf_grid::{GridDescriptor, GridOps, MapGrid};
@@ -12,8 +14,12 @@ const MONTH: f64 = DAYS / 12.;
 const YEAR: f64 = DAYS * 86400.;
 const RHO_I: f64 = 917.;
 const RHO_O: f64 = 1028.;
-pub const MODEL: &str = "seasonal-cryosphere-pdd-sia-stefan-ttop-v1";
+mod ice_sheet;
+pub const LEGACY_MODEL: &str = "seasonal-cryosphere-pdd-sia-stefan-ttop-v1";
+pub const MODEL: &str = "map-grid-cryosphere-pdd-sia-stefan-ttop-v2";
+/// Legacy v1 atlas limit; v2 stores ice in the map's existing channels.
 pub const MAX_CELLS: usize = 12000;
+pub const MAX_TRANSPORT_STEPS: usize = 2_000_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IceBudget {
@@ -25,11 +31,19 @@ pub struct IceBudget {
     pub final_storage_m3: f64,
     pub rounding_m3: f64,
     pub residual_m3: f64,
+    #[serde(default)]
+    pub solver_cells: usize,
+    #[serde(default)]
+    pub peak_active_cells: usize,
+    #[serde(default)]
+    pub transport_steps: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CryosphereAtlas {
     pub model: String,
+    /// v1: ice solver grid. v2: monthly climate provenance only; actual ice
+    /// uses the map node geometry and persisted LandIce/IceShelf channels.
     pub grid: GridDescriptor,
     pub spinup_years: u32,
     pub gravity_m_s2: f64,
@@ -128,39 +142,6 @@ fn ice_cover(h: f64) -> f32 {
     (h / (h + 0.08)).clamp(0., 1.) as f32
 }
 
-fn coarse_descriptor(climate: &ClimateAtlas) -> GridDescriptor {
-    match climate.grid.clone() {
-        GridDescriptor::Sphere {
-            frequency,
-            radius_m,
-            ..
-        } => GridDescriptor::sphere(frequency.min(16), radius_m),
-        GridDescriptor::Plane {
-            size,
-            rows,
-            width_m,
-            center_lat,
-            center_lon,
-            radius_m,
-            reference_lat,
-            version,
-        } => {
-            let columns = size.min(48);
-            GridDescriptor::Plane {
-                size: columns,
-                rows: ((rows as f64 * columns as f64 / size as f64).round() as u32).max(4),
-                width_m,
-                center_lat,
-                center_lon,
-                radius_m,
-                reference_lat,
-                version,
-            }
-        }
-        other => other,
-    }
-}
-
 fn weights(grid: &MapGrid, dir: tf_core::geo::UnitVec3) -> [(usize, f64); 3] {
     let position = match grid {
         MapGrid::Plane(g) => {
@@ -177,6 +158,7 @@ fn weights(grid: &MapGrid, dir: tf_core::geo::UnitVec3) -> [(usize, f64); 3] {
 
 /// A finite-volume upwind SIA flux; floating ice has a separate extensional
 /// spreading approximation. Every transfer subtracts and adds the same volume.
+#[cfg(test)]
 fn transport<G: GridOps>(
     grid: &G,
     bed: &[f64],
@@ -254,134 +236,7 @@ pub fn solve<G: GridOps>(
     gravity: f64,
     cancel: &dyn Fn() -> bool,
 ) -> Option<Cryosphere> {
-    let climate = fields.climate.as_ref()?;
-    let descriptor = coarse_descriptor(climate);
-    let coarse = descriptor.build();
-    let climate_grid = climate.grid.build();
-    let n = coarse.cell_count();
-    if n > MAX_CELLS {
-        return None;
-    }
-    let mut bed = vec![0.; n];
-    let mut valid = vec![false; n];
-    let mut temperatures = vec![[0.; 12]; n];
-    let mut rain = vec![[0.; 12]; n];
-    for i in 0..n {
-        let direction = coarse.center_dir(i);
-        let Some(j) = grid.locate(direction) else {
-            continue;
-        };
-        valid[i] = true;
-        bed[i] = fields.elevation[j] as f64;
-        (temperatures[i], rain[i], _) = climate.sample(
-            &climate_grid,
-            direction,
-            fields.temperature[j],
-            fields.precipitation[j],
-        );
-    }
-    let mut h = vec![0.; n];
-    let mut inverse = WorldFields::with_capacity(n);
-    inverse.elevation = bed.iter().map(|&b| (-b) as f32).collect();
-    crate::erosion::compute_distance_to_sea(&coarse, &mut inverse);
-    let coast_distance = inverse.distance_to_sea;
-    let mut budget = IceBudget::default();
-    let dt = 10.;
-    let years = 10000;
-    for step in 0..years / 10 {
-        if cancel() {
-            return None;
-        }
-        for i in 0..n {
-            if !valid[i] || (bed[i] <= 0. && h[i] <= 0.) {
-                continue;
-            }
-            let mut t = temperatures[i];
-            let floating = bed[i] < 0. && RHO_I * h[i] < RHO_O * (-bed[i]);
-            let rise = if floating {
-                (1. - RHO_I / RHO_O) * h[i]
-            } else {
-                (bed[i] + h[i]).max(0.) - bed[i].max(0.)
-            };
-            for v in &mut t {
-                *v -= (rise * 0.0065) as f32;
-            }
-            let cycle = snow_cycle(&t, &rain[i], h[i]);
-            let coverage = if bed[i] <= 0. {
-                (h[i] / 10.).clamp(0., 1.)
-            } else {
-                1.
-            };
-            let snow = cycle.retained.max(0.) / RHO_I * dt * coverage;
-            let melt = (cycle.melted_ice / RHO_I * dt).min(h[i] + snow);
-            h[i] += snow - melt;
-            budget.snowfall_m3 += snow * coarse.area_m2(i);
-            budget.surface_melt_m3 += melt * coarse.area_m2(i);
-            if bed[i] < 0. && RHO_I * h[i] < RHO_O * (-bed[i]) {
-                let warm = temperatures[i].iter().map(|&v| v as f64).sum::<f64>() / 12.;
-                let basal = (dt * (0.2 + warm.max(0.) * 1.5)).min(h[i]);
-                h[i] -= basal;
-                let residence = if warm > 0. {
-                    20.
-                } else {
-                    4. + 496. * (-(coast_distance[i] as f64) / 300000.).exp()
-                };
-                let calved = h[i] * (1. - (-dt / residence).exp());
-                h[i] -= calved;
-                budget.basal_melt_m3 += basal * coarse.area_m2(i);
-                budget.calved_m3 += calved * coarse.area_m2(i);
-            }
-            if coarse.boundary_mask()[i] || coarse.neighbors(i).iter().any(|&j| !valid[j as usize])
-            {
-                let exported = h[i] * (1. - (-dt / 100.).exp());
-                h[i] -= exported;
-                budget.boundary_export_m3 += exported * coarse.area_m2(i);
-            }
-        }
-        transport(&coarse, &bed, &valid, &mut h, dt, gravity);
-        if step % 20 == 0 && h.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-    }
-    let mut grounded = vec![0.; n];
-    let mut shelf = vec![0.; n];
-    let mut sea = vec![vec![0.; n]; 12];
-    for i in 0..n {
-        if !valid[i] {
-            continue;
-        }
-        budget.final_storage_m3 += h[i] * coarse.area_m2(i);
-        let value = h[i] as f32;
-        budget.rounding_m3 += (value as f64 - h[i]) * coarse.area_m2(i);
-        if bed[i] < 0. && RHO_I * h[i] < RHO_O * (-bed[i]) {
-            shelf[i] = value;
-        } else {
-            grounded[i] = value;
-        }
-        if bed[i] <= 0. {
-            let monthly = freezing_cycle(&temperatures[i], -1.8);
-            for m in 0..12 {
-                sea[m][i] = monthly[m];
-            }
-        }
-    }
-    budget.residual_m3 = budget.snowfall_m3
-        - budget.surface_melt_m3
-        - budget.basal_melt_m3
-        - budget.calved_m3
-        - budget.boundary_export_m3
-        - budget.final_storage_m3;
-    let atlas = CryosphereAtlas {
-        model: MODEL.into(),
-        grid: descriptor,
-        spinup_years: years,
-        gravity_m_s2: gravity,
-        grounded_ice_m: grounded,
-        shelf_ice_m: shelf,
-        sea_ice_m: sea,
-        ice_budget: budget,
-    };
-    Some(sample(grid, fields, atlas, 0))
+    ice_sheet::solve(grid, fields, gravity, cancel)
 }
 
 /// Fine monthly weather is retained: sub-grid mountains and cold coastal seas
@@ -391,23 +246,44 @@ pub fn sample<G: GridOps>(
     fields: &WorldFields,
     atlas: CryosphereAtlas,
     month: u8,
-) -> Cryosphere {
-    let source = atlas.grid.build();
+    thickness: Option<(&[f32], &[f32])>,
+) -> Option<Cryosphere> {
+    if month > 12
+        || (atlas.model == MODEL
+            && (thickness.is_none() || atlas.ice_budget.solver_cells != grid.cell_count()))
+        || thickness
+            .is_some_and(|(a, b)| a.len() != grid.cell_count() || b.len() != grid.cell_count())
+        || thickness.is_some_and(|(a, b)| a.iter().chain(b).any(|v| !v.is_finite() || *v < 0.))
+    {
+        return None;
+    }
+    let source = thickness.is_none().then(|| atlas.grid.build());
     let climate_grid = fields.climate.as_ref().map(|a| a.grid.build());
     let values: Vec<[f32; 9]> = (0..grid.cell_count())
         .into_par_iter()
         .map(|i| {
             let dir = grid.center_dir(i);
             let land = fields.elevation[i] > 0.;
-            let stencil = weights(&source, dir);
-            let at = |v: &[f32]| stencil.iter().map(|&(j, w)| v[j] as f64 * w).sum::<f64>();
-            let mut ice = if land {
-                at(&atlas.grounded_ice_m).max(0.)
+            let stencil = source.as_ref().map(|g| weights(g, dir));
+            let at = |v: &[f32]| {
+                stencil
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|&(j, w)| v[j] as f64 * w)
+                    .sum::<f64>()
+            };
+            let mut ice = if land || thickness.is_some() {
+                thickness
+                    .map_or_else(|| at(&atlas.grounded_ice_m), |(a, _)| a[i] as f64)
+                    .max(0.)
             } else {
                 0.
             };
             let shelf = if !land {
-                at(&atlas.shelf_ice_m).max(0.)
+                thickness
+                    .map_or_else(|| at(&atlas.shelf_ice_m), |(_, b)| b[i] as f64)
+                    .max(0.)
             } else {
                 0.
             };
@@ -420,9 +296,16 @@ pub fn sample<G: GridOps>(
                     [0.; 12],
                 )
             };
-            if land {
+            if land || (thickness.is_some() && (ice > 0. || shelf > 0.)) {
+                let rise = if land {
+                    ice
+                } else if ice > 0. {
+                    (fields.elevation[i] as f64 + ice).max(0.)
+                } else {
+                    (1. - RHO_I / RHO_O) * shelf
+                };
                 for v in &mut t {
-                    *v -= (ice * 0.0065) as f32;
+                    *v -= (rise * 0.0065) as f32;
                 }
             }
             let cycle = if land {
@@ -446,7 +329,7 @@ pub fn sample<G: GridOps>(
             };
             // Perennial snow itself remains visible before a coarse glacier grows.
             let snow_cover = if land { cover(snow) } else { 0. };
-            if !land {
+            if !land && thickness.is_none() {
                 ice = 0.;
             }
             let sea_cover = if land {
@@ -510,7 +393,7 @@ pub fn sample<G: GridOps>(
         })
         .collect();
     let channel = |c| values.iter().map(|v| v[c]).collect();
-    Cryosphere {
+    Some(Cryosphere {
         land_ice_m: channel(0),
         snow_cover: channel(1),
         sea_ice_cover: channel(2),
@@ -521,17 +404,59 @@ pub fn sample<G: GridOps>(
         lake_ice_cover: channel(7),
         pet_mm_year: channel(8),
         atlas,
-    }
+    })
 }
 
 impl CryosphereAtlas {
     pub fn validate(&self) -> Result<(), String> {
-        if self.model != MODEL
+        if ![MODEL, LEGACY_MODEL].contains(&self.model.as_str())
             || self.spinup_years > 20000
             || !self.gravity_m_s2.is_finite()
             || self.gravity_m_s2 <= 0.
         {
             return Err("冰雪模型或尺寸无效".into());
+        }
+        let max_frequency = if self.model == MODEL { 56 } else { 32 };
+        match &self.grid {
+            GridDescriptor::Sphere {
+                frequency,
+                radius_m,
+                version,
+            } if (4..=max_frequency).contains(frequency)
+                && radius_m.is_finite()
+                && (1e6..=5e7).contains(radius_m)
+                && [tf_grid::GRID_VERSION, tf_grid::SPHERE_GRID_VERSION].contains(version) => {}
+            GridDescriptor::Plane { .. } | GridDescriptor::Patch { .. } => self.grid.validate()?,
+            _ => return Err("冰雪来源网格无效".into()),
+        }
+        let b = &self.ice_budget;
+        if [
+            b.snowfall_m3,
+            b.surface_melt_m3,
+            b.basal_melt_m3,
+            b.calved_m3,
+            b.boundary_export_m3,
+            b.final_storage_m3,
+        ]
+        .iter()
+        .any(|v| !v.is_finite() || *v < 0.)
+            || !b.residual_m3.is_finite()
+            || !b.rounding_m3.is_finite()
+        {
+            return Err("冰量收支无效".into());
+        }
+        if self.model == MODEL {
+            if self.ice_budget.solver_cells == 0
+                || self.ice_budget.solver_cells > 16_777_216
+                || self.ice_budget.peak_active_cells > self.ice_budget.solver_cells
+                || self.ice_budget.transport_steps > MAX_TRANSPORT_STEPS
+                || !self.grounded_ice_m.is_empty()
+                || !self.shelf_ice_m.is_empty()
+                || !self.sea_ice_m.is_empty()
+            {
+                return Err("新版冰雪必须使用地图网格上的保存字段".into());
+            }
+            return Ok(());
         }
         match &self.grid {
             GridDescriptor::Sphere {
@@ -732,6 +657,13 @@ mod tests {
             .enumerate()
             .all(|(i, &p)| f.elevation[i] <= 0. || p == 0.));
         ice.atlas.validate().unwrap();
+        let saved = (0..g.cell_count())
+            .map(|i| (ice.land_ice_m[i] + ice.shelf_ice_m[i]) as f64 * g.area_m2(i))
+            .sum::<f64>();
+        assert!((saved - b.final_storage_m3 - b.rounding_m3).abs() < b.final_storage_m3 * 1e-6);
+        assert_eq!(b.solver_cells, g.cell_count());
+        assert!(ice.atlas.grounded_ice_m.is_empty());
+        assert!(sample(&g, &f, ice.atlas.clone(), 1, None).is_none());
     }
     #[test]
     fn warm_climate_and_dry_cold_ground_do_not_invent_ice_sheets() {
@@ -755,6 +687,84 @@ mod tests {
         assert!(ice.land_ice_m.iter().all(|&h| h == 0.));
         assert!(ice.snow_cover.iter().all(|&h| h == 0.));
         assert!(ice.permafrost.iter().any(|&c| c > 0.9));
+    }
+
+    #[test]
+    fn fine_snowline_is_not_a_coarse_cell_footprint_and_months_keep_ice_identity() {
+        let descriptor = GridDescriptor::plane(35., 0., 1600000., 64, 32, 6371000.);
+        let g = descriptor.build();
+        let n = g.cell_count();
+        let climate_descriptor = GridDescriptor::plane(35., 0., 1600000., 8, 4, 6371000.);
+        let mut f = WorldFields::with_capacity(n);
+        f.elevation.fill(200.);
+        f.temperature.fill(20.);
+        f.precipitation.fill(600.);
+        let peak = n / 2 + 32;
+        f.elevation[peak] = 4000.;
+        f.temperature[peak] = -5.;
+        let m = climate_descriptor.cell_count();
+        f.climate = Some(ClimateAtlas {
+            grid: climate_descriptor,
+            model: "fixture".into(),
+            axial_tilt_deg: 23.44,
+            temperature_c: vec![vec![20.; m]; 12],
+            precipitation_mm: vec![vec![50.; m]; 12],
+            pet_mm: vec![vec![0.; m]; 12],
+            energy: Default::default(),
+            water: Default::default(),
+            circulation: None,
+        });
+        let ice = solve(&g, &f, 9.81, &|| false).unwrap();
+        assert!(ice.land_ice_m[peak] > 1.);
+        for i in 0..n {
+            if g.distance_m(peak, i) > 200000. {
+                assert!(ice.land_ice_m[i] < 1e-3, "remote warm cell {i}");
+            }
+        }
+        for month in [1, 7] {
+            let view = sample(
+                &g,
+                &f,
+                ice.atlas.clone(),
+                month,
+                Some((&ice.land_ice_m, &ice.shelf_ice_m)),
+            )
+            .unwrap();
+            assert_eq!(view.land_ice_m, ice.land_ice_m);
+            assert_eq!(view.shelf_ice_m, ice.shelf_ice_m);
+        }
+        let b = &ice.atlas.ice_budget;
+        let stored = (0..n)
+            .map(|i| (ice.land_ice_m[i] + ice.shelf_ice_m[i]) as f64 * g.area_m2(i))
+            .sum::<f64>();
+        assert!((stored - b.final_storage_m3 - b.rounding_m3).abs() < stored * 1e-6);
+    }
+
+    #[test]
+    fn map_grid_ice_is_not_subject_to_the_legacy_twelve_thousand_cell_limit() {
+        let g = GridDescriptor::sphere(40, 6371000.).build();
+        let n = g.cell_count();
+        let d = GridDescriptor::sphere(4, 6371000.);
+        let m = d.cell_count();
+        let mut f = WorldFields::with_capacity(n);
+        f.elevation.fill(100.);
+        f.temperature.fill(20.);
+        f.precipitation.fill(500.);
+        f.climate = Some(ClimateAtlas {
+            grid: d,
+            model: "fixture".into(),
+            axial_tilt_deg: 23.44,
+            temperature_c: vec![vec![20.; m]; 12],
+            precipitation_mm: vec![vec![42.; m]; 12],
+            pet_mm: vec![vec![0.; m]; 12],
+            energy: Default::default(),
+            water: Default::default(),
+            circulation: None,
+        });
+        let ice = solve(&g, &f, 9.81, &|| false).unwrap();
+        assert!(n > MAX_CELLS);
+        assert!(ice.land_ice_m.iter().all(|&h| h == 0.));
+        ice.atlas.validate().unwrap();
     }
     #[test]
     fn level_floating_shelves_have_no_index_driven_ice_transport() {
@@ -780,8 +790,22 @@ mod tests {
         let annual = solve(&g, &f, 9.81, &|| false).unwrap();
         assert!(annual.permafrost.iter().all(|&v| v > 0.5));
         assert!(annual.active_layer_m.iter().all(|&v| v > 0.1));
-        let winter = sample(&g, &f, annual.atlas.clone(), 1);
-        let summer = sample(&g, &f, annual.atlas.clone(), 7);
+        let winter = sample(
+            &g,
+            &f,
+            annual.atlas.clone(),
+            1,
+            Some((&annual.land_ice_m, &annual.shelf_ice_m)),
+        )
+        .unwrap();
+        let summer = sample(
+            &g,
+            &f,
+            annual.atlas.clone(),
+            7,
+            Some((&annual.land_ice_m, &annual.shelf_ice_m)),
+        )
+        .unwrap();
         assert!(winter.liquid_water_mm.iter().all(|&v| v == 0.));
         assert!(summer.liquid_water_mm.iter().all(|&v| v > 0.));
         assert!(annual.land_ice_m.iter().all(|&v| v == 0.));

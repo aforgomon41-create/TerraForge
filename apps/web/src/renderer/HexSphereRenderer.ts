@@ -399,7 +399,7 @@ export class HexSphereRenderer {
     if (!packed) {
       for (const location of [14, 15]) {
         gl.disableVertexAttribArray(location)
-        gl.vertexAttrib3f(location, 0, 0, 0)
+        gl.vertexAttrib4f(location, 0, 0, 0, 0)
       }
       gl.bindVertexArray(null)
       return
@@ -413,7 +413,7 @@ export class HexSphereRenderer {
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
       gl.bufferData(gl.ARRAY_BUFFER, values, gl.DYNAMIC_DRAW)
       gl.enableVertexAttribArray(location)
-      gl.vertexAttribPointer(location, 3, gl.FLOAT, false, 0, 0)
+      gl.vertexAttribPointer(location, location === 15 ? 4 : 3, gl.FLOAT, false, 0, 0)
     }
     gl.bindVertexArray(null)
   }

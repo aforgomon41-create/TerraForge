@@ -87,7 +87,9 @@ fn main() {
     let cryosphere = input.join("cryosphere.json");
     if cryosphere.is_file() {
         let atlas = serde_json::from_slice(&fs::read(cryosphere).unwrap()).unwrap();
-        f.cryosphere = Some(tf_sim::cryosphere::sample(&grid, &f, atlas, 0));
+        let ground=input.join("land_ice_m.bin");let shelf=input.join("ice_shelf_m.bin");
+        let canonical=if ground.is_file() && shelf.is_file() {Some((read(&ground),read(&shelf)))}else{None};
+        f.cryosphere = Some(tf_sim::cryosphere::sample(&grid, &f, atlas, 0,canonical.as_ref().map(|(a,b)|(a.as_slice(),b.as_slice()))).expect("saved fine ice is required for v2"));
     }
     let before = stats(&grid, &f);
     let height = f.elevation.clone();

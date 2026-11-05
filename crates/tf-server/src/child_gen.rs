@@ -141,9 +141,7 @@ pub fn run_child_generation(
         fields.temperature[i] -= (fields.elevation[i] - sample.elevation[i]) * 0.0065;
     }
     inherited_pet(&patch, &mut fields, params);
-    if let Some(atlas) = crate::cryosphere::for_map(store, &parent)? {
-        fields.cryosphere = Some(tf_sim::cryosphere::sample(&patch, &fields, atlas, 0));
-    } else if fields.climate.is_some() {
+    if fields.climate.is_some() {
         fields.cryosphere =
             tf_sim::cryosphere::solve(&patch, &fields, params.planet.surface_gravity(), &|| {
                 cancel.load(Ordering::Relaxed)

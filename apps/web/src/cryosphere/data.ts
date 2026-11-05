@@ -72,7 +72,7 @@ export function iceAttributes(ice: IceData | undefined, count: number, sourceIds
   if (ice.count !== count) throw new Error('冰雪字段长度与地表不一致')
   for (let j = 0; j < size; j++) {
     const i = sourceIds?.[j] ?? j
-    cover[j * 4] = Math.min(1, ice.landIce[i])
+    cover[j * 4] = 1 - Math.exp(-ice.landIce[i] / 3)
     cover[j * 4 + 1] = ice.seaIce[i]
     cover[j * 4 + 2] = 1 - Math.exp(-ice.shelf[i] / 30)
     cover[j * 4 + 3] = ice.snow[i]

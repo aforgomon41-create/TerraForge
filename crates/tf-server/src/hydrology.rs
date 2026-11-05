@@ -53,7 +53,10 @@ pub async fn get_hydrology(
             if let (Some(atlas),Some(t),Some(p))=(crate::cryosphere::for_map(&st.store,&node)?,&temp,&rain) {
                 let mut f=tf_sim::WorldFields{elevation:height.clone(),temperature:t.clone(),precipitation:p.clone(),lake_depth:lake.clone(),
                     flow_accumulation:vec![0.;n],potential_evaporation:vec![0.;n],climate:climate.clone(),..Default::default()};
-                f.cryosphere=Some(tf_sim::cryosphere::sample(&grid,&f,atlas,query.month));
+                let shelf=optional(Channel::IceShelf)?;
+                let canonical=if atlas.model==tf_sim::cryosphere::MODEL {ice.as_deref().zip(shelf.as_deref())} else {None};
+                let Some(view)=tf_sim::cryosphere::sample(&grid,&f,atlas,query.month,canonical) else{return Ok(json!({"available":false,"reason":"缺少与地图匹配的冰厚字段，请重新生成"}));};
+                f.cryosphere=Some(view);
                 let directions=receivers.iter().map(|&r|if r == -1. {Ok(u32::MAX)}else if r.is_finite() && r>=0. && r.fract()==0. && (r as usize)<n {Ok(r as u32)}else{Err(anyhow::anyhow!("水系下游编号无效"))}).collect::<anyhow::Result<Vec<_>>>()?;
                 let water=tf_sim::erosion::from_saved_receivers(&grid,&mut f,directions).map_err(anyhow::Error::msg)?;
                 discharge=Some(tf_sim::cryosphere::annual_discharge(&grid,&f,&water));monthly_liquid=true;

@@ -6,6 +6,7 @@ import {
   identificationName,
   type EcosystemData,
 } from './data.ts'
+import { ecosystemPaint } from './paint.ts'
 
 export const ecosystemModes = [
   { id: 0, name: '大类' },
@@ -132,8 +133,9 @@ export function ecosystemAttributes(
     throw Error('生态绘制资料尺寸或模式无效')
   const n = sourceIds?.length || count,
     colors = new Float32Array(n * 3),
-    paint = new Float32Array(n * 3),
+    paint = new Float32Array(n * 4),
     cache = new Map<number, number[]>()
+  const paintCache = new Map<number, number[]>()
   if (!data) return { colors, paint }
   const rgb = (b: number, g: number, v: number, m: number) => {
     const key = m * 1_000_000 + (b * 512 + (m ? g : 0)) * 64 + (m === 2 ? v : 0)
@@ -151,7 +153,13 @@ export function ecosystemAttributes(
       g = data.group[id],
       v = data.variant[id]
     colors.set(rgb(b, g, v, mode), i * 3)
-    paint.set(rgb(b, g, v, 2), i * 3)
+    const key = (b * 512 + g) * 64 + v
+    let natural = paintCache.get(key)
+    if (!natural) {
+      natural = ecosystemPaint(b, g, v)
+      paintCache.set(key, natural)
+    }
+    paint.set(natural, i * 4)
   }
   return { colors, paint }
 }

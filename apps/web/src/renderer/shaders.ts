@@ -1,7 +1,7 @@
 /** Shared vertices form a continuous surface; hex outlines are a separate pass. */
 export const VERT = `#version 300 es
 precision highp float;
-layout(location=14)in vec3 aEcosystemColor;layout(location=15)in vec3 aEcosystemPaint;uniform bool uHasEcosystems;uniform highp int uLayer;
+layout(location=14)in vec3 aEcosystemColor;layout(location=15)in vec4 aEcosystemPaint;uniform bool uHasEcosystems;uniform highp int uLayer;
 layout(location=12)in vec4 aCryosphere;layout(location=13)in vec2 aFrozen;out vec4 vCryosphere;out vec2 vFrozen;
 layout(location=10)in float aLake;out float vLake;out vec3 vMapPosition;
 layout(location=8)in float aGeography;out float vGeography;
@@ -10,7 +10,7 @@ layout(location=0)in vec3 aCenter;layout(location=1)in float aHeight;layout(loca
 uniform mat4 uViewProj;uniform float uRadius,uHeightScale;uniform bool uPlanarMode,uWorldFlatMode,uPreviewMode;uniform sampler2D uFrameTex,uFlowTex;uniform float uPreviewMinElev,uPreviewMaxElev,uPreviewHalfHeight;
 out vec3 vNormal,vPosition,vBiomeColor;out vec3 vPlateColor;out float vHeight,vBiome,vTemp,vPrecip,vFlow;
 out vec2 vAtlasPosition;
-out vec3 vPaintColor;out vec2 vVegetation;
+out vec3 vPaintColor;out vec4 vVegetation;out vec4 vEcosystemSurface;
 layout(location=11)in vec3 aHeightGradient;out vec3 vHeightGradient;
 vec3 biome(float value){int b=int(value+.5);
 if(b==1)return vec3(.91,.93,.90);if(b==2)return vec3(.65,.69,.58);if(b==3)return vec3(.30,.43,.32);if(b==4)return vec3(.40,.54,.34);if(b==5)return vec3(.66,.71,.43);if(b==6)return vec3(.65,.67,.44);if(b==7)return vec3(.81,.71,.50);if(b==8)return vec3(.73,.71,.45);if(b==9)return vec3(.25,.46,.32);if(b==10)return vec3(.37,.55,.34);if(b==11)return vec3(.67,.69,.55);if(b==12)return vec3(.36,.52,.44);if(b==13)return vec3(.20,.55,.63);return vec3(.55,.64,.56);}
@@ -39,9 +39,31 @@ void main(){
   }
   vAtlasPosition=aAtlasPosition.xy;
   int b=int(aBiome+.5);
-  vVegetation=uPreviewMode?vec2(0.):vec2((b==3||b==4||b==9||b==10)?1.:0.,b==1?1.:0.);
+  vVegetation=uPreviewMode?vec4(0.):vec4((b==3||b==4||b==9||b==10)?1.:0.,b==1?1.:0.,b==3?1.:0.,b==6?.8:0.);
+  vEcosystemSurface=vec4(0.);
   vPaintColor=uPreviewMode?mix(vec3(.80,.70,.40),vec3(.35,.53,.30),clamp(vPrecip/1800.,0.,1.)):paintedBiome(aBiome);
-  if(uHasEcosystems&&!uPreviewMode)vPaintColor=mix(vPaintColor,aEcosystemPaint,.28);
+  if(uHasEcosystems&&!uPreviewMode){
+    vPaintColor=aEcosystemPaint.rgb;
+    int material=int(aEcosystemPaint.w+.5);
+    // Decode categorical IDs before interpolation across ecotones and seams.
+    vVegetation=vec4(0.);vEcosystemSurface=vec4(0.);
+    if(material>=1&&material<=7){vVegetation.x=material==2?.62:1.;vVegetation.z=material==5?1.:(material==6?.45:0.);}
+    if(material==1)vVegetation.w=.08;
+    if(material==2){vVegetation.w=.18;vEcosystemSurface.x=.25;}
+    if(material==3){vVegetation.z=.15;vEcosystemSurface.y=.35;}
+    if(material==4){vVegetation.x=.82;vVegetation.w=.12;vEcosystemSurface.x=.2;}
+    if(material==6){vVegetation.x=.9;vVegetation.w=.15;}
+    if(material==7){vVegetation.x=.65;vVegetation.w=.28;vEcosystemSurface.x=.3;}
+    if(material==8||material==9)vVegetation.w=.8;
+    if(material==10||material==11||material==13||material==17)vEcosystemSurface.x=1.;
+    if(material==11){vVegetation.x=.18;vVegetation.w=.2;}
+    if(material==15)vVegetation.y=1.;
+    if(material==16)vEcosystemSurface.z=1.;
+    if(material==18){vVegetation.w=.2;vEcosystemSurface.x=.5;}
+    if(material==19){vVegetation.x=1.;vEcosystemSurface.y=.8;}
+    if(material==20||material==21){vVegetation.w=.25;vEcosystemSurface.y=1.;}
+    if(material==12||material==14)vEcosystemSurface.w=1.;
+  }
   vNormal=n;vPosition=uPlanarMode?aCenter:n;vBiomeColor=uPreviewMode?mix(vec3(.79,.72,.52),vec3(.42,.59,.39),clamp(vPrecip/1800.,0.,1.)):(uHasEcosystems&&uLayer==3?aEcosystemColor:biome(aBiome));
   gl_Position=uViewProj*vec4(pos,1.);
 }`
@@ -53,7 +75,7 @@ in float vGeography;uniform bool uGeographyActive;
 in vec3 vPartitionColor;in float vPartitionPresent;
 in vec3 vNormal,vPosition,vBiomeColor;in vec3 vPlateColor;in float vHeight,vBiome,vTemp,vPrecip,vFlow;
 in vec2 vAtlasPosition;
-in vec3 vPaintColor;in vec2 vVegetation;
+in vec3 vPaintColor;in vec4 vVegetation;in vec4 vEcosystemSurface;
 in vec3 vHeightGradient;uniform bool uPreviewMode;
 uniform sampler2D uPigmentTex;
 uniform bool uPlanarMode,uWorldFlatMode;uniform float uMapMetres;uniform vec3 uLightDir;uniform highp int uStyle,uLayer,uProjection;out vec4 fragColor;
@@ -103,14 +125,21 @@ vec3 gameMap(){
     sea*=(1.+wash*1.8)*(.94+.06*shade);
     float seaIce=clamp(vCryosphere.y*(.96+.04*grain),0.,1.);
     sea=mix(sea,vec3(.85,.94,.95)*(.96+wash*.25),seaIce);
-    return mix(sea,vec3(.93,.96,.95)*(.96+wash*.18),clamp(vCryosphere.z,0.,1.));
+    return mix(sea,vec3(.93,.96,.95)*(.96+wash*.18),clamp(max(vCryosphere.x,vCryosphere.z),0.,1.));
   }
   vec3 color=vPaintColor;
   float slope=1.-max(dot(normal,up),0.);
   float rock=smoothstep(1800.,4800.,vHeight)*.60+smoothstep(.16,.65,slope)*.22;
   color=mix(color,vec3(.64,.57,.44),min(rock,.78));
   float forest=clamp(vVegetation.x,0.,1.);
-  color*=1.-forest*smoothstep(.35,.8,grain)*.16*visible;
+  float needle=terrainGrain(p*vec3(115.,55.,115.));
+  float crowns=mix(smoothstep(.35,.8,grain),smoothstep(.43,.72,needle),clamp(vVegetation.z,0.,1.));
+  color*=1.-forest*crowns*.22*visible;
+  color*=1.-vVegetation.w*smoothstep(.48,.72,brush)*.11;
+  color+=vec3(.035,.027,-.012)*vEcosystemSurface.x*(grain-.5)*visible;
+  color=mix(color,color*vec3(.87,.94,.91),vEcosystemSurface.y*(.25+.35*brush));
+  color=mix(color,vec3(.57,.53,.46),vEcosystemSurface.z*.3*smoothstep(.25,.75,grain)*visible);
+  color+=vec3(.025,.016,.005)*vEcosystemSurface.w*(brush-.5);
   color*=shade*(1.+wash+(grain-.5)*.04*visible);
   float snow=uHasCryosphere?max(vCryosphere.x,vCryosphere.w):max(clamp(vVegetation.y,0.,1.),smoothstep(4200.,5700.,vHeight)*(1.-smoothstep(-8.,5.,vTemp)));
   color=mix(color,vec3(.93,.96,.94)*(.88+.12*shade+wash*.3),snow);
@@ -130,8 +159,8 @@ else{
   if(uStyle==2)color=mix(color,vec3(.94,.90,.79),.16);
   if(uStyle==3&&vHeight>0.){color=elevation(vHeight);float contour=abs(fract(vHeight/200.-.5)-.5)/max(fwidth(vHeight/200.),1.e-5);color=mix(color,vec3(.32,.32,.23),(1.-min(contour,1.))*.55);}
 }
-if(uLayer==11){color=vHeight<=0.?mix(vec3(.19,.40,.53),vec3(.84,.94,.95),clamp(vCryosphere.y,0.,1.)):mix(vec3(.70,.74,.61),vec3(.57,.49,.68),clamp(vFrozen.x,0.,1.));if(vHeight>0.&&vLake>.5)color=mix(color,mix(vec3(.19,.40,.53),vec3(.84,.94,.95),clamp(vFrozen.y,0.,1.)),smoothstep(.5,3.,vLake));color=mix(color,vec3(.97,.98,.96),clamp(vHeight<=0.?vCryosphere.z:max(vCryosphere.x,vCryosphere.w),0.,1.));}
-if(uLayer==0&&uHasCryosphere&&!uPreviewMode){float ice=vHeight<=0.?max(vCryosphere.y,vCryosphere.z):max(max(vCryosphere.x,vCryosphere.w),vLake>.5?vFrozen.y:0.);color=mix(color,vec3(.91,.96,.95),clamp(ice,0.,1.));}
+if(uLayer==11){color=vHeight<=0.?mix(vec3(.19,.40,.53),vec3(.84,.94,.95),clamp(vCryosphere.y,0.,1.)):mix(vec3(.70,.74,.61),vec3(.57,.49,.68),clamp(vFrozen.x,0.,1.));if(vHeight>0.&&vLake>.5)color=mix(color,mix(vec3(.19,.40,.53),vec3(.84,.94,.95),clamp(vFrozen.y,0.,1.)),smoothstep(.5,3.,vLake));color=mix(color,vec3(.97,.98,.96),clamp(vHeight<=0.?max(vCryosphere.x,vCryosphere.z):max(vCryosphere.x,vCryosphere.w),0.,1.));}
+if(uLayer==0&&uHasCryosphere&&!uPreviewMode){float ice=vHeight<=0.?max(vCryosphere.x,max(vCryosphere.y,vCryosphere.z)):max(max(vCryosphere.x,vCryosphere.w),vLake>.5?vFrozen.y:0.);color=mix(color,vec3(.91,.96,.95),clamp(ice,0.,1.));}
 if(uGeographyActive){float member=smoothstep(.25,.75,vGeography);color=mix(mix(color,vec3(.94,.92,.85),.48),mix(color,vec3(.28,.52,.36),.22),member);}
 fragColor=vec4(color,1.);
 }`
