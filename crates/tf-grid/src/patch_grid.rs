@@ -74,6 +74,12 @@ pub struct PatchGrid {
 
 impl PatchGrid {
     pub fn new(patch: &SphericalPatch) -> Self {
+        Self::build(patch, true)
+    }
+    pub fn legacy(patch: &SphericalPatch) -> Self {
+        Self::build(patch, false)
+    }
+    fn build(patch: &SphericalPatch, metric_area: bool) -> Self {
         assert!(patch.size > 0 && patch.width_m > 0. && patch.radius_m > 0.);
         let n = (patch.size * patch.size) as usize;
         let center = patch.center_vec();
@@ -111,7 +117,30 @@ impl PatchGrid {
 
                 centers.push(u);
                 lat_deg.push(lat);
-                areas.push(area);
+                let cell_area = if metric_area {
+                    let corner = |k: usize| {
+                        let angle =
+                            std::f64::consts::PI / 6. + k as f64 * std::f64::consts::PI / 3.;
+                        let ax = (px + hex_size * angle.cos()) / patch.radius_m;
+                        let ay = (py + hex_size * angle.sin()) / patch.radius_m;
+                        (center.as_vec() + east * ax.tan() + north * ay.tan()).normalize()
+                    };
+                    (0..6)
+                        .map(|k| {
+                            let a = dir;
+                            let b = corner(k);
+                            let c = corner((k + 1) % 6);
+                            2. * a
+                                .dot(b.cross(c))
+                                .abs()
+                                .atan2(1. + a.dot(b) + b.dot(c) + c.dot(a))
+                                * patch.radius_m.powi(2)
+                        })
+                        .sum()
+                } else {
+                    area
+                };
+                areas.push(cell_area);
             }
         }
 
@@ -189,6 +218,18 @@ impl PatchGrid {
             ((col as f64 + (row % 2) as f64 * 0.5) - half - 0.25) * self.cell_size_m,
             (half - row as f64) * self.cell_size_m * (3.0_f64).sqrt() / 2.,
         )
+    }
+
+    pub fn direction_at_local(&self, x: f64, y: f64) -> UnitVec3 {
+        UnitVec3::from_normalized(
+            (self.center.as_vec()
+                + self.east * (x / self.radius_m).tan()
+                + self.north * (y / self.radius_m).tan())
+            .normalize(),
+        )
+    }
+    pub fn origin(&self) -> UnitVec3 {
+        self.center
     }
 
     pub fn cell_at(&self, dir: UnitVec3) -> Option<usize> {

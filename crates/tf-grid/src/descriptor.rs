@@ -7,6 +7,7 @@ pub const GRID_VERSION: u32 = 2;
 /// Version 3 joins spherical faces continuously; version 2 stays readable.
 pub const SPHERE_GRID_VERSION: u32 = 3;
 pub const PLANE_GRID_VERSION: u32 = 3;
+pub const PATCH_GRID_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -52,7 +53,7 @@ impl GridDescriptor {
             width_m: width,
             size,
             radius_m: radius,
-            version: GRID_VERSION,
+            version: PATCH_GRID_VERSION,
         }
     }
     pub fn plane(lat: f64, lon: f64, width: f64, size: u32, rows: u32, radius: f64) -> Self {
@@ -137,14 +138,14 @@ impl GridDescriptor {
                 radius_m,
                 version,
             } => {
-                if *version != GRID_VERSION
+                if ![GRID_VERSION, PATCH_GRID_VERSION].contains(version)
                     || !center_lat.is_finite()
                     || !(-90.0..=90.0).contains(center_lat)
                     || !center_lon.is_finite()
                     || !(-180.0..=180.0).contains(center_lon)
                     || !width_m.is_finite()
                     || *width_m <= 0.
-                    || *width_m > *radius_m * 0.8
+                    || *width_m > *radius_m * if *version == GRID_VERSION { 0.8 } else { 2.4 }
                     || !(4..=4096).contains(size)
                 {
                     return Err("局部网格的坐标、尺寸或版本无效".into());
@@ -188,10 +189,16 @@ impl GridDescriptor {
                 width_m,
                 size,
                 radius_m,
-                ..
-            } => MapGrid::Patch(PatchGrid::new(&SphericalPatch::with_radius(
-                center_lat, center_lon, width_m, size, radius_m,
-            ))),
+                version,
+            } => {
+                let spec =
+                    SphericalPatch::with_radius(center_lat, center_lon, width_m, size, radius_m);
+                MapGrid::Patch(if version == GRID_VERSION {
+                    PatchGrid::legacy(&spec)
+                } else {
+                    PatchGrid::new(&spec)
+                })
+            }
         }
     }
 }
@@ -317,5 +324,43 @@ impl GridOps for MapGrid {
             Self::Patch(g) => g.boundary_mask(),
             Self::Plane(g) => g.boundary_mask(),
         }
+    }
+}
+
+#[cfg(test)]
+mod patch_version_tests {
+    use super::*;
+    #[test]
+    fn large_continent_patch_roundtrips_and_legacy_areas_stay_readable() {
+        let desc = GridDescriptor::patch(35., 170., 12_000_000., 64, 6_371_000.);
+        desc.validate().unwrap();
+        let grid = desc.build();
+        for i in 0..grid.cell_count() {
+            assert_eq!(grid.cell_at(grid.center_dir(i)), Some(i));
+            assert!(grid.area_m2(i).is_finite() && grid.area_m2(i) > 0.);
+        }
+        assert!((grid.area_m2(0) - grid.area_m2(grid.cell_count() / 2 + 32)).abs() > 1e6);
+        let old = GridDescriptor::Patch {
+            center_lat: 0.,
+            center_lon: 0.,
+            width_m: 1_000_000.,
+            size: 32,
+            radius_m: 6_371_000.,
+            version: 2,
+        };
+        old.validate().unwrap();
+        let g = old.build();
+        let expected = (1_000_000_f64 / 32.).powi(2) * 3_f64.sqrt() / 2.;
+        assert_eq!(g.area_m2(0), expected);
+        assert_eq!(g.area_m2(0), g.area_m2(500));
+        let too_wide = GridDescriptor::Patch {
+            center_lat: 0.,
+            center_lon: 0.,
+            width_m: 12_000_000.,
+            size: 32,
+            radius_m: 6_371_000.,
+            version: 2,
+        };
+        assert!(too_wide.validate().is_err());
     }
 }

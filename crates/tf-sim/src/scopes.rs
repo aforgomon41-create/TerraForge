@@ -6,6 +6,23 @@ use tf_core::{
     DeterministicRng,
 };
 use tf_grid::GridOps;
+#[derive(Clone, Copy)]
+struct Reach {
+    a: (f64, f64),
+    b: (f64, f64),
+    za: f64,
+    zb: f64,
+}
+impl Reach {
+    fn surface(&self, u: f64, v: f64, relief: f64, shape: f64) -> f64 {
+        let dx = self.b.0 - self.a.0;
+        let dy = self.b.1 - self.a.1;
+        let t = (((u - self.a.0) * dx + (v - self.a.1) * dy) / (dx * dx + dy * dy).max(1e-12))
+            .clamp(0., 1.);
+        let d = (u - self.a.0 - t * dx).hypot(v - self.a.1 - t * dy);
+        self.za * (1. - t) + self.zb * t + relief * (d / 0.25).powf(shape)
+    }
+}
 pub fn local_terrain<G: GridOps>(
     grid: &G,
     fields: &mut WorldFields,
@@ -19,32 +36,97 @@ pub fn local_terrain<G: GridOps>(
         .extent_m()
         .expect("local roots require a finite domain");
     let size = w.min(h);
+    // A connected, downhill trunk and tributaries define valleys and divides.
+    // Noise adds small rock/soil texture, rather than deciding every landform.
+    let along = (c.abs() * w + s.abs() * h) / size;
+    let across = (s.abs() * w + c.abs() * h) / size;
+    let trunk = |u: f64| 0.06 * (u * 5. + angle).sin() + 0.025 * (u * 11. + angle * 2.).sin();
+    let relief = params.terrain_relief_m;
+    let (valley_relief, gradient, shape) = match params.landscape {
+        LandscapeKind::Mountains => (relief * 0.75, relief * 0.45, 0.85),
+        LandscapeKind::Valley => (relief * 0.6, relief * 0.12, 1.15),
+        LandscapeKind::Hills => (relief * 0.26, relief * 0.13, 1.1),
+        LandscapeKind::Plains => (relief * 0.025, relief * 0.035, 1.4),
+        LandscapeKind::Coast => (relief * 0.22, relief * 0.6, 1.05),
+    };
+    let bed = |u: f64| {
+        if params.landscape == LandscapeKind::Coast {
+            relief * (0.1 - u) * 0.6
+        } else {
+            params.base_elevation_m + gradient * (0.5 - u / along)
+        }
+    };
+    let mut reaches = Vec::new();
+    for k in 0..24 {
+        let a = -along * 0.6 + along * 1.2 * k as f64 / 24.;
+        let b = -along * 0.6 + along * 1.2 * (k + 1) as f64 / 24.;
+        reaches.push(Reach {
+            a: (a, trunk(a)),
+            b: (b, trunk(b)),
+            za: bed(a),
+            zb: bed(b),
+        });
+    }
+    for k in 0..14 {
+        let side = if k % 2 == 0 { 1. } else { -1. };
+        let join = -along * 0.42 + along * 0.84 * (k as f64 + rng.range_f64(0.1, 0.9)) / 14.;
+        let head = (
+            join - rng.range_f64(0.07, 0.27) * along,
+            side * rng.range_f64(0.24, 0.62) * across,
+        );
+        let mid = (
+            (head.0 + join) / 2. - rng.range_f64(-0.04, 0.04),
+            head.1 * 0.52 + trunk(join) * 0.48,
+        );
+        let z = bed(join);
+        let rise = valley_relief * rng.range_f64(0.12, 0.38);
+        reaches.push(Reach {
+            a: head,
+            b: mid,
+            za: z + rise,
+            zb: z + rise * 0.4,
+        });
+        reaches.push(Reach {
+            a: mid,
+            b: (join, trunk(join)),
+            za: z + rise * 0.4,
+            zb: z,
+        });
+        let fork = (
+            mid.0 - rng.range_f64(0.04, 0.16) * along,
+            mid.1 + side * rng.range_f64(0.12, 0.25) * across,
+        );
+        reaches.push(Reach {
+            a: fork,
+            b: mid,
+            za: z + rise * 0.9,
+            zb: z + rise * 0.4,
+        });
+    }
     for i in 0..grid.cell_count() {
         let (x, y) = grid.local_center_m(i).unwrap();
         let u = (c * x + s * y) / size;
         let v = (-s * x + c * y) / size;
         let detail = noise.fbm(u * 6., v * 6., 31., 4, 2., 0.5);
         let broad = noise.fbm(u * 1.8, v * 1.8, 17., 3, 2., 0.5);
-        let channel = v - 0.10 * (u * 7. + angle).sin() - 0.05 * broad;
-        let height = match params.landscape {
-            LandscapeKind::Hills => {
-                params.base_elevation_m + params.terrain_relief_m * (0.35 * broad + 0.10 * detail)
+        let valley = reaches
+            .iter()
+            .map(|r| r.surface(u, v, valley_relief, shape))
+            .fold(f64::INFINITY, f64::min);
+        let texture = relief
+            * if params.landscape == LandscapeKind::Plains {
+                0.003
+            } else {
+                0.018
             }
-            LandscapeKind::Plains => {
-                params.base_elevation_m + params.terrain_relief_m * (0.10 * broad + 0.03 * detail)
-            }
-            LandscapeKind::Mountains => {
-                params.base_elevation_m
-                    + params.terrain_relief_m
-                        * ((-channel.powi(2) / 0.045).exp() * (0.75 + 0.2 * detail) + 0.15 * broad)
-            }
-            LandscapeKind::Valley => {
-                params.base_elevation_m
-                    + params.terrain_relief_m * ((channel.abs() * 2.).powf(0.8) + 0.05 * detail)
-            }
-            LandscapeKind::Coast => {
-                params.terrain_relief_m * (u + 0.15 * broad + 0.025 * detail) * 2.
-            }
+            * (detail + 0.25 * broad);
+        let height = if params.landscape == LandscapeKind::Coast {
+            // An indented continental edge and estuary share the same drainage
+            // base level. Tributaries continue inland instead of island chains.
+            let shore = relief * (0.10 - u + 0.065 * broad + 0.018 * detail) * 1.2;
+            shore.min(valley + texture)
+        } else {
+            valley + texture
         };
         fields.elevation[i] = height as f32;
         fields.crust_type[i] = if height > 0. { 1. } else { 0. };

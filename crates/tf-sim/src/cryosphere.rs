@@ -23,6 +23,8 @@ pub const MAX_TRANSPORT_STEPS: usize = 2_000_000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IceBudget {
+    #[serde(default)]
+    pub initial_storage_m3: f64,
     pub snowfall_m3: f64,
     pub surface_melt_m3: f64,
     pub basal_melt_m3: f64,
@@ -239,6 +241,18 @@ pub fn solve<G: GridOps>(
     ice_sheet::solve(grid, fields, gravity, cancel)
 }
 
+/// Downscale actual parent ice, then relax on the finer geometry. This is a
+/// regional initial-condition solve, not another fresh planetary spinup.
+pub fn solve_refinement<G: GridOps>(
+    grid: &G,
+    fields: &WorldFields,
+    gravity: f64,
+    initial: (&[f32], &[f32]),
+    cancel: &dyn Fn() -> bool,
+) -> Option<Cryosphere> {
+    ice_sheet::solve_from(grid, fields, gravity, Some(initial), 500, cancel)
+}
+
 /// Fine monthly weather is retained: sub-grid mountains and cold coastal seas
 /// are not forced to inherit the coarse cell's land/sea classification.
 pub fn sample<G: GridOps>(
@@ -431,6 +445,7 @@ impl CryosphereAtlas {
         }
         let b = &self.ice_budget;
         if [
+            b.initial_storage_m3,
             b.snowfall_m3,
             b.surface_melt_m3,
             b.basal_melt_m3,
@@ -525,30 +540,146 @@ pub fn update_water_surfaces<G: GridOps>(grid: &G, fields: &mut WorldFields) {
 }
 
 /// Annual liquid support in m3/s. Contributing area remains a separate channel.
+/// Local monthly runoff, annualized m3/s, using the same snow/PET equations as
+/// the month-view endpoint. No sea-ice spinup or fine atlas duplication needed.
+pub fn liquid_background<G: GridOps>(
+    grid: &G,
+    fields: &WorldFields,
+    ice: Option<&[f32]>,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let climate_grid = fields.climate.as_ref().map(|a| a.grid.build());
+    let data: Option<Vec<(f32, f32)>> = (0..grid.cell_count())
+        .into_par_iter()
+        .map(|i| {
+            if cancel() {
+                return None;
+            }
+            let dir = grid.center_dir(i);
+            let (mut t, p) = if let (Some(a), Some(g)) = (&fields.climate, &climate_grid) {
+                let (t, p, _) = a.sample(g, dir, fields.temperature[i], fields.precipitation[i]);
+                (t, p)
+            } else {
+                (
+                    [fields.temperature[i]; 12],
+                    [fields.precipitation[i] / 12.; 12],
+                )
+            };
+            let h = ice.and_then(|v| v.get(i)).copied().unwrap_or(0.).max(0.) as f64;
+            for v in &mut t {
+                *v -= (h * 0.0065) as f32;
+            }
+            let snow = snow_cycle(&t, &p, h);
+            let pet = crate::scientific::monthly_pet(
+                &t,
+                dir.to_lat_lon_deg().0.to_radians(),
+                fields
+                    .climate
+                    .as_ref()
+                    .map_or(23.44, |a| a.axial_tilt_deg)
+                    .to_radians(),
+            );
+            Some((snow.liquid.iter().sum::<f64>() as f32, pet.iter().sum()))
+        })
+        .collect();
+    Some(data?.into_iter().unzip())
+}
+
+pub fn runoff_climatology<G: GridOps>(
+    grid: &G,
+    fields: &WorldFields,
+    ice: Option<&[f32]>,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Option<Vec<[f64; 13]>> {
+    let climate_grid = fields.climate.as_ref().map(|a| a.grid.build());
+    (0..grid.cell_count())
+        .into_par_iter()
+        .map(|i| {
+            if cancel() {
+                return None;
+            }
+            if fields.elevation[i] <= 0. {
+                return Some([0.; 13]);
+            }
+            let dir = grid.center_dir(i);
+            let (mut t, p) = if let (Some(a), Some(g)) = (&fields.climate, &climate_grid) {
+                let (t, p, _) = a.sample(g, dir, fields.temperature[i], fields.precipitation[i]);
+                (t, p)
+            } else {
+                (
+                    [fields.temperature[i]; 12],
+                    [fields.precipitation[i] / 12.; 12],
+                )
+            };
+            let h = ice.and_then(|a| a.get(i)).copied().unwrap_or(0.).max(0.) as f64;
+            for v in &mut t {
+                *v -= (h * 0.0065) as f32;
+            }
+            let snow = snow_cycle(&t, &p, h);
+            let pet = crate::scientific::monthly_pet(
+                &t,
+                dir.to_lat_lon_deg().0.to_radians(),
+                fields
+                    .climate
+                    .as_ref()
+                    .map_or(23.44, |a| a.axial_tilt_deg)
+                    .to_radians(),
+            );
+            // Annual support uses the same source as annual_discharge. Normalize
+            // the seasonal shape to it, so opening January cannot create a second
+            // model with a different annual water supply.
+            let annual_liquid = fields.liquid_water()[i];
+            let annual_pet = fields.runoff_pet(i);
+            let annual = crate::lakes::annual_runoff_m(annual_liquid as f64, annual_pet as f64)
+                * grid.area_m2(i)
+                / YEAR;
+            let seasonal: [f64; 12] = std::array::from_fn(|m| {
+                crate::lakes::annual_runoff_m(snow.liquid[m] * 12., pet[m] as f64 * 12.)
+                    * grid.area_m2(i)
+                    / YEAR
+            });
+            let mean = seasonal.iter().sum::<f64>() / 12.;
+            Some(std::array::from_fn(|m| {
+                if m == 0 {
+                    annual
+                } else if mean > 0. {
+                    seasonal[m - 1] * annual / mean
+                } else {
+                    annual
+                }
+            }))
+        })
+        .collect()
+}
+
 pub fn annual_discharge<G: GridOps>(
     grid: &G,
     fields: &WorldFields,
     water: &crate::erosion::ErosionState,
 ) -> Vec<f32> {
-    let input = fields
-        .cryosphere
-        .as_ref()
-        .map(|c| c.liquid_water_mm.as_slice())
-        .unwrap_or(&fields.precipitation);
+    let input = fields.liquid_water();
     let mut flux: Vec<f64> = (0..grid.cell_count())
         .map(|i| {
-            if fields.elevation[i] > 0. {
-                crate::lakes::annual_runoff_m(
-                    input[i] as f64,
-                    fields.cryosphere.as_ref().map_or(
-                        fields.potential_evaporation.get(i).copied().unwrap_or(0.),
-                        |c| c.pet_mm_year[i],
-                    ) as f64,
-                ) * grid.area_m2(i)
-                    / YEAR
-            } else {
-                0.
-            }
+            let external = fields.external_water_m3_yr.get(i).copied().unwrap_or(0.) / YEAR;
+            external
+                + if fields.elevation[i] > 0. {
+                    let liquid = input[i].max(0.) as f64;
+                    let pet = fields.runoff_pet(i).max(0.) as f64;
+                    let runoff =
+                        crate::lakes::annual_runoff_m(input[i] as f64, fields.runoff_pet(i) as f64);
+                    let land_et = (liquid / 1000. - runoff).max(0.);
+                    (runoff
+                        - (pet / 1000. - land_et).max(0.)
+                            * fields
+                                .lake_runoff_loss_fraction
+                                .get(i)
+                                .copied()
+                                .unwrap_or(0.) as f64)
+                        * grid.area_m2(i)
+                        / YEAR
+                } else {
+                    0.
+                }
         })
         .collect();
     for &cell in &water.topo_order {
@@ -558,7 +689,7 @@ pub fn annual_discharge<G: GridOps>(
             flux[j as usize] += flux[i];
         }
     }
-    flux.into_iter().map(|v| v as f32).collect()
+    flux.into_iter().map(|v| v.max(0.) as f32).collect()
 }
 
 #[cfg(test)]
@@ -638,6 +769,27 @@ mod tests {
             circulation: None,
         });
         (grid, f)
+    }
+    #[test]
+    fn regional_ice_relaxation_retains_and_accounts_for_parent_storage() {
+        let (g, f) = fixture();
+        let n = g.cell_count();
+        let ground = vec![120.; n];
+        let shelf = vec![0.; n];
+        let ice = solve_refinement(&g, &f, 9.81, (&ground, &shelf), &|| false).unwrap();
+        let b = &ice.atlas.ice_budget;
+        let initial = (0..n).map(|i| 120. * g.area_m2(i)).sum::<f64>();
+        assert_eq!(b.initial_storage_m3, initial);
+        assert_eq!(ice.atlas.spinup_years, 500);
+        assert!(b.residual_m3.abs() < (initial + b.snowfall_m3) * 1e-9);
+        ice.atlas.validate().unwrap();
+        assert!(solve_refinement(&g, &f, 9.81, (&ground[..n - 1], &shelf), &|| false).is_none());
+        let (liquid, pet) = liquid_background(&g, &f, Some(&ground), &|| false).unwrap();
+        assert!(liquid
+            .iter()
+            .zip(&pet)
+            .all(|(p, e)| p.is_finite() && e.is_finite() && *p >= 0. && *e >= 0.));
+        assert!(liquid_background(&g, &f, None, &|| true).is_none());
     }
     #[test]
     fn cold_snow_builds_ice_shelves_with_a_closed_solid_water_budget() {

@@ -49,6 +49,19 @@ pub struct WorldFields {
     pub flow_accumulation: Vec<f32>,
     /// Final liquid-supported discharge (m³/s), empty until final hydrology.
     pub liquid_discharge: Vec<f32>,
+    /// Explicit water/area supplied from outside a finite refinement domain.
+    /// Empty for global and legacy maps. Water is annualized m3/year.
+    pub external_water_m3_yr: Vec<f64>,
+    pub external_area_m2: Vec<f64>,
+    /// Prescribed downstream water levels, independent of the ground surface.
+    pub boundary_stages: Vec<(u32, f64)>,
+    /// Additional lake ET fraction before externally held backwater is applied.
+    /// Empty preserves legacy/global runoff behaviour; persisted on new crops.
+    pub lake_runoff_loss_fraction: Vec<f32>,
+    /// Transient seasonal background for a refinement halo; never published as
+    /// a solved ice atlas. Empty outside that pre-final-ice calculation.
+    pub liquid_background_mm: Vec<f32>,
+    pub pet_background_mm: Vec<f32>,
     /// 年度水量平衡支持的实际湖深，米。0 表示无水，不是地形填洼容量。
     pub lake_depth: Vec<f32>,
 }
@@ -77,12 +90,36 @@ impl WorldFields {
             distance_to_sea: vec![0.0; n],
             flow_accumulation: vec![0.0; n],
             liquid_discharge: Vec::new(),
+            external_water_m3_yr: Vec::new(),
+            external_area_m2: Vec::new(),
+            boundary_stages: Vec::new(),
+            lake_runoff_loss_fraction: Vec::new(),
+            liquid_background_mm: Vec::new(),
+            pet_background_mm: Vec::new(),
             lake_depth: vec![0.0; n],
         }
     }
 
     pub fn len(&self) -> usize {
         self.elevation.len()
+    }
+    pub fn liquid_water(&self) -> &[f32] {
+        if let Some(c) = &self.cryosphere {
+            &c.liquid_water_mm
+        } else if self.liquid_background_mm.len() == self.len() {
+            &self.liquid_background_mm
+        } else {
+            &self.precipitation
+        }
+    }
+    pub fn runoff_pet(&self, i: usize) -> f32 {
+        if let Some(c) = &self.cryosphere {
+            c.pet_mm_year[i]
+        } else if self.pet_background_mm.len() == self.len() {
+            self.pet_background_mm[i]
+        } else {
+            self.potential_evaporation.get(i).copied().unwrap_or(0.)
+        }
     }
 
     pub fn is_empty(&self) -> bool {

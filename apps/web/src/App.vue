@@ -7,6 +7,8 @@ import {
   type TectonicDiagnostic,
   type CirculationDiagnostic,
   type HydrologyDiagnostic,
+  type RefinementPlan,
+  type RefinementQuery,
 } from '@/api/client'
 import { HexSphereRenderer, MapStyle } from '@/renderer/HexSphereRenderer'
 import { buildSphereGrid } from '@/renderer/sphereGrid'
@@ -42,6 +44,7 @@ import {
 } from '@/geography/view'
 import AgentPanel from '@/components/AgentPanel.vue'
 import EcosystemPanel from '@/components/EcosystemPanel.vue'
+import RefinementPanel from '@/components/RefinementPanel.vue'
 import { ecosystemAt, ecosystemModes } from '@/ecosystems/view'
 import { evolutionClock } from '@/generation/progress'
 const store = useWorldStore(),
@@ -132,6 +135,15 @@ const manualLat = ref('0'),
   refine = ref(false),
   ended = ref(false)
 const activeFeatureId = ref<number | null>(null)
+const childScope = ref<'full' | 'custom'>('custom'),
+  childPrecision = ref<'auto' | 'fixed'>('auto'),
+  childSpacing = ref(1000),
+  childPlan = shallowRef<RefinementPlan | null>(null),
+  childPlanLoading = ref(false),
+  childPlanError = ref('')
+let childPlanKey = ''
+let childPlanController: AbortController | undefined,
+  childPlanTimer: ReturnType<typeof setTimeout> | undefined
 const activeFeature = computed(() =>
   activeFeatureId.value ? store.geography?.features[activeFeatureId.value - 1] : null,
 )
@@ -353,10 +365,81 @@ const activeLayer = computed(() => layers.find((l) => l.id === liveLayer.value)!
 const locked = computed(() => busy.value || store.generating || store.loading || !ready.value),
   hasMap = computed(() => !!store.currentMap)
 const next = computed(() => nextKind[store.currentMap?.kind || ''] || ''),
-  spacing = computed(() => ({ continent: 1000, region: 100, site: 1 })[next.value] || 1),
-  maxWidthKm = computed(() => (spacing.value * (store.session?.max_patch_side || 512)) / 1000)
-const childSide = computed(() => Math.ceil((childWidth.value * 1000) / spacing.value)),
-  validSelection = computed(() => selection.value && store.currentMap?.status === 'done')
+  spacing = computed(() => ({ continent: 1000, region: 100, site: 1 })[next.value] || 1)
+const validSelection = computed(() => selection.value && store.currentMap?.status === 'done')
+const refinementFeature = computed(() =>
+  activeFeature.value?.level === next.value
+    ? activeFeature.value
+    : selectedGeography.value.find((f) => f.level === next.value) || null,
+)
+function childQuery(): RefinementQuery {
+  const s = selection.value
+  if (!s) throw new Error('请先选择位置')
+  const precision = childPrecision.value === 'fixed' ? { cell_size_m: childSpacing.value } : {}
+  if (refine.value && childScope.value === 'full' && refinementFeature.value)
+    return { feature_id: refinementFeature.value.id, ...precision }
+  return { center_lat: s.lat, center_lon: s.lon, width_m: childWidth.value * 1000, ...precision }
+}
+watch(
+  () => [
+    refine.value,
+    store.currentMap?.id,
+    selection.value?.lat,
+    selection.value?.lon,
+    refinementFeature.value?.id,
+    childScope.value,
+    childPrecision.value,
+    childWidth.value,
+    childSpacing.value,
+  ],
+  () => {
+    clearTimeout(childPlanTimer)
+    childPlanController?.abort()
+    childPlan.value = null
+    childPlanKey = ''
+    childPlanError.value = ''
+    childPlanLoading.value = false
+    if (!refine.value || !selection.value || !next.value || !store.currentMap) return
+    const id = store.currentMap.id,
+      query = childQuery(),
+      controller = new AbortController()
+    childPlanController = controller
+    if (Object.values(query).some((v) => !Number.isFinite(v))) {
+      childPlanError.value = '请填写有效的覆盖宽度与计算格距'
+      return
+    }
+    childPlanLoading.value = true
+    childPlanTimer = setTimeout(async () => {
+      try {
+        const plan = await api.refinementPlan(id, query, controller.signal)
+        if (!controller.signal.aborted) {
+          childPlan.value = plan
+          childPlanKey = `${id}:${JSON.stringify(query)}`
+        }
+      } catch (e) {
+        if (!controller.signal.aborted)
+          childPlanError.value = e instanceof Error ? e.message : String(e)
+      } finally {
+        if (!controller.signal.aborted) childPlanLoading.value = false
+      }
+    }, 250)
+  },
+  { flush: 'sync' },
+)
+function beginRefinement() {
+  childWidth.value = (spacing.value * Math.min(256, store.session?.max_patch_side || 512)) / 1000
+  childScope.value = refinementFeature.value ? 'full' : 'custom'
+  childPrecision.value = 'auto'
+  childSpacing.value = spacing.value
+  childName.value = refinementFeature.value
+    ? refinementFeature.value.name + ' · 概览'
+    : '自定义精细图'
+  refine.value = true
+}
+function changeChildScope(scope: 'full' | 'custom') {
+  if (scope === 'custom' && childPlan.value) childWidth.value = childPlan.value.width_m / 1000
+  childScope.value = scope
+}
 const selectedFacts = computed(() => {
   const i = selection.value?.cell
   if (i === undefined || !store.elevation) return null
@@ -921,11 +1004,19 @@ async function generateChild(parentId = store.currentMap?.id, kind = next.value)
   if (!parentId || !kind || !selection.value) throw new Error('请先在父图上选择位置')
   if (store.currentMap?.id !== parentId) throw new Error('请先切换到父图并选择位置')
   if (kind !== next.value) throw new Error('只能生成下一层地图')
+  if (refine.value && (childPlanLoading.value || childPlanError.value))
+    throw new Error('请先完成范围与精度核验')
+  if (refine.value && childPlanKey !== `${parentId}:${JSON.stringify(childQuery())}`)
+    throw new Error('范围或精度已变更，请等待重新核验')
+  const plan = refine.value ? childPlan.value : await api.refinementPlan(parentId, childQuery())
+  if (!plan?.can_generate) throw new Error(plan?.message || '请先核验范围与精度')
+  if (store.currentMap?.id !== parentId) throw new Error('父图已切换，请重新选择范围')
   await store.child(parentId, {
     kind,
-    center_lat: selection.value.lat,
-    center_lon: selection.value.lon,
-    width_m: childWidth.value * 1000,
+    center_lat: plan.center_lat,
+    center_lon: plan.center_lon,
+    width_m: plan.width_m,
+    cell_size_m: plan.cell_size_m,
     name: childName.value.trim() || '自定义精细图',
   })
   tab.value = 'tree'
@@ -1131,6 +1222,8 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
+  clearTimeout(childPlanTimer)
+  childPlanController?.abort()
   iceController?.abort()
   hydrologyController?.abort()
   tectonicController?.abort()
@@ -1920,44 +2013,31 @@ onBeforeUnmount(() => {
               </dd>
             </div>
           </dl>
-          <button v-if="next && !refine" class="primary" :disabled="locked" @click="refine = true">
+          <button
+            v-if="next && !refine"
+            class="primary"
+            :disabled="locked"
+            @click="beginRefinement"
+          >
             提高此处精度 →
           </button>
-          <form
+          <RefinementPanel
             v-if="refine && next"
-            class="refine-form"
-            @submit.prevent="guard(() => generateChild())"
-          >
-            <label>
-              精细图名称
-              <input v-model="childName" maxlength="80" />
-            </label>
-            <label>
-              覆盖宽度（km）
-              <input
-                v-model.number="childWidth"
-                type="number"
-                :min="(spacing * 4) / 1000"
-                :max="maxWidthKm"
-                :step="spacing / 1000"
-                required
-              />
-            </label>
-            <small>
-              {{ spacing >= 1000 ? spacing / 1000 + ' km' : spacing + ' m' }} / 格 ·
-              {{ childSide }} × {{ childSide }} 格
-              <br />
-              宽度上限 {{ maxWidthKm }} km，需完整位于父图内。
-            </small>
-            <button
-              class="primary"
-              :disabled="
-                locked || childSide < 4 || childSide > (store.session?.max_patch_side || 512)
-              "
-            >
-              生成精细图 ↗
-            </button>
-          </form>
+            :source="store.currentMap?.name || kinds[store.currentMap?.kind || '']"
+            :kind="kinds[next]"
+            :feature="refinementFeature?.name || null"
+            :scope="childScope"
+            @update:scope="changeChildScope"
+            v-model:precision="childPrecision"
+            v-model:width="childWidth"
+            v-model:spacing="childSpacing"
+            v-model:name="childName"
+            :plan="childPlan"
+            :loading="childPlanLoading"
+            :error="childPlanError"
+            :locked="locked"
+            @submit="guard(() => generateChild())"
+          />
           <p v-else-if="!next" class="hint">已到地点层，可继续查看各项数据。</p>
         </template>
         <p v-else class="muted">

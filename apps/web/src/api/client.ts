@@ -127,6 +127,28 @@ export interface ChildRequest {
   cell_size_m?: number
   name?: string
 }
+export interface RefinementQuery {
+  feature_id?: number
+  center_lat?: number
+  center_lon?: number
+  width_m?: number
+  cell_size_m?: number
+}
+export interface RefinementPlan {
+  kind: string
+  feature_id: number | null
+  feature_name: string | null
+  center_lat: number
+  center_lon: number
+  width_m: number
+  cell_size_m: number
+  side: number
+  cells: number
+  can_generate: boolean
+  complete_object: boolean
+  message: string
+  maximum_width_m: number
+}
 export function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
@@ -184,6 +206,17 @@ async function geometryRequest(path: string, signal?: AbortSignal): Promise<Resp
   }
 }
 export const api = {
+  async refinementPlan(
+    id: string,
+    query: RefinementQuery,
+    signal?: AbortSignal,
+  ): Promise<RefinementPlan> {
+    const params = new URLSearchParams()
+    for (const [key, value] of Object.entries(query))
+      if (value !== undefined) params.set(key, String(value))
+    const response = await geometryRequest(`/maps/${id}/refinement-plan?${params}`, signal)
+    return response.json()
+  },
   async hydrology(id: string, signal?: AbortSignal, month = 0): Promise<HydrologyDiagnostic> {
     const response = await geometryRequest(`/maps/${id}/hydrology?month=${month}`, signal)
     return response.json()

@@ -79,7 +79,7 @@ pub async fn get_vectors(
                 match &target {
                     MapGrid::Patch(g)=>{
                         let next=tf_core::geo::UnitVec3::from_vec(dir.as_vec()+velocity/target.radius_m()).unwrap();
-                        let(x,y)=g.project(next);(DVec3::new(x,y,0.)-p).normalize_or_zero()
+                        let(x,y)=g.project(next);(DVec3::new(x*target.radius_m(),y*target.radius_m(),0.)-p).normalize_or_zero()
                     },
                     _=>DVec3::new(east,north,0.).normalize_or_zero(),
                 }

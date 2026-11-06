@@ -86,6 +86,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/maps/{id}/sample", get(sample_map))
         .route("/api/v1/maps/{id}/children", post(generate_child))
+        .route(
+            "/api/v1/maps/{id}/refinement-plan",
+            get(crate::refinement::get_plan),
+        )
         .route("/api/v1/maps/{id}/export.json", get(export_json))
         .route("/api/v1/maps/{id}/export.png", get(export_png))
         .route(
@@ -950,13 +954,15 @@ async fn generate_child(
     if body.kind != expected || parent.status != "done" {
         return Err(ApiError::bad_request("只能从已完成的父图生成下一层"));
     }
-    let default_spacing = match body.kind.as_str() {
+    let default_spacing: f64 = match body.kind.as_str() {
         "continent" => 1000.,
         "region" => 100.,
         "site" => 1.,
         _ => unreachable!(),
     };
-    let cell_size_m = body.cell_size_m.unwrap_or(default_spacing);
+    let cell_size_m = body
+        .cell_size_m
+        .unwrap_or_else(|| default_spacing.max(body.width_m / st.config.max_patch_side() as f64));
     if !cell_size_m.is_finite() || cell_size_m < 1. || cell_size_m >= parent.cell_size_m {
         return Err(ApiError::bad_request(
             "子图格距必须至少 1 米，并小于父图格距",
@@ -971,7 +977,12 @@ async fn generate_child(
     {
         return Err(ApiError::bad_request("经纬度或覆盖宽度无效"));
     }
-    let side_f = (body.width_m / cell_size_m).ceil();
+    let ratio = body.width_m / cell_size_m;
+    let side_f = if (ratio - ratio.round()).abs() < 1e-8 {
+        ratio.round()
+    } else {
+        ratio.ceil()
+    };
     let limit = st.config.max_patch_side();
     if side_f < 4. || side_f > limit as f64 {
         return Err(ApiError::bad_request(format!(
@@ -1053,7 +1064,7 @@ async fn generate_child(
         completed_at: None,
         grid: Some(grid),
         seed: params.seed,
-        generator_version: "tf-0.6".into(),
+        generator_version: "tf-0.7".into(),
     };
     let job_id = st
         .jobs

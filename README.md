@@ -4,6 +4,8 @@
 
 [在线体验](https://aforgomon.win/terraforge/) · [审计报告](docs/audit-2026-10-29.md) · [最新冰雪与生态验收](docs/ice-and-ecosystem-rendering-2026-11-05.md) · [前端设计](docs/frontend-design.md)
 
+2026-11-06，本地新增完整大陆概览、自定范围与自动／指定采样精度，强化父子山河和图外来水继承，并重做独立区域的河网地貌；尚未部署到网页。[本轮验收与限制](docs/regional-generation-acceptance-2026-11-06.md)。
+
 ## 当前网页版本（2026-11-05）
 
 网页已部署当前生成引擎与自然彩绘地图。仓库保留从原型到当前版本的提交历史；旧的开发与部署文档记录对应日期的状态，以最新验收文档为准。

@@ -128,9 +128,24 @@ pub(super) fn solve<G: GridOps>(
     gravity: f64,
     cancel: &dyn Fn() -> bool,
 ) -> Option<Cryosphere> {
+    solve_from(grid, fields, gravity, None, 10000, cancel)
+}
+pub(super) fn solve_from<G: GridOps>(
+    grid: &G,
+    fields: &WorldFields,
+    gravity: f64,
+    initial: Option<(&[f32], &[f32])>,
+    years: u32,
+    cancel: &dyn Fn() -> bool,
+) -> Option<Cryosphere> {
     let climate = fields.climate.as_ref()?;
     let climate_grid = climate.grid.build();
     let n = grid.cell_count();
+    if initial.is_some_and(|(a, b)| {
+        a.len() != n || b.len() != n || a.iter().chain(b).any(|h| !h.is_finite() || *h < 0.)
+    }) {
+        return None;
+    }
     if fields.elevation.len() != n || !gravity.is_finite() || gravity <= 0. {
         return None;
     }
@@ -158,16 +173,18 @@ pub(super) fn solve<G: GridOps>(
         if i % 2048 == 0 && cancel() {
             return None;
         }
-        if bed[i] <= 0. {
+        let inherited = initial.map_or(0., |(a, b)| a[i] + b[i]);
+        if bed[i] <= 0. && inherited == 0. {
             continue;
         }
         let w = weather(i);
-        if snow_cycle(&w.temperature, &w.precipitation, 0.).retained > 1e-8 {
+        let accumulates = snow_cycle(&w.temperature, &w.precipitation, 0.).retained > 1e-8;
+        if accumulates || inherited > 0. {
             slots[i] = forcing.len();
             forcing.push(w);
             active.push(i);
             present[i] = true;
-            accumulating[i] = true;
+            accumulating[i] = accumulates;
         }
     }
     let mut inverse = WorldFields {
@@ -177,14 +194,16 @@ pub(super) fn solve<G: GridOps>(
     };
     crate::erosion::compute_distance_to_sea(grid, &mut inverse);
     let coast_distance = inverse.distance_to_sea;
-    let mut h = vec![0.; n];
+    let mut h: Vec<f64> = (0..n)
+        .map(|i| initial.map_or(0., |(a, b)| a[i] as f64 + b[i] as f64))
+        .collect();
     let mut fluxes = Fluxes::new(n);
     let mut budget = IceBudget {
         solver_cells: n,
+        initial_storage_m3: (0..n).map(|i| h[i] * grid.area_m2(i)).sum(),
         ..Default::default()
     };
     let dt = 10.;
-    let years = 10000;
     for step in 0..years / 10 {
         if cancel() {
             return None;
@@ -279,7 +298,7 @@ pub(super) fn solve<G: GridOps>(
             grounded[i] = value;
         }
     }
-    budget.residual_m3 = budget.snowfall_m3
+    budget.residual_m3 = budget.initial_storage_m3 + budget.snowfall_m3
         - budget.surface_melt_m3
         - budget.basal_melt_m3
         - budget.calved_m3
@@ -303,7 +322,7 @@ pub(super) fn solve<G: GridOps>(
         .sum::<f64>();
     let b = &result.atlas.ice_budget;
     if (stored - b.final_storage_m3 - b.rounding_m3).abs() > b.final_storage_m3.max(1.) * 1e-10
-        || b.residual_m3.abs() > b.snowfall_m3.max(1.) * 1e-8
+        || b.residual_m3.abs() > (b.initial_storage_m3 + b.snowfall_m3).max(1.) * 1e-8
     {
         return None;
     }

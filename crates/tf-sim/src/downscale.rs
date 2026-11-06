@@ -23,6 +23,53 @@
 
 use tf_grid::{GridOps, PatchGrid, SphereHexGrid};
 
+/// Preserve the inherited edge, while allowing the interior to evolve. All
+/// lengths are in metres; no final whole-map pull back to the coarse surface.
+pub fn constrain_edges<G: GridOps>(grid: &G, height: &mut [f32], parent: &[f32], band_m: f64) {
+    let Some((w, h)) = grid.extent_m() else {
+        return;
+    };
+    for i in 0..height.len() {
+        let (x, y) = grid.local_center_m(i).unwrap();
+        let d = (w / 2. - x.abs()).min(h / 2. - y.abs()).max(0.);
+        let t = (d / band_m.max(1.)).clamp(0., 1.);
+        let free = t * t * (3. - 2. * t);
+        height[i] = (parent[i] as f64 + (height[i] - parent[i]) as f64 * free) as f32;
+    }
+}
+
+/// Seed continuous valley floors along the parent's saved major river graph.
+/// Only initial subgrid relief is constrained; subsequent erosion is retained.
+pub fn guide_rivers<G: GridOps>(
+    grid: &G,
+    height: &mut [f32],
+    guides: &[crate::refinement::RiverGuide],
+    spacing: f64,
+) {
+    let mut target = vec![f32::INFINITY; height.len()];
+    for guide in guides {
+        let depth = (guide.discharge_m3_s.sqrt() * 0.15).clamp(0., (spacing * 0.02).min(40.));
+        for (&i, &z) in guide.cells.iter().zip(&guide.heights) {
+            if height[i] <= 0. || z <= 0. {
+                continue;
+            }
+            target[i] = target[i].min((z - depth as f32).max(0.001));
+            for &j in grid.neighbors(i) {
+                let j = j as usize;
+                if height[j] <= 0. {
+                    continue;
+                }
+                let t = (grid.distance_m(i, j) / (spacing * 1.8)).clamp(0., 1.);
+                let floor = z - depth as f32 + (height[j] - z).max(0.) * t as f32;
+                target[j] = target[j].min(floor.max(0.001));
+            }
+        }
+    }
+    for (h, z) in height.iter_mut().zip(target) {
+        *h = h.min(z);
+    }
+}
+
 /// A missing parent cell is an error, never an invented ocean or default climate.
 pub fn sample_from_grid<C: GridOps>(
     parent: &tf_grid::MapGrid,
@@ -61,28 +108,44 @@ pub fn interpolate_from_grid<C: GridOps>(
     (0..child.cell_count())
         .map(|i| {
             let dir = child.center_dir(i);
-            let cell = parent.cell_at(dir).ok_or("子图超出父图范围")?;
-            let mut sum = 0.0;
-            let mut weights = 0.0;
-            for j in std::iter::once(cell).chain(parent.neighbors(cell).iter().map(|&j| j as usize))
-            {
-                let d = if let tf_grid::MapGrid::Plane(g) = parent {
+            let position = match parent {
+                tf_grid::MapGrid::Plane(g) => {
                     let (x, y) = g.project(dir);
-                    let (a, b) = g.xy(j);
-                    (x - a).hypot(y - b)
-                } else {
-                    dir.angle_to(&parent.center_dir(j)) * parent.radius_m()
-                };
-                if d < 1e-12 {
-                    return Ok(elevation[j]);
+                    glam::DVec3::new(x, y, 0.)
                 }
-                let w = 1.0 / (d * d);
-                sum += elevation[j] as f64 * w;
-                weights += w;
-            }
-            Ok((sum / weights) as f32)
+                _ => dir.as_vec() * parent.radius_m(),
+            };
+            let stencil = crate::evolution::stencil(parent, position).ok_or("子图超出父图范围")?;
+            Ok(stencil
+                .iter()
+                .map(|&(j, w)| elevation[j] as f64 * w)
+                .sum::<f64>() as f32)
         })
         .collect()
+}
+
+pub fn sample_at(
+    parent: &tf_grid::MapGrid,
+    values: &[f32],
+    dir: tf_core::geo::UnitVec3,
+) -> Option<f32> {
+    if values.len() != parent.cell_count() {
+        return None;
+    }
+    let p = match parent {
+        tf_grid::MapGrid::Plane(g) => {
+            let (x, y) = g.project(dir);
+            glam::DVec3::new(x, y, 0.)
+        }
+        _ => dir.as_vec() * parent.radius_m(),
+    };
+    let weights = crate::evolution::stencil(parent, p)?;
+    Some(
+        weights
+            .iter()
+            .map(|&(i, w)| values[i] as f64 * w)
+            .sum::<f64>() as f32,
+    )
 }
 
 /// 父图上的一块采样结果。

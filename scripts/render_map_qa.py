@@ -27,6 +27,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base', default='http://127.0.0.1:18798/terraforge')
     parser.add_argument('--project', required=True)
+    parser.add_argument('--map-id', help='Select a child map from an offline multi-map project')
     parser.add_argument('--out', required=True)
     parser.add_argument('--view', default='equirectangular', choices=['globe','equirectangular','mercator','mollweide','equal-earth'])
     parser.add_argument('--width', type=int, default=2048)
@@ -66,7 +67,9 @@ def main():
     try:
         project_bytes = Path(args.project).read_bytes()
         project = json.loads(project_bytes)
-        source_map = next(m for m in project['maps'] if m['node']['parent'] is None)
+        source_map = next(m for m in project['maps'] if (m['node']['id']==args.map_id if args.map_id else m['node']['parent'] is None))
+        if args.map_id and not args.offline_artifacts:
+            parser.error('--map-id currently requires --offline-artifacts')
         if args.offline_artifacts:
             node = source_map['node']
         else:
@@ -181,7 +184,7 @@ fs.writeFileSync(directory+'/camera.json',JSON.stringify({eye,bounds:geometry.pr
         native_gl.glTexParameteri(0x0DE1,0x2802,0x8370);native_gl.glTexParameteri(0x0DE1,0x2803,0x8370)
         pigment.use(2);program['uPigmentTex'].value=2
         width=args.width
-        height=width if globe else (round(width*camera['bounds']['height']/2) if atlas else round(width*node['grid']['rows']/node['grid']['size']*3**.5/2))
+        height=width if globe else (round(width*camera['bounds']['height']/2) if atlas else round(width*node['grid'].get('rows',node['grid']['size'])/node['grid']['size']*3**.5/2))
         frame = ctx.simple_framebuffer((width,height),components=3); frame.use()
         aspect=width/height
         matrix=np.array(camera['matrix'],dtype='f4') if globe else np.diag([.5 if atlas else 1.,1./camera['bounds']['height'] if atlas else aspect,1.,1.]).astype('f4')

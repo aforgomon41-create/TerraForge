@@ -798,6 +798,38 @@ details > label + label {
   line-height: 1.9;
   color: var(--muted);
 }
+.refine-source {
+  margin: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.refine-source small {
+  color: var(--muted);
+}
+.refine-scope {
+  display: flex;
+  gap: 6px;
+}
+.refine-scope button {
+  flex: 1;
+}
+.refine-scope button[aria-pressed='true'] {
+  background: #dfe8db;
+  border-color: #8ba38c;
+}
+.refine-summary {
+  background: #edf1e8;
+  border-radius: 7px;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.refine-summary [role='alert'] {
+  color: var(--red);
+}
+.refine-form input[readonly] {
+  background: #efeee5;
+}
 .coordinate-form {
   display: grid;
   grid-template-columns: 1fr 1fr;

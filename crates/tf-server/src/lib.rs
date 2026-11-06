@@ -12,6 +12,7 @@ pub mod geography;
 pub mod hydrology;
 pub mod jobs;
 mod project;
+pub mod refinement;
 pub mod render;
 pub mod store;
 mod surface;

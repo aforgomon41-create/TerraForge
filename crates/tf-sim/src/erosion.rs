@@ -167,7 +167,8 @@ fn drainage<G: GridOps>(grid: &G, fields: &mut WorldFields) -> ErosionState {
 
 fn accumulate<G: GridOps>(grid: &G, fields: &mut WorldFields, state: &ErosionState) {
     for i in 0..grid.cell_count() {
-        fields.flow_accumulation[i] = grid.area_m2(i) as f32;
+        fields.flow_accumulation[i] =
+            (grid.area_m2(i) + fields.external_area_m2.get(i).copied().unwrap_or(0.)) as f32;
     }
     for &cell in &state.topo_order {
         let i = cell as usize;
@@ -270,18 +271,21 @@ pub fn run_erosion_observed<G: GridOps>(
             state = refresh_hydrology(grid, fields);
         }
         // Rainfall-weighted discharge is separate from the stored contributing area.
-        let rain_driven = fields.precipitation.iter().any(|&p| p > 0.);
+        let rain_driven =
+            fields.precipitation.iter().any(|&p| p > 0.) || !fields.external_water_m3_yr.is_empty();
+        let liquid = fields.liquid_water();
         let mut discharge: Vec<f64> = (0..grid.cell_count())
             .map(|i| {
-                grid.area_m2(i)
-                    * if rain_driven {
-                        crate::lakes::annual_runoff_m(
-                            fields.precipitation[i] as f64,
-                            fields.potential_evaporation[i] as f64,
-                        )
-                    } else {
-                        1.
-                    }
+                fields.external_water_m3_yr.get(i).copied().unwrap_or(0.)
+                    + grid.area_m2(i)
+                        * if rain_driven {
+                            crate::lakes::annual_runoff_m(
+                                liquid[i] as f64,
+                                fields.runoff_pet(i) as f64,
+                            )
+                        } else {
+                            1.
+                        }
             })
             .collect();
         for &cell in &state.topo_order {

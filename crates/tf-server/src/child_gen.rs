@@ -44,15 +44,120 @@ pub fn run_child_generation(
             .get_field(&parent.id, ch)?
             .ok_or_else(|| anyhow::anyhow!("父图缺少 {} 数据", ch.name()))
     };
-    let pe = field(Channel::Elevation)?;
-    let pt = field(Channel::Temperature)?;
-    let pp = field(Channel::Precipitation)?;
+    let parent_meta = store.get_metadata(&parent.id)?.unwrap_or_default();
+    let mut parent_fields = tf_sim::WorldFields {
+        elevation: field(Channel::Elevation)?,
+        temperature: field(Channel::Temperature)?,
+        precipitation: field(Channel::Precipitation)?,
+        potential_evaporation: field(Channel::PotentialEvaporation)?,
+        flow_accumulation: field(Channel::FlowAccumulation)?,
+        liquid_discharge: store
+            .get_field(&parent.id, Channel::LiquidDischarge)?
+            .unwrap_or_default(),
+        lake_depth: field(Channel::LakeDepth)?,
+        lake_runoff_loss_fraction: store
+            .get_field(&parent.id, Channel::LakeRunoffLossFraction)?
+            .unwrap_or_default(),
+        climate: crate::climatology::for_map(store, &parent)?,
+        ..Default::default()
+    };
+    let parent_forcing = crate::refinement::decode(&parent_meta, &parent_grid)?;
+    if let Some(b) = &parent_forcing {
+        b.apply(&mut parent_fields, 0).map_err(anyhow::Error::msg)?;
+    }
+    if let Some(atlas) = crate::cryosphere::for_map(store, &parent)? {
+        let ice = store.get_field(&parent.id, Channel::LandIce)?;
+        let shelf = store.get_field(&parent.id, Channel::IceShelf)?;
+        let canonical = ice.as_deref().zip(shelf.as_deref());
+        parent_fields.cryosphere =
+            tf_sim::cryosphere::sample(&parent_grid, &parent_fields, atlas, 0, canonical);
+        anyhow::ensure!(parent_fields.cryosphere.is_some(), "父图冰雪资料不完整");
+    }
+    let parent_receivers = field(Channel::FlowReceiver)?
+        .into_iter()
+        .map(|r| {
+            if r == -1. {
+                Ok(u32::MAX)
+            } else if r.is_finite()
+                && r >= 0.
+                && r.fract() == 0.
+                && r < parent_grid.cell_count() as f32
+            {
+                Ok(r as u32)
+            } else {
+                Err(anyhow::anyhow!("父图流向无效"))
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    tf_sim::erosion::from_saved_receivers(
+        &parent_grid,
+        &mut parent_fields,
+        parent_receivers.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let (work_descriptor, padding) = crate::refinement::buffered(descriptor, &parent_grid);
+    let work = work_descriptor.build();
+    let (work_forcing, guides) = tf_sim::refinement::inherit(
+        &parent_grid,
+        &work,
+        &parent_fields,
+        &parent_receivers,
+        parent_forcing.as_ref(),
+        parent_fields
+            .cryosphere
+            .as_ref()
+            .map(|c| c.land_ice_m.as_slice()),
+        &|| cancel.load(Ordering::Relaxed),
+    )
+    .map_err(anyhow::Error::msg)?;
     let pd = field(Channel::DistanceToSea)?;
-    let sample = tf_sim::downscale::sample_from_grid(&parent_grid, &patch, &pe, &pt, &pp)
+    let sample = tf_sim::downscale::sample_from_grid(
+        &parent_grid,
+        &work,
+        &parent_fields.elevation,
+        &parent_fields.temperature,
+        &parent_fields.precipitation,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let relief: Vec<f32> = (0..parent_grid.cell_count())
+        .map(|i| {
+            let h = parent_fields.elevation[i];
+            let mut lo = h;
+            let mut hi = h;
+            for &j in parent_grid.neighbors(i) {
+                lo = lo.min(parent_fields.elevation[j as usize]);
+                hi = hi.max(parent_fields.elevation[j as usize]);
+            }
+            hi - lo
+        })
+        .collect();
+    let relief = tf_sim::downscale::interpolate_from_grid(&parent_grid, &work, &relief)
         .map_err(anyhow::Error::msg)?;
-    let mut fields = tf_sim::WorldFields::with_capacity(patch.cell_count());
+    let background_ice = if padding > 0 {
+        parent_fields
+            .cryosphere
+            .as_ref()
+            .map(|c| tf_sim::downscale::interpolate_from_grid(&parent_grid, &work, &c.land_ice_m))
+            .transpose()
+            .map_err(anyhow::Error::msg)?
+    } else {
+        None
+    };
+    let initial_ice = parent_fields
+        .cryosphere
+        .as_ref()
+        .map(|c| -> Result<_, String> {
+            Ok((
+                tf_sim::downscale::interpolate_from_grid(&parent_grid, &patch, &c.land_ice_m)?,
+                tf_sim::downscale::interpolate_from_grid(&parent_grid, &patch, &c.shelf_ice_m)?,
+            ))
+        })
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    drop(parent_fields);
+    let mut fields = tf_sim::WorldFields::with_capacity(work.cell_count());
     fields.elevation = sample.elevation.clone();
-    fields.distance_to_sea = tf_sim::downscale::interpolate_from_grid(&parent_grid, &patch, &pd)
+    fields.distance_to_sea = tf_sim::downscale::interpolate_from_grid(&parent_grid, &work, &pd)
         .map_err(anyhow::Error::msg)?;
     // Add only wavelengths the parent could not resolve, using a stable root coordinate frame.
     let mut root = parent.clone();
@@ -61,38 +166,71 @@ pub fn run_child_generation(
             .get_map_node(id)?
             .ok_or_else(|| anyhow::anyhow!("缺少根地图"))?;
     }
-    let root_grid = root
+    let root_descriptor = root
         .grid
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("缺少根几何"))?
-        .build();
+        .ok_or_else(|| anyhow::anyhow!("缺少根几何"))?;
+    let root_plane = if matches!(root_descriptor, tf_grid::GridDescriptor::Plane { .. }) {
+        Some(root_descriptor.build())
+    } else {
+        None
+    };
     let world_seed = store
         .get_world(&node.world_id)?
         .ok_or_else(|| anyhow::anyhow!("缺少工程"))?
         .seed;
     let noise = tf_core::noise::SimplexNoise::new(world_seed ^ 0x0ED0_6E17);
     let crust = field(Channel::CrustType)?;
-    let child_crust = tf_sim::downscale::interpolate_from_grid(&parent_grid, &patch, &crust)
+    let child_crust = tf_sim::downscale::interpolate_from_grid(&parent_grid, &work, &crust)
         .map_err(anyhow::Error::msg)?;
-    for i in 0..patch.cell_count() {
-        let dir = patch.center_dir(i);
-        let p = if let tf_grid::MapGrid::Plane(g) = &root_grid {
+    fields.crust_type = child_crust.clone();
+    for i in 0..work.cell_count() {
+        let dir = work.center_dir(i);
+        let p = if let Some(tf_grid::MapGrid::Plane(g)) = &root_plane {
             let (x, y) = g.project(dir);
             glam::DVec3::new(x, y, 0.)
         } else {
-            dir.as_vec() * root_grid.radius_m()
+            dir.as_vec() * root_descriptor.radius_m()
         };
         let detail = tf_sim::terrain::interior_detail(&noise, p, node.cell_size_m)
             - tf_sim::terrain::interior_detail(&noise, p, parent.cell_size_m);
+        // Fine relief follows the observed local parent relief. The same global
+        // rock noise amplitude would turn a low-gradient plain into lake pits.
+        let budget = relief[i] as f64 * 0.35 * (node.cell_size_m / parent.cell_size_m).sqrt();
         fields.elevation[i] +=
-            (detail * params.interior_relief * (0.12 + 0.88 * child_crust[i] as f64)) as f32;
+            (detail * params.interior_relief * (0.12 + 0.88 * child_crust[i] as f64))
+                .clamp(-budget, budget) as f32;
     }
-    let weights = tf_sim::downscale::constraint_weights(&patch);
-    tf_sim::downscale::blend_with_parent(&patch, &mut fields.elevation, &sample, &weights, true);
+    tf_sim::downscale::guide_rivers(&work, &mut fields.elevation, &guides, node.cell_size_m);
+    tf_sim::downscale::constrain_edges(
+        &work,
+        &mut fields.elevation,
+        &sample.elevation,
+        node.cell_size_m * 4.,
+    );
+    work_forcing
+        .apply(&mut fields, 0)
+        .map_err(anyhow::Error::msg)?;
+    let water_grid =
+        tf_sim::refinement::BoundaryGrid::new(&work, &work_forcing).map_err(anyhow::Error::msg)?;
     fields.temperature = sample.temperature.clone();
     fields.precipitation = sample.precipitation.clone();
     fields.climate = crate::climatology::for_map(store, &parent)?;
-    inherited_pet(&patch, &mut fields, params);
+    inherited_pet(&work, &mut fields, params);
+    // The halo has the parent's prescribed ice background. Computing its snow
+    // and melt budget does not require a second evolving ice-sheet solver.
+    if padding > 0 && fields.climate.is_some() {
+        let Some((liquid, pet)) = tf_sim::cryosphere::liquid_background(
+            &work,
+            &fields,
+            background_ice.as_deref(),
+            &|| cancel.load(Ordering::Relaxed),
+        ) else {
+            return Ok(());
+        };
+        fields.liquid_background_mm = liquid;
+        fields.pet_background_mm = pet;
+    }
     let progress = |stage: &str, p: f64| {
         let _ = store.update_progress(job_id, stage, p);
         let _ = tx.send(JobEvent::Progress {
@@ -106,7 +244,7 @@ pub fn run_child_generation(
     let mut info = tf_sim::preview::FrameInfo::stage(tf_sim::Stage::Landforms, 0.15);
     info.detail = "父图继承与局部地貌";
     info.channels = tf_sim::preview::ALL;
-    tf_sim::preview::emit(&mut live, &patch, &fields, info);
+    tf_sim::preview::emit(&mut live, &work, &fields, info);
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -116,7 +254,7 @@ pub fn run_child_generation(
         ..Default::default()
     };
     let Some(erosion_result) = tf_sim::erosion::run_erosion_observed(
-        &patch,
+        &water_grid,
         &mut fields,
         &erosion,
         &|| cancel.load(Ordering::Relaxed),
@@ -127,7 +265,7 @@ pub fn run_child_generation(
             info.stage_complete = false;
             info.step = step;
             info.detail = "子区域河流与坡面细化";
-            tf_sim::preview::emit(&mut live, &patch, fields, info);
+            tf_sim::preview::emit(&mut live, &work, fields, info);
         },
     ) else {
         return Ok(());
@@ -136,16 +274,62 @@ pub fn run_child_generation(
         return Ok(());
     }
     progress("水文细化", 0.55);
-    tf_sim::downscale::blend_with_parent(&patch, &mut fields.elevation, &sample, &weights, true);
-    for i in 0..patch.cell_count() {
+    for i in 0..work.cell_count() {
         fields.temperature[i] -= (fields.elevation[i] - sample.elevation[i]) * 0.0065;
     }
-    inherited_pet(&patch, &mut fields, params);
+    inherited_pet(&work, &mut fields, params);
+    let forcing = if padding > 0 {
+        // The halo's own rainfall becomes external only when it crosses into
+        // the final crop. Grandparent inflow stays explicit through this step.
+        fields.liquid_discharge =
+            tf_sim::cryosphere::annual_discharge(&water_grid, &fields, &erosion_result);
+        let (b, _) = tf_sim::refinement::inherit(
+            &work,
+            &patch,
+            &fields,
+            &erosion_result.flow_dir,
+            Some(&work_forcing),
+            background_ice.as_deref(),
+            &|| cancel.load(Ordering::Relaxed),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let side = (patch.cell_count() as f64).sqrt() as usize;
+        let crop = |v: &[f32]| crate::refinement::crop(v, side, padding as usize);
+        fields.elevation = crop(&fields.elevation);
+        fields.temperature = crop(&fields.temperature);
+        fields.precipitation = crop(&fields.precipitation);
+        fields.distance_to_sea = crop(&fields.distance_to_sea);
+        fields.crust_type = crop(&fields.crust_type);
+        fields.potential_evaporation = crop(&fields.potential_evaporation);
+        fields.aridity = crop(&fields.aridity);
+        fields.flow_accumulation = vec![0.; patch.cell_count()];
+        fields.lake_depth = vec![0.; patch.cell_count()];
+        b
+    } else {
+        work_forcing.clone()
+    };
+    fields.liquid_discharge.clear();
+    fields.cryosphere = None;
+    fields.liquid_background_mm.clear();
+    fields.pet_background_mm.clear();
+    forcing.apply(&mut fields, 0).map_err(anyhow::Error::msg)?;
+    let water_grid =
+        tf_sim::refinement::BoundaryGrid::new(&patch, &forcing).map_err(anyhow::Error::msg)?;
     if fields.climate.is_some() {
-        fields.cryosphere =
+        progress("冰雪细化", 0.65);
+        fields.cryosphere = if let Some((land, shelf)) = &initial_ice {
+            tf_sim::cryosphere::solve_refinement(
+                &patch,
+                &fields,
+                params.planet.surface_gravity(),
+                (land, shelf),
+                &|| cancel.load(Ordering::Relaxed),
+            )
+        } else {
             tf_sim::cryosphere::solve(&patch, &fields, params.planet.surface_gravity(), &|| {
                 cancel.load(Ordering::Relaxed)
-            });
+            })
+        };
         if fields.cryosphere.is_none() {
             anyhow::ensure!(
                 cancel.load(Ordering::Relaxed),
@@ -154,9 +338,9 @@ pub fn run_child_generation(
             return Ok(());
         }
     }
-    let water = tf_sim::erosion::refresh_hydrology(&patch, &mut fields);
+    let water = tf_sim::erosion::refresh_hydrology(&water_grid, &mut fields);
     tf_sim::cryosphere::update_water_surfaces(&patch, &mut fields);
-    fields.liquid_discharge = tf_sim::cryosphere::annual_discharge(&patch, &fields, &water);
+    fields.liquid_discharge = tf_sim::cryosphere::annual_discharge(&water_grid, &fields, &water);
     tf_sim::erosion::compute_distance_to_sea(&patch, &mut fields);
     let ecology =
         tf_sim::ecology::run_ecology_with_diversity(&patch, &fields, params.biome_diversity);
@@ -195,7 +379,6 @@ pub fn run_child_generation(
             inherited.push((channel, data));
         }
     }
-    let parent_meta = store.get_metadata(&parent.id)?.unwrap_or_default();
     let minerals: Vec<serde_json::Value> = parent_meta
         .get("minerals")
         .and_then(|v| v.as_array())
@@ -230,15 +413,20 @@ pub fn run_child_generation(
         (Channel::PotentialEvaporation, &fields.potential_evaporation),
         (Channel::Aridity, &fields.aridity),
         (Channel::FlowReceiver, &receivers),
+        (
+            Channel::LakeRunoffLossFraction,
+            &fields.lake_runoff_loss_fraction,
+        ),
+        (Channel::LiquidDischarge, &fields.liquid_discharge),
     ];
     for (channel, data) in &inherited {
         channels.push((*channel, data.as_slice()));
     }
-    let mut metadata = serde_json::json!({"generator_version":"tf-0.6","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
-    let discharge = fields
-        .cryosphere
-        .as_ref()
-        .map(|_| tf_sim::cryosphere::annual_discharge(&patch, &fields, &water));
+    let mut metadata = serde_json::json!({"generator_version":"tf-0.7","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
+    metadata[crate::refinement::KEY] = serde_json::to_value(&forcing)?;
+    metadata["erosion_budget_domain"] =
+        "buffered solver domain; sediment ledger is not an output-only mass balance".into();
+    metadata["refinement_model"] = serde_json::json!({"name":"continuous-parent-river-boundary-v1","halo_cells":padding,"solver_cells":work.cell_count(),"output_cells":patch.cell_count(),"river_guides":guides.len(),"sediment_inflow":"unavailable in parent; local eroded sediment only","local_climate":"parent seasonal background with elevation lapse","ice_initial_condition":if initial_ice.is_some(){"continuous parent ice + 500-year fine-grid relaxation"}else{"no parent ice; fresh spinup"}});
     if let Some(ice) = &fields.cryosphere {
         crate::cryosphere::attach(&mut metadata, ice)?;
         channels.extend(
@@ -246,9 +434,6 @@ pub fn run_child_generation(
                 .into_iter()
                 .zip(crate::cryosphere::fields(ice)),
         );
-    }
-    if let Some(q) = &discharge {
-        channels.push((Channel::LiquidDischarge, q));
     }
     anyhow::ensure!(
         ecology.ecosystems.validate(fields.elevation.len()),

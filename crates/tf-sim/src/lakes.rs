@@ -9,6 +9,19 @@ use serde::{Deserialize, Serialize};
 use tf_grid::GridOps;
 
 const OUT: usize = usize::MAX;
+#[derive(Clone, Copy, PartialEq)]
+struct Head(f64, usize);
+impl Eq for Head {}
+impl PartialOrd for Head {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Head {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&o.0).then_with(|| self.1.cmp(&o.1))
+    }
+}
 
 /// Marine outlets for sediment transport: below-sea-level pits enclosed by land
 /// are sediment traps, not unlimited exports. A closed spherical domain keeps
@@ -55,6 +68,11 @@ pub fn marine_cells<G: GridOps>(grid: &G, elevation: &[f32]) -> Vec<bool> {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LakeBudget {
     pub precipitation_m3_yr: f64,
+    #[serde(default)]
+    pub external_inflow_m3_yr: f64,
+    /// Water replacing extra evaporation from an externally maintained stage.
+    #[serde(default)]
+    pub prescribed_head_supply_m3_yr: f64,
     /// Rain/snow retained as solid water, net of melt from older snow/ice.
     #[serde(default)]
     pub solid_water_change_m3_yr: f64,
@@ -420,12 +438,11 @@ impl Hierarchy {
 
 /// Annual equilibrium surface, without converting every spill capacity to water.
 pub fn balance<G: GridOps>(grid: &G, fields: &mut WorldFields) -> (Vec<f64>, LakeBudget) {
-    let liquid = fields
-        .cryosphere
-        .as_ref()
-        .map(|c| c.liquid_water_mm.as_slice())
-        .unwrap_or(&fields.precipitation);
-    if !liquid.iter().any(|&p| p > 0.) {
+    let liquid = fields.liquid_water();
+    if !liquid.iter().any(|&p| p > 0.)
+        && !fields.external_water_m3_yr.iter().any(|&q| q > 0.)
+        && fields.boundary_stages.is_empty()
+    {
         fields.lake_depth.fill(0.);
         let solid = (0..grid.cell_count())
             .filter(|&i| fields.elevation[i] > 0.)
@@ -449,19 +466,17 @@ pub fn balance<G: GridOps>(grid: &G, fields: &mut WorldFields) -> (Vec<f64>, Lak
     let mut loss = vec![0.; n];
     let mut budget = LakeBudget::default();
     for i in 0..n {
+        let external = fields.external_water_m3_yr.get(i).copied().unwrap_or(0.);
+        budget.external_inflow_m3_yr += external;
         if fields.elevation[i] <= 0. {
+            source[i] = external;
             continue;
         }
         let rain = (liquid[i] as f64).max(0.) / 1000.;
-        let pet = (fields
-            .cryosphere
-            .as_ref()
-            .map_or(fields.potential_evaporation[i], |c| c.pet_mm_year[i])
-            as f64)
-            .max(0.)
-            / 1000.;
+        let pet = (fields.runoff_pet(i) as f64).max(0.) / 1000.;
         source[i] = annual_runoff_m(rain * 1000., pet * 1000.) * tree.area[i];
         let actual_et = (rain * tree.area[i] - source[i]).max(0.);
+        source[i] += external;
         budget.precipitation_m3_yr += fields.precipitation[i].max(0.) as f64 / 1000. * tree.area[i];
         budget.solid_water_change_m3_yr +=
             (fields.precipitation[i].max(0.) as f64 / 1000. - rain) * tree.area[i];
@@ -470,13 +485,85 @@ pub fn balance<G: GridOps>(grid: &G, fields: &mut WorldFields) -> (Vec<f64>, Lak
     }
     tree.prepare(&source, &loss, false);
     tree.solve();
-    let surfaces = tree.surfaces();
+    let natural = tree.surfaces();
+    let mut surfaces = natural.clone();
+    // Minimum escape level across ALL exits. A high mountain-side outlet
+    // cannot hold the entire crop underwater when a lower exit is available.
+    let mut escape = if fields.boundary_stages.is_empty() {
+        vec![]
+    } else {
+        vec![f64::INFINITY; n]
+    };
+    let mut pending = std::collections::BinaryHeap::new();
+    if !fields.boundary_stages.is_empty() {
+        let mut stages = vec![f64::NEG_INFINITY; n];
+        for &(i, z) in &fields.boundary_stages {
+            stages[i as usize] = stages[i as usize].max(z);
+        }
+        for i in 0..n {
+            if grid.boundary_mask()[i] || tree.height[i] <= 0. {
+                let z = tree.height[i].max(if tree.height[i] <= 0. { 0. } else { stages[i] });
+                escape[i] = z;
+                pending.push(std::cmp::Reverse(Head(z, i)));
+            }
+        }
+        while let Some(std::cmp::Reverse(Head(z, i))) = pending.pop() {
+            if z > escape[i] {
+                continue;
+            }
+            for &j in grid.neighbors(i) {
+                let j = j as usize;
+                let next = z.max(tree.height[j]);
+                if next < escape[j] {
+                    escape[j] = next;
+                    pending.push(std::cmp::Reverse(Head(next, j)));
+                }
+            }
+        }
+    }
+    // Fixed downstream heads create connected backwater, never a raised bed.
+    // The replacement water needed for its evaporation has its own ledger.
+    let mut queue = std::collections::BinaryHeap::new();
+    for &(i, z) in &fields.boundary_stages {
+        let i = i as usize;
+        let z = z.min(escape[i]);
+        if z > surfaces[i] {
+            surfaces[i] = z;
+            queue.push(Head(z, i));
+        }
+    }
+    while let Some(Head(z, i)) = queue.pop() {
+        if z < surfaces[i] {
+            continue;
+        }
+        for &j in grid.neighbors(i) {
+            let j = j as usize;
+            let head = z.min(escape[j]);
+            if tree.height[j] < head && surfaces[j] < head {
+                surfaces[j] = head;
+                queue.push(Head(head, j));
+            }
+        }
+    }
+    if fields.external_area_m2.len() == n {
+        fields.lake_runoff_loss_fraction = vec![0.; n];
+    }
     for i in 0..n {
+        if !fields.boundary_stages.is_empty() && fields.elevation[i] <= 0. {
+            fields.lake_depth[i] = 0.;
+            continue;
+        }
         let depth = (surfaces[i] - tree.height[i]).max(0.);
         fields.lake_depth[i] = depth as f32;
+        let natural_fraction =
+            ((natural[i] - tree.height[i]).max(0.) / tree.width[i].max(1e-12)).clamp(0., 1.);
+        if fields.lake_runoff_loss_fraction.len() == n {
+            fields.lake_runoff_loss_fraction[i] = natural_fraction as f32;
+        }
         if depth > 0. {
-            let fraction = (depth / tree.width[i]).clamp(0., 1.);
+            let fraction = (depth / tree.width[i].max(1e-12)).clamp(0., 1.);
             budget.additional_lake_evaporation_m3_yr += loss[i] * fraction;
+            budget.prescribed_head_supply_m3_yr += loss[i] * (fraction - natural_fraction).max(0.);
             budget.lake_area_m2 += tree.area[i] * fraction;
             budget.lake_storage_m3 += tree.area[i]
                 * if depth < tree.width[i] {
@@ -488,6 +575,8 @@ pub fn balance<G: GridOps>(grid: &G, fields: &mut WorldFields) -> (Vec<f64>, Lak
     }
     budget.terminal_runoff_m3_yr = tree.export();
     budget.residual_m3_yr = budget.precipitation_m3_yr
+        + budget.external_inflow_m3_yr
+        + budget.prescribed_head_supply_m3_yr
         - budget.solid_water_change_m3_yr
         - budget.land_evaporation_m3_yr
         - budget.additional_lake_evaporation_m3_yr

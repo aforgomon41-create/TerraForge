@@ -116,7 +116,7 @@ pub async fn get_tectonics(
                 match &coarse {
                     MapGrid::Patch(g)=>{
                         let next=tf_core::geo::UnitVec3::from_vec(spherical.as_vec()+v/coarse.radius_m()*0.01).unwrap();
-                        let(x,y)=g.project(next);(DVec3::new(x,y,0.)-p).normalize_or_zero()
+                        let(x,y)=g.project(next);(DVec3::new(x*coarse.radius_m(),y*coarse.radius_m(),0.)-p).normalize_or_zero()
                     },
                     _=>{let(e,n)=spherical.tangent_frame();DVec3::new(v.dot(e),v.dot(n),0.).normalize_or_zero()}
                 }

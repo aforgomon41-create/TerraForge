@@ -41,7 +41,7 @@ pub fn bytes(g: &Geography) -> anyhow::Result<Vec<u8>> {
     }
     Ok(out)
 }
-pub(crate) fn parse(raw: &[u8], n: usize) -> anyhow::Result<Geography> {
+pub fn parse(raw: &[u8], n: usize) -> anyhow::Result<Geography> {
     anyhow::ensure!(raw.len() >= 4 && raw.len() <= MAX_RAW, "地理资料长度无效");
     let len = u32::from_le_bytes(raw[..4].try_into()?) as usize;
     anyhow::ensure!(
@@ -97,7 +97,7 @@ fn decode(value: &serde_json::Value, n: usize) -> anyhow::Result<Geography> {
 }
 
 /// Rebuild old/imported maps from the authoritative elevation and receiver graph.
-fn for_map(store: &Store, node: &MapNodeRecord) -> anyhow::Result<Geography> {
+pub(crate) fn for_map(store: &Store, node: &MapNodeRecord) -> anyhow::Result<Geography> {
     if let Some(value) = store
         .get_metadata(&node.id)?
         .and_then(|mut m| m.as_object_mut()?.remove(KEY))
@@ -125,6 +125,11 @@ fn for_map(store: &Store, node: &MapNodeRecord) -> anyhow::Result<Geography> {
     fields.lake_depth = store
         .get_field(&node.id, Channel::LakeDepth)?
         .unwrap_or_else(|| vec![0.; grid.cell_count()]);
+    if let Some(b) =
+        crate::refinement::decode(&store.get_metadata(&node.id)?.unwrap_or_default(), &grid)?
+    {
+        b.apply(&mut fields, 0).map_err(anyhow::Error::msg)?;
+    }
     let water = if let Some(saved) = store.get_field(&node.id, Channel::FlowReceiver)? {
         let receivers = saved
             .iter()

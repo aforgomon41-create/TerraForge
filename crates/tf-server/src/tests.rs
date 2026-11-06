@@ -11,6 +11,122 @@ struct Fixture {
     state: api::AppState,
     _dir: tempfile::TempDir,
 }
+#[tokio::test]
+async fn spherical_patch_rivers_use_local_metres_instead_of_unit_sphere_vectors() {
+    use tf_grid::GridOps;
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let world = f.world(&token).await;
+    let mut n = node(&world, "patch-rivers");
+    let d = tf_grid::GridDescriptor::patch(25., 179.9, 80000., 16, 6371000.);
+    let g = d.build();
+    n.grid = Some(d);
+    n.kind = "continent".into();
+    n.cells = g.cell_count() as u32;
+    n.cell_size_m = 5000.;
+    f.state.store.put_map_node(&n).unwrap();
+    let mut fields = tf_sim::WorldFields::with_capacity(g.cell_count());
+    for i in 0..g.cell_count() {
+        let (x, y) = g.local_center_m(i).unwrap();
+        fields.elevation[i] = (1000. - x * 0.01 + y * 0.00001) as f32;
+        fields.precipitation[i] = 1000.;
+    }
+    let water = tf_sim::erosion::refresh_hydrology(&g, &mut fields);
+    fields.flow_accumulation.fill(1e12);
+    let receivers: Vec<_> = water
+        .flow_dir
+        .iter()
+        .map(|&r| if r == u32::MAX { -1. } else { r as f32 })
+        .collect();
+    f.state
+        .store
+        .publish_fields(
+            &n.id,
+            &[
+                (Channel::Elevation, &fields.elevation),
+                (Channel::FlowAccumulation, &fields.flow_accumulation),
+                (Channel::FlowReceiver, &receivers),
+            ],
+            &json!({"hydrology_model":{"name":"depression-hierarchy-annual-balance-v1"}}),
+        )
+        .unwrap();
+    let (status, body) = f
+        .request(
+            "GET",
+            &format!("/api/v1/maps/{}/hydrology", n.id),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["segments"].as_u64().unwrap() > 0);
+    for group in body["groups"].as_array().unwrap() {
+        for point in group.as_array().unwrap().chunks_exact(3) {
+            let (x, y) = (point[0].as_f64().unwrap(), point[1].as_f64().unwrap());
+            let i = g.locate_local(x, y).unwrap();
+            let (a, b) = g.local_center_m(i).unwrap();
+            assert!((x - a).hypot(y - b) < 0.01, "{x}, {y}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn refinement_plan_keeps_full_width_uses_auto_precision_and_is_private() {
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let world = f.world(&token).await;
+    let mut n = node(&world, "planning-parent");
+    n.grid = Some(tf_grid::GridDescriptor::plane(
+        25., 0., 1_200_000., 100, 100, 6371000.,
+    ));
+    n.cells = 10000;
+    n.cell_size_m = 12000.;
+    f.state.store.put_map_node(&n).unwrap();
+    f.state
+        .store
+        .publish_fields(
+            &n.id,
+            &[(Channel::Elevation, &vec![100.; 10000])],
+            &json!({}),
+        )
+        .unwrap();
+    let path = format!(
+        "/api/v1/maps/{}/refinement-plan?width_m=800000&center_lat=25&center_lon=0",
+        n.id
+    );
+    let (status, p) = f.request("GET", &path, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    assert_eq!(p["can_generate"], true);
+    assert_eq!(p["width_m"], 800000.);
+    assert_eq!(p["side"], 512);
+    assert_eq!(p["cell_size_m"], 1562.5);
+    let (status, p) = f
+        .request(
+            "GET",
+            &(path.clone() + "&cell_size_m=100"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(p["can_generate"], false);
+    assert_eq!(
+        f.request(
+            "GET",
+            &format!("/api/v1/maps/{}/refinement-plan?width_m=-1", n.id),
+            Some(&token),
+            None
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let other = f.session().await;
+    assert_eq!(
+        f.request("GET", &path, Some(&other), None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
 impl Fixture {
     fn new(desktop: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();

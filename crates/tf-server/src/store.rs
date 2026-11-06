@@ -118,10 +118,11 @@ pub enum Channel {
     EcosystemHabitatGroup = 30,
     EcosystemVariant = 31,
     EcosystemEvidence = 32,
+    LakeRunoffLossFraction = 33,
 }
 
 impl Channel {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::Elevation,
         Self::CrustThickness,
         Self::CrustType,
@@ -155,6 +156,7 @@ impl Channel {
         Self::EcosystemHabitatGroup,
         Self::EcosystemVariant,
         Self::EcosystemEvidence,
+        Self::LakeRunoffLossFraction,
     ];
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|ch| ch.name() == name)
@@ -194,6 +196,7 @@ impl Channel {
             Channel::EcosystemHabitatGroup => "ecosystem_habitat_group",
             Channel::EcosystemVariant => "ecosystem_variant",
             Channel::EcosystemEvidence => "ecosystem_evidence",
+            Channel::LakeRunoffLossFraction => "lake_runoff_loss_fraction",
         }
     }
 }

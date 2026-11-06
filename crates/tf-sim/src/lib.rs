@@ -29,6 +29,7 @@ pub mod lifecycle;
 pub mod pipeline;
 pub mod plates;
 pub mod preview;
+pub mod refinement;
 pub mod scientific;
 pub mod scopes;
 pub mod seasonal;

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bitvec.workspace = true
 tf-core.workspace = true
 tf-grid.workspace = true
 glam.workspace = true
@@ -16,5 +17,3 @@ rand_chacha.workspace = true
 num-traits.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-[dev-dependencies]
-bitvec.workspace = true

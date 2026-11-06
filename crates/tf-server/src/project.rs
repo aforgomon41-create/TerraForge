@@ -77,7 +77,7 @@ pub fn export(store: &Store, world_id: &str) -> anyhow::Result<Vec<u8>> {
     );
     Ok(serde_json::to_vec(&Project {
         format: FORMAT.into(),
-        generator_version: "tf-0.6".into(),
+        generator_version: "tf-0.7".into(),
         world,
         maps,
     })?)
@@ -105,7 +105,7 @@ pub fn import(
         project.format == FORMAT
             && matches!(
                 project.generator_version.as_str(),
-                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6"
+                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7"
             ),
         "不支持的工程版本"
     );
@@ -174,7 +174,7 @@ pub fn import(
         anyhow::ensure!(
             matches!(
                 node.generator_version.as_str(),
-                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6"
+                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7"
             ) && node.status == "done",
             "地图版本或状态无效"
         );
@@ -263,7 +263,7 @@ pub fn import(
         }
         if matches!(
             node.generator_version.as_str(),
-            "tf-0.3" | "tf-0.4" | "tf-0.6"
+            "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7"
         ) {
             let spacing = match descriptor {
                 tf_grid::GridDescriptor::Plane { width_m, size, .. }
@@ -311,7 +311,11 @@ pub fn import(
             }
             if matches!(
                 ch,
-                Channel::SnowCover | Channel::SeaIce | Channel::Permafrost | Channel::LakeIce
+                Channel::SnowCover
+                    | Channel::SeaIce
+                    | Channel::Permafrost
+                    | Channel::LakeIce
+                    | Channel::LakeRunoffLossFraction
             ) {
                 anyhow::ensure!(
                     data.chunks_exact(4)
@@ -372,6 +376,21 @@ pub fn import(
         node.parent = node.parent.map(|p| ids[&p].clone());
         node.world_id = world.id.clone();
         let mut metadata: serde_json::Value = serde_json::from_str(m.metadata.get())?;
+        if metadata.get(crate::refinement::KEY).is_some() {
+            crate::refinement::decode(&metadata, &descriptor.build())?;
+            anyhow::ensure!(node.parent.is_some(), "局部边界资料缺少父图");
+            for required in [
+                Channel::LakeRunoffLossFraction,
+                Channel::FlowReceiver,
+                Channel::LiquidDischarge,
+            ] {
+                anyhow::ensure!(
+                    channels.iter().any(|(c, _)| *c == required),
+                    "局部边界工程缺少 {}",
+                    required.name()
+                );
+            }
+        }
         if has_ecosystems {
             anyhow::ensure!(
                 metadata["ecosystem_model"]["version"] == tf_sim::ecosystems::VERSION,

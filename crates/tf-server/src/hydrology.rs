@@ -57,6 +57,8 @@ pub async fn get_hydrology(
                 let canonical=if atlas.model==tf_sim::cryosphere::MODEL {ice.as_deref().zip(shelf.as_deref())} else {None};
                 let Some(view)=tf_sim::cryosphere::sample(&grid,&f,atlas,query.month,canonical) else{return Ok(json!({"available":false,"reason":"缺少与地图匹配的冰厚字段，请重新生成"}));};
                 f.cryosphere=Some(view);
+                f.lake_runoff_loss_fraction=optional(Channel::LakeRunoffLossFraction)?.unwrap_or_default();
+                if let Some(b)=crate::refinement::decode(&metadata,&grid)?{b.apply(&mut f,query.month).map_err(anyhow::Error::msg)?;}
                 let directions=receivers.iter().map(|&r|if r == -1. {Ok(u32::MAX)}else if r.is_finite() && r>=0. && r.fract()==0. && (r as usize)<n {Ok(r as u32)}else{Err(anyhow::anyhow!("水系下游编号无效"))}).collect::<anyhow::Result<Vec<_>>>()?;
                 let water=tf_sim::erosion::from_saved_receivers(&grid,&mut f,directions).map_err(anyhow::Error::msg)?;
                 discharge=Some(tf_sim::cryosphere::annual_discharge(&grid,&f,&water));monthly_liquid=true;
@@ -83,7 +85,7 @@ pub async fn get_hydrology(
             let seasonal=frost.as_ref().is_some_and(|v|v[i]>0.1)
                 || monthly.as_ref().is_some_and(|t|t.iter().any(|&v|v<0.));
             let group=usize::from(seasonal);
-            for cell in [i,j]{let p=if grid.field_is_planar(){grid.field_position(cell)}else{grid.center_dir(cell).as_vec()*1.0006};groups[group].extend(p.to_array().map(|x|x as f32));}
+            for cell in [i,j]{let p=if let Some((x,y))=grid.local_center_m(cell){glam::DVec3::new(x,y,0.)}else{grid.center_dir(cell).as_vec()*1.0006};groups[group].extend(p.to_array().map(|x|x as f32));}
             counts[group]+=1;
         }
         Ok(json!({"available":true,"groups":groups,"segments":counts.iter().sum::<i32>(),"perennial_segments":counts[0],"seasonal_segments":counts[1],
