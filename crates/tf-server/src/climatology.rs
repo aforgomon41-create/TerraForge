@@ -41,18 +41,47 @@ pub fn for_map(
     store: &crate::store::Store,
     node: &crate::store::MapNodeRecord,
 ) -> anyhow::Result<Option<ClimateAtlas>> {
-    let mut root = node.clone();
-    let mut depth = 0;
-    while let Some(id) = &root.parent {
-        depth += 1;
-        anyhow::ensure!(depth <= 4, "气候继承层级无效");
-        root = store
+    inherited(store, node, 0)
+}
+fn inherited(
+    store: &crate::store::Store,
+    node: &crate::store::MapNodeRecord,
+    depth: u8,
+) -> anyhow::Result<Option<ClimateAtlas>> {
+    anyhow::ensure!(depth <= 4, "气候继承层级无效");
+    let metadata = store.get_metadata(&node.id)?.unwrap_or_default();
+    let own = metadata.get("climate_atlas").map(decode).transpose()?;
+    let remap = metadata["climate_circulation_inherited"] == true;
+    if own.is_some() && !remap {
+        return Ok(own);
+    }
+    let parent = if let Some(id) = &node.parent {
+        let p = store
             .get_map_node(id)?
             .ok_or_else(|| anyhow::anyhow!("缺少气候父图"))?;
-        anyhow::ensure!(root.world_id == node.world_id, "气候父图不属于此工程");
+        anyhow::ensure!(p.world_id == node.world_id, "气候父图不属于此工程");
+        inherited(store, &p, depth + 1)?
+    } else {
+        None
+    };
+    if let Some(mut atlas) = own {
+        anyhow::ensure!(
+            atlas.circulation.is_none() && node.parent.is_some(),
+            "局部风场继承资料无效"
+        );
+        let height: Vec<f32> =
+            serde_json::from_value(metadata["regional_climate"]["reference_elevation_m"].clone())?;
+        if let Some(parent) = parent {
+            atlas.circulation =
+                tf_sim::regional_climate::remap_circulation(&parent, &atlas.grid, &height)
+                    .map_err(anyhow::Error::msg)?;
+        }
+        atlas.validate().map_err(anyhow::Error::msg)?;
+        Ok(Some(atlas))
+    } else {
+        anyhow::ensure!(!remap, "局部气候继承缺少本图资料");
+        Ok(parent)
     }
-    let metadata = store.get_metadata(&root.id)?.unwrap_or_default();
-    metadata.get("climate_atlas").map(decode).transpose()
 }
 
 #[cfg(test)]

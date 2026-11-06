@@ -30,6 +30,7 @@ pub mod pipeline;
 pub mod plates;
 pub mod preview;
 pub mod refinement;
+pub mod regional_climate;
 pub mod scientific;
 pub mod scopes;
 pub mod seasonal;

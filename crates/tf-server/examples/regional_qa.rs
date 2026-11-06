@@ -25,6 +25,14 @@ async fn call(
     token: Option<&str>,
     body: Option<Value>,
 ) -> anyhow::Result<Vec<u8>> {
+    call_body(app, path, token, body.map(|b| b.to_string().into_bytes())).await
+}
+async fn call_body(
+    app: &Router,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Vec<u8>>,
+) -> anyhow::Result<Vec<u8>> {
     let mut r = Request::builder()
         .uri(path)
         .method(if body.is_some() { "POST" } else { "GET" })
@@ -35,7 +43,7 @@ async fn call(
     }
     let response = app
         .clone()
-        .oneshot(r.body(body.map_or(Body::empty(), |b| Body::from(b.to_string())))?)
+        .oneshot(r.body(body.map_or(Body::empty(), Body::from))?)
         .await?;
     let status = response.status();
     let b = to_bytes(response.into_body(), 128 * 1024 * 1024).await?;
@@ -153,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
             completed_at: None,
             grid: Some(descriptor),
             seed: p.seed,
-            generator_version: "tf-0.7".into(),
+            generator_version: "tf-0.8".into(),
         };
         store.put_map_node(&child)?;
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
@@ -274,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
                 "import changed {suffix}"
             );
         }
-        let r = json!({"case":name,"seed":p.seed,"seconds":start.elapsed().as_secs_f64(),"map_id":child.id,"water":water,"refinement":meta["refinement_model"],"land_cells":land,"deep_lake_cells":lakes,"min_m":h.iter().copied().fold(f32::INFINITY,f32::min),"max_m":h.iter().copied().fold(f32::NEG_INFINITY,f32::max),"max_river_m3_s":q.iter().copied().fold(0.,f32::max),"determinism":true,"project_and_monthly_roundtrip":true});
+        let r = json!({"case":name,"seed":p.seed,"seconds":start.elapsed().as_secs_f64(),"map_id":child.id,"water":water,"refinement":meta["refinement_model"],"climate":meta["climate_model"],"return_links":meta[tf_server::refinement::KEY_V2]["links"].as_array().map_or(0,Vec::len),"land_cells":land,"deep_lake_cells":lakes,"min_m":h.iter().copied().fold(f32::INFINITY,f32::min),"max_m":h.iter().copied().fold(f32::NEG_INFINITY,f32::max),"max_river_m3_s":q.iter().copied().fold(0.,f32::max),"determinism":true,"project_and_monthly_roundtrip":true});
         println!("{}", serde_json::to_string(&r)?);
         reports.push(r);
         state.jobs.delete_world(&world_id).await?;
@@ -525,7 +533,47 @@ async fn full_continent(
             .await?,
         )?;
     }
-    let report = json!({"result":"passed","source":source,"map_id":map,"feature":p,"all_source_cells_covered":covered,"cells":node.cells,"refinement":meta["refinement_model"],"water":water,"generation_and_export_seconds":generation_seconds,"full_project_monthly_roundtrip":true,"nested_region":{"map_id":region_id,"plan":region_plan,"seconds":region_start.elapsed().as_secs_f64()},"total_seconds":start.elapsed().as_secs_f64()});
+    let packed = call(
+        app,
+        &format!("/api/v1/maps/{region_id}/export.json?packed=true"),
+        Some(token),
+        None,
+    )
+    .await?;
+    anyhow::ensure!(
+        packed.len() <= 64 * 1024 * 1024,
+        "saved project cannot be reopened under web upload cap"
+    );
+    let packed_size = packed.len();
+    std::fs::write(region_dir.join("world.tfworld"), &packed)?;
+    let imported: Value = serde_json::from_slice(
+        &call_body(app, "/api/v1/projects/import", Some(token), Some(packed)).await?,
+    )?;
+    let restored = state
+        .store
+        .list_map_nodes(imported["id"].as_str().unwrap())?
+        .into_iter()
+        .find(|n| n.name == "Second-level drainage QA")
+        .unwrap();
+    for (suffix, file) in [
+        ("hydrology", "hydrology.json"),
+        ("hydrology?month=1", "hydrology-1.json"),
+        ("hydrology?month=7", "hydrology-7.json"),
+        ("cryosphere?month=0", "ice-0.bin"),
+    ] {
+        anyhow::ensure!(
+            call(
+                app,
+                &format!("/api/v1/maps/{}/{suffix}", restored.id),
+                Some(token),
+                None
+            )
+            .await?
+                == std::fs::read(region_dir.join(file))?,
+            "nested packed import changed {suffix}"
+        );
+    }
+    let report = json!({"result":"passed","source":source,"map_id":map,"feature":p,"all_source_cells_covered":covered,"cells":node.cells,"refinement":meta["refinement_model"],"water":water,"generation_and_export_seconds":generation_seconds,"full_project_monthly_roundtrip":true,"nested_region":{"map_id":region_id,"plan":region_plan,"seconds":region_start.elapsed().as_secs_f64(),"packed_project_bytes":packed_size,"packed_project_monthly_roundtrip":true},"total_seconds":start.elapsed().as_secs_f64()});
     std::fs::write(out.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
     println!("{report}");
     Ok(())

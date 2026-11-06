@@ -1064,7 +1064,7 @@ async fn generate_child(
         completed_at: None,
         grid: Some(grid),
         seed: params.seed,
-        generator_version: "tf-0.7".into(),
+        generator_version: "tf-0.8".into(),
     };
     let job_id = st
         .jobs
@@ -1149,9 +1149,15 @@ async fn get_monthly_climate(
     }).await??;
     Ok(Json(result))
 }
+#[derive(serde::Deserialize, Default)]
+struct ProjectExportQuery {
+    #[serde(default)]
+    packed: bool,
+}
 async fn export_json(
     State(st): State<AppState>,
     Path(map_id): Path<String>,
+    Query(query): Query<ProjectExportQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let node = st
         .store
@@ -1165,12 +1171,24 @@ async fn export_json(
     })?;
     let bytes = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        crate::project::export(&st.store, &node.world_id)
+        let bytes = crate::project::export(&st.store, &node.world_id)?;
+        if query.packed {
+            crate::project::pack(&bytes)
+        } else {
+            Ok(bytes)
+        }
     })
     .await??;
     Ok((
         [
-            ("content-type", "application/json"),
+            (
+                "content-type",
+                if query.packed {
+                    "application/octet-stream"
+                } else {
+                    "application/json"
+                },
+            ),
             (
                 "content-disposition",
                 "attachment; filename=terraforge.tfworld",

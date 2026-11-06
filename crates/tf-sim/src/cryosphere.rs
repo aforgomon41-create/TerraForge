@@ -657,6 +657,16 @@ pub fn annual_discharge<G: GridOps>(
     fields: &WorldFields,
     water: &crate::erosion::ErosionState,
 ) -> Vec<f32> {
+    annual_discharge_f64(grid, fields, water)
+        .into_iter()
+        .map(|v| v as f32)
+        .collect()
+}
+pub fn annual_discharge_f64<G: GridOps>(
+    grid: &G,
+    fields: &WorldFields,
+    water: &crate::erosion::ErosionState,
+) -> Vec<f64> {
     let input = fields.liquid_water();
     let mut flux: Vec<f64> = (0..grid.cell_count())
         .map(|i| {
@@ -684,12 +694,11 @@ pub fn annual_discharge<G: GridOps>(
         .collect();
     for &cell in &water.topo_order {
         let i = cell as usize;
-        let j = water.flow_dir[i];
-        if j != u32::MAX {
-            flux[j as usize] += flux[i];
+        if let Some((j, retained)) = crate::erosion::flow_receiver(water, i) {
+            flux[j] += flux[i] * retained;
         }
     }
-    flux.into_iter().map(|v| v.max(0.) as f32).collect()
+    flux.into_iter().map(|v| v.max(0.)).collect()
 }
 
 #[cfg(test)]

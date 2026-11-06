@@ -326,7 +326,7 @@ export const api = {
     const r = await authorizedFetch('/api/v1/projects/import', {
       method: 'POST',
       body: file,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/octet-stream' },
     })
     return r.json() as Promise<World>
   },
@@ -336,7 +336,7 @@ export const api = {
     filename: string,
     ecosystem?: 'biome' | 'group' | 'variant',
   ) {
-    const query = format === 'png' && ecosystem ? `?ecosystem=${ecosystem}` : ''
+    const query = format === 'json' ? '?packed=true' : ecosystem ? `?ecosystem=${ecosystem}` : ''
     const res = await authorizedFetch(`/api/v1/maps/${id}/export.${format}${query}`)
     const url = URL.createObjectURL(await res.blob())
     const a = document.createElement('a')

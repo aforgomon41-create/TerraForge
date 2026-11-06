@@ -10,8 +10,38 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::Read,
 };
+use tf_grid::GridOps;
 
 const FORMAT: &str = "terraforge-project-v2";
+const PACKED_MAGIC: &[u8] = b"TFWORLD\0\x01";
+/// The HTTP upload cap remains 64 MiB. Bound the decoded file separately;
+/// map counts, field lengths and metadata budgets are still checked below.
+pub fn pack(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::from(PACKED_MAGIC);
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    let mut encoder = zstd::stream::write::Encoder::new(out, 3)?;
+    std::io::Write::write_all(&mut encoder, bytes)?;
+    Ok(encoder.finish()?)
+}
+fn unpack(bytes: &[u8], desktop: bool) -> anyhow::Result<Option<Vec<u8>>> {
+    if !bytes.starts_with(PACKED_MAGIC) {
+        return Ok(None);
+    }
+    let header = PACKED_MAGIC.len() + 8;
+    anyhow::ensure!(bytes.len() >= header, "压缩工程头损坏");
+    let expected = u64::from_le_bytes(bytes[PACKED_MAGIC.len()..header].try_into().unwrap());
+    let limit = if desktop { 512 } else { 128 } * 1024 * 1024;
+    anyhow::ensure!(
+        expected > 0 && expected <= limit,
+        "解压后的工程超过当前模式限制"
+    );
+    let mut decoder = zstd::stream::read::Decoder::new(&bytes[header..])?;
+    decoder.window_log_max(26)?;
+    let mut raw = Vec::new();
+    decoder.take(expected + 1).read_to_end(&mut raw)?;
+    anyhow::ensure!(raw.len() as u64 == expected, "压缩工程长度不匹配");
+    Ok(Some(raw))
+}
 #[derive(Serialize, Deserialize)]
 struct Field {
     encoding: String,
@@ -77,7 +107,7 @@ pub fn export(store: &Store, world_id: &str) -> anyhow::Result<Vec<u8>> {
     );
     Ok(serde_json::to_vec(&Project {
         format: FORMAT.into(),
-        generator_version: "tf-0.7".into(),
+        generator_version: "tf-0.8".into(),
         world,
         maps,
     })?)
@@ -88,6 +118,8 @@ pub fn import(
     owner: &str,
     config: &ServerConfig,
 ) -> anyhow::Result<WorldRecord> {
+    let decoded = unpack(bytes, config.desktop)?;
+    let bytes = decoded.as_deref().unwrap_or(bytes);
     let project: Project<Box<serde_json::value::RawValue>> = serde_json::from_slice(bytes)?;
     let metadata_bytes: usize = project.maps.iter().map(|m| m.metadata.get().len()).sum();
     anyhow::ensure!(
@@ -105,7 +137,7 @@ pub fn import(
         project.format == FORMAT
             && matches!(
                 project.generator_version.as_str(),
-                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7"
+                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7" | "tf-0.8"
             ),
         "不支持的工程版本"
     );
@@ -174,7 +206,7 @@ pub fn import(
         anyhow::ensure!(
             matches!(
                 node.generator_version.as_str(),
-                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7"
+                "tf-0.2" | "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7" | "tf-0.8"
             ) && node.status == "done",
             "地图版本或状态无效"
         );
@@ -263,7 +295,7 @@ pub fn import(
         }
         if matches!(
             node.generator_version.as_str(),
-            "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7"
+            "tf-0.3" | "tf-0.4" | "tf-0.6" | "tf-0.7" | "tf-0.8"
         ) {
             let spacing = match descriptor {
                 tf_grid::GridDescriptor::Plane { width_m, size, .. }
@@ -279,6 +311,7 @@ pub fn import(
             );
         }
         let mut channels = Vec::new();
+        let mut saved_receivers = None;
         let mut ecosystem_fields: [Option<Vec<f32>>; 6] = std::array::from_fn(|_| None);
         for (name, field) in m.channels {
             let ch = Channel::parse(&name).ok_or_else(|| anyhow::anyhow!("未知数据通道"))?;
@@ -307,6 +340,18 @@ pub fn import(
                         r == -1. || (r >= 0. && r.fract() == 0. && (r as usize) < field.count)
                     }),
                     "水系下游编号无效"
+                );
+                saved_receivers = Some(
+                    data.chunks_exact(4)
+                        .map(|b| {
+                            let v = f32::from_le_bytes(b.try_into().unwrap());
+                            if v < 0. {
+                                u32::MAX
+                            } else {
+                                v as u32
+                            }
+                        })
+                        .collect::<Vec<_>>(),
                 );
             }
             if matches!(
@@ -376,8 +421,11 @@ pub fn import(
         node.parent = node.parent.map(|p| ids[&p].clone());
         node.world_id = world.id.clone();
         let mut metadata: serde_json::Value = serde_json::from_str(m.metadata.get())?;
-        if metadata.get(crate::refinement::KEY).is_some() {
-            crate::refinement::decode(&metadata, &descriptor.build())?;
+        if metadata.get(crate::refinement::KEY).is_some()
+            || metadata.get(crate::refinement::KEY_V2).is_some()
+        {
+            let grid = descriptor.build();
+            let forcing = crate::refinement::decode(&metadata, &grid)?.unwrap();
             anyhow::ensure!(node.parent.is_some(), "局部边界资料缺少父图");
             for required in [
                 Channel::LakeRunoffLossFraction,
@@ -390,6 +438,26 @@ pub fn import(
                     required.name()
                 );
             }
+            let receivers = saved_receivers
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("局部边界工程缺少保存流向"))?;
+            anyhow::ensure!(
+                receivers
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &r)| r == u32::MAX || grid.neighbors(i).contains(&r)),
+                "保存的流向不满足地形邻接"
+            );
+            let links: Vec<_> = forcing
+                .links
+                .iter()
+                .map(|p| tf_sim::refinement::WaterLink {
+                    outlet: p.outlet,
+                    inlet: p.inlet,
+                    retention: p.water_retention[0],
+                })
+                .collect();
+            tf_sim::refinement::routing_order(&receivers, &links).map_err(anyhow::Error::msg)?;
         }
         if has_ecosystems {
             anyhow::ensure!(
@@ -412,7 +480,32 @@ pub fn import(
                 (atlas.grid.radius_m() - params.planet.radius_m).abs() < 0.001,
                 "月气候半径与工程不一致"
             );
+            if let Some(local) = metadata.get("regional_climate") {
+                let diagnostics: tf_sim::regional_climate::Diagnostics =
+                    serde_json::from_value(local.clone())?;
+                anyhow::ensure!(
+                    node.parent.is_some()
+                        && diagnostics.cells == atlas.grid.cell_count()
+                        && diagnostics.reference_elevation_m.len() == diagnostics.cells
+                        && diagnostics
+                            .reference_elevation_m
+                            .iter()
+                            .all(|h| h.is_finite()),
+                    "局部气候背景地形无效"
+                );
+                anyhow::ensure!(
+                    metadata["climate_circulation_inherited"] == true
+                        && atlas.circulation.is_none(),
+                    "局部风场存储约定无效"
+                );
+            }
         }
+        anyhow::ensure!(
+            (metadata.get("regional_climate").is_none()
+                && metadata.get("climate_circulation_inherited").is_none())
+                || metadata.get("climate_atlas").is_some(),
+            "缺少局部月气候资料"
+        );
         if let Some(ice) = metadata.get("cryosphere_atlas") {
             let atlas = crate::cryosphere::decode(ice)?;
             if atlas.model == tf_sim::cryosphere::MODEL {
@@ -445,4 +538,25 @@ pub fn import(
     }
     store.import_project(&world, &maps)?;
     Ok(world)
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    #[test]
+    fn packed_projects_are_bounded_and_reject_truncation_and_length_mismatch() {
+        let source = br#"{"format":"fixture","data":[1,2,3]}"#;
+        let packed = pack(source).unwrap();
+        assert_eq!(unpack(&packed, false).unwrap().unwrap(), source);
+        assert!(unpack(source, false).unwrap().is_none());
+        assert!(unpack(PACKED_MAGIC, false).is_err());
+        let mut invalid = packed.clone();
+        invalid[PACKED_MAGIC.len()..PACKED_MAGIC.len() + 8]
+            .copy_from_slice(&(129_u64 * 1024 * 1024).to_le_bytes());
+        assert!(unpack(&invalid, false).is_err());
+        let mut invalid = packed.clone();
+        invalid[PACKED_MAGIC.len()..PACKED_MAGIC.len() + 8].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(unpack(&invalid, false).is_err());
+        assert!(unpack(&packed[..packed.len() - 4], false).is_err());
+    }
 }

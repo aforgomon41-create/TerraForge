@@ -503,8 +503,7 @@ impl ClimateAtlas {
                     return Err("月气候球面网格无效".into());
                 }
             }
-            GridDescriptor::Plane { .. } => self.grid.validate()?,
-            _ => return Err("月气候网格类型无效".into()),
+            GridDescriptor::Plane { .. } | GridDescriptor::Patch { .. } => self.grid.validate()?,
         }
         let n = self.grid.cell_count();
         if n > MAX_ATLAS_CELLS {

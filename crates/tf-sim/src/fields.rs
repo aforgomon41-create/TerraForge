@@ -53,6 +53,9 @@ pub struct WorldFields {
     /// Empty for global and legacy maps. Water is annualized m3/year.
     pub external_water_m3_yr: Vec<f64>,
     pub external_area_m2: Vec<f64>,
+    /// Internal transfer through a paired outside reach; never new rainfall.
+    pub boundary_links: Vec<crate::refinement::WaterLink>,
+    pub recycled_water_m3_yr: Vec<f64>,
     /// Prescribed downstream water levels, independent of the ground surface.
     pub boundary_stages: Vec<(u32, f64)>,
     /// Additional lake ET fraction before externally held backwater is applied.
@@ -92,6 +95,8 @@ impl WorldFields {
             liquid_discharge: Vec::new(),
             external_water_m3_yr: Vec::new(),
             external_area_m2: Vec::new(),
+            boundary_links: Vec::new(),
+            recycled_water_m3_yr: Vec::new(),
             boundary_stages: Vec::new(),
             lake_runoff_loss_fraction: Vec::new(),
             liquid_background_mm: Vec::new(),

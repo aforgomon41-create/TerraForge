@@ -19,6 +19,20 @@ pub struct Outlet {
     pub cell: u32,
     pub surface_m: f64,
 }
+/// An outside river reach connects two boundary ports; it is never drawn as a
+/// straight line across the interior. Retention is the saved outside-path loss.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReturnLink {
+    pub outlet: u32,
+    pub inlet: u32,
+    pub water_retention: [f64; 13],
+}
+#[derive(Debug, Clone)]
+pub struct WaterLink {
+    pub outlet: u32,
+    pub inlet: u32,
+    pub retention: f64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryForcing {
     pub version: u32,
@@ -28,24 +42,29 @@ pub struct BoundaryForcing {
     pub outlets: Vec<Outlet>,
     /// Parent legacy models save a sediment ledger, not per-edge load.
     pub sediment_available: bool,
+    #[serde(default)]
+    pub links: Vec<ReturnLink>,
 }
 impl BoundaryForcing {
     pub fn empty(n: usize) -> Self {
         Self {
-            version: 1,
+            version: 2,
             cells: n,
             monthly_available: false,
             inlets: vec![],
             outlets: vec![],
             sediment_available: false,
+            links: vec![],
         }
     }
     pub fn validate(&self, n: usize) -> Result<(), String> {
-        if self.version != 1
+        if ![1, 2].contains(&self.version)
             || self.cells != n
             || n == 0
             || self.inlets.len() > n * 2
             || self.outlets.len() > n
+            || self.links.len() > n
+            || (self.version == 1 && !self.links.is_empty())
         {
             return Err("局部边界资料尺寸无效".into());
         }
@@ -63,6 +82,21 @@ impl BoundaryForcing {
         {
             return Err("局部边界资料数值无效".into());
         }
+        let mut seen = std::collections::BTreeSet::new();
+        for link in &self.links {
+            if link.outlet as usize >= n
+                || link.inlet as usize >= n
+                || link.outlet == link.inlet
+                || !seen.insert(link.outlet)
+                || !self.outlets.iter().any(|p| p.cell == link.outlet)
+                || link
+                    .water_retention
+                    .iter()
+                    .any(|x| !x.is_finite() || !(0. ..=1.).contains(x))
+            {
+                return Err("跨边界河流端口无效或重复".into());
+            }
+        }
         Ok(())
     }
     pub fn apply(&self, fields: &mut WorldFields, month: u8) -> Result<(), String> {
@@ -73,6 +107,17 @@ impl BoundaryForcing {
         fields.external_water_m3_yr = vec![0.; self.cells];
         fields.external_area_m2 = vec![0.; self.cells];
         fields.boundary_stages = self.outlets.iter().map(|p| (p.cell, p.surface_m)).collect();
+        fields.boundary_links = self
+            .links
+            .iter()
+            .map(|p| WaterLink {
+                outlet: p.outlet,
+                inlet: p.inlet,
+                retention: p.water_retention[month as usize],
+            })
+            .collect();
+        fields.boundary_links.sort_by_key(|p| p.outlet);
+        fields.recycled_water_m3_yr = vec![0.; self.cells];
         for p in &self.inlets {
             fields.external_water_m3_yr[p.cell as usize] +=
                 p.water_m3_s[month as usize] * YEAR_SECONDS;
@@ -80,6 +125,26 @@ impl BoundaryForcing {
         }
         Ok(())
     }
+}
+
+pub fn routing_order(receivers: &[u32], links: &[WaterLink]) -> Result<Vec<u32>, String> {
+    let mut combined = receivers.to_vec();
+    let n = combined.len();
+    let mut seen = std::collections::BTreeSet::new();
+    for link in links {
+        if link.outlet as usize >= n
+            || link.inlet as usize >= n
+            || link.outlet == link.inlet
+            || !link.retention.is_finite()
+            || !(0. ..=1.).contains(&link.retention)
+            || !seen.insert(link.outlet)
+            || receivers[link.outlet as usize] != u32::MAX
+        {
+            return Err("跨边界河流必须连接真实出口和入口".into());
+        }
+        combined[link.outlet as usize] = link.inlet;
+    }
+    order(&combined).map_err(|_| "跨边界河流形成循环，请提高精度或扩大选区".into())
 }
 
 /// Only inherited outward-facing terrain and actual river exits are open.
@@ -91,6 +156,12 @@ pub struct BoundaryGrid<'a> {
 impl<'a> BoundaryGrid<'a> {
     pub fn new(grid: &'a MapGrid, b: &BoundaryForcing) -> Result<Self, String> {
         b.validate(grid.cell_count())?;
+        if b.links
+            .iter()
+            .any(|p| !grid.boundary_mask()[p.inlet as usize])
+        {
+            return Err("跨界河流入口不在地图边界".into());
+        }
         let mut open = bitvec::bitvec![0;grid.cell_count()];
         for p in &b.outlets {
             if !grid.boundary_mask()[p.cell as usize] {
@@ -300,7 +371,21 @@ pub fn inherit(
     {
         return Err("父图水文尺寸无效".into());
     }
-    let order = order(receivers)?;
+    let parent_links: std::collections::BTreeMap<u32, ReturnLink> = parent_forcing
+        .into_iter()
+        .flat_map(|p| p.links.iter())
+        .map(|p| (p.outlet, p.clone()))
+        .collect();
+    let active_parent_links: Vec<_> = parent_links
+        .values()
+        .map(|p| WaterLink {
+            outlet: p.outlet,
+            inlet: p.inlet,
+            retention: p.water_retention[0],
+        })
+        .collect();
+    let order = routing_order(receivers, &active_parent_links)?;
+    let mut retained_at = vec![1.; n];
     let (width, height) = child.extent_m().ok_or("细化图必须为有限域")?;
     if child.boundary_mask().not_any() {
         return Err("细化图没有边界".into());
@@ -380,22 +465,40 @@ pub fn inherit(
             return Err("细化已取消".into());
         }
         let i = i as usize;
-        let j = receivers[i];
-        if j == u32::MAX {
+        let virtual_link = parent_links.get(&(i as u32));
+        let j = if receivers[i] != u32::MAX {
+            receivers[i] as usize
+        } else if let Some(p) = virtual_link {
+            p.inlet as usize
+        } else {
             continue;
-        }
-        let j = j as usize;
+        };
         if f.lake_runoff_loss_fraction.get(i).is_some_and(|&v| v > 0.)
             && f.liquid_discharge.len() == n
             && full_annual[i] > 0.
         {
             let retained = (f.liquid_discharge[i] as f64 / full_annual[i]).clamp(0., 1.);
+            retained_at[i] = retained;
             for m in 0..13 {
                 q[i][m] *= retained;
             }
             full_annual[i] *= retained;
         }
-        if let (Some(a), Some(b)) = (
+        if receivers[i] == u32::MAX {
+            if child.cell_at(parent.center_dir(j)).is_some() {
+                if let Some((x, y)) = project(child, parent.center_dir(j)) {
+                    let cell = boundary_cell(child, x, y);
+                    let entry = inputs.entry(cell).or_insert(([0.; 13], 0.));
+                    let p = virtual_link.unwrap();
+                    for m in 0..13 {
+                        entry.0[m] += q[i][m] * p.water_retention[m];
+                    }
+                    entry.1 += area[i];
+                    q[i] = [0.; 13];
+                    area[i] = 0.;
+                }
+            }
+        } else if let (Some(a), Some(b)) = (
             project(child, parent.center_dir(i)),
             edge_end(parent, child, i, j),
         ) {
@@ -416,10 +519,16 @@ pub fn inherit(
             }
         }
         for m in 0..13 {
-            q[j][m] += q[i][m];
+            q[j][m] += q[i][m]
+                * virtual_link
+                    .filter(|_| receivers[i] == u32::MAX)
+                    .map_or(1., |p| p.water_retention[m]);
         }
         area[j] += area[i];
-        full_annual[j] += full_annual[i];
+        full_annual[j] += full_annual[i]
+            * virtual_link
+                .filter(|_| receivers[i] == u32::MAX)
+                .map_or(1., |p| p.water_retention[0]);
     }
     drop(q);
     drop(area);
@@ -524,6 +633,182 @@ pub fn inherit(
             }
         }
     }
+    // Reverse-DAG memoization finds the first return from each outside node.
+    // Outside parent ports are real virtual reaches, never straight chords.
+    let mut returns = vec![u32::MAX; n];
+    let mut survival = vec![1.; n];
+    // Most parents have annual-only outside losses. Allocate extra monthly
+    // storage only when an ancestor actually supplies different monthly rates.
+    let mut monthly_survival = parent_links
+        .values()
+        .any(|p| {
+            p.water_retention[1..]
+                .iter()
+                .any(|&r| r != p.water_retention[0])
+        })
+        .then(|| vec![[1_f32; 12]; n]);
+    for &ii in order.iter().rev() {
+        let i = ii as usize;
+        if cancel() {
+            return Err("细化已取消".into());
+        }
+        if child.cell_at(parent.center_dir(i)).is_some() {
+            continue;
+        }
+        let r = receivers[i];
+        if r == u32::MAX {
+            if let Some(p) = parent_links.get(&ii) {
+                let j = p.inlet as usize;
+                if let Some((x, y)) = project(child, parent.center_dir(j))
+                    .filter(|_| child.cell_at(parent.center_dir(j)).is_some())
+                {
+                    returns[i] = boundary_cell(child, x, y) as u32;
+                    survival[i] = retained_at[i] * p.water_retention[0];
+                } else {
+                    returns[i] = returns[j];
+                    survival[i] = retained_at[i] * p.water_retention[0] * survival[j];
+                }
+                if let Some(values) = &mut monthly_survival {
+                    for m in 0..12 {
+                        values[i][m] = (retained_at[i]
+                            * p.water_retention[m + 1]
+                            * if returns[j] == u32::MAX
+                                || child.cell_at(parent.center_dir(j)).is_some()
+                            {
+                                1.
+                            } else {
+                                values[j][m] as f64
+                            }) as f32;
+                    }
+                }
+            }
+            continue;
+        }
+        let j = r as usize;
+        let entry = project(child, parent.center_dir(i))
+            .zip(edge_end(parent, child, i, j))
+            .and_then(|(a, b)| {
+                clip(a, b, width, height)
+                    .filter(|(lo, hi)| hi - lo > 1e-10)
+                    .map(|(lo, _)| {
+                        boundary_cell(child, a.0 + (b.0 - a.0) * lo, a.1 + (b.1 - a.1) * lo) as u32
+                    })
+            });
+        if let Some(cell) = entry {
+            returns[i] = cell;
+            survival[i] = retained_at[i];
+        } else {
+            returns[i] = returns[j];
+            survival[i] = retained_at[i] * survival[j];
+        }
+        if let Some(values) = &mut monthly_survival {
+            for m in 0..12 {
+                values[i][m] = (retained_at[i]
+                    * if entry.is_some() {
+                        1.
+                    } else {
+                        values[j][m] as f64
+                    }) as f32;
+            }
+        }
+    }
+    let path_retention = |i: usize| -> [f64; 13] {
+        std::array::from_fn(|m| {
+            if m == 0 {
+                survival[i]
+            } else {
+                monthly_survival
+                    .as_ref()
+                    .map_or(survival[i], |v| v[i][m - 1] as f64)
+            }
+        })
+    };
+    let mut links = std::collections::BTreeMap::<u32, ReturnLink>::new();
+    let mut add_link =
+        |outlet: u32, inlet: u32, retention: [f64; 13], z: f64| -> Result<(), String> {
+            if inlet == u32::MAX {
+                return Ok(());
+            }
+            if outlet == inlet {
+                return Err("跨界河道小于当前格距，请提高精度或移动选区".into());
+            }
+            if let Some(old) = links.get(&outlet) {
+                if old.inlet != inlet
+                    || old
+                        .water_retention
+                        .iter()
+                        .zip(retention)
+                        .any(|(a, b)| (a - b).abs() > 1e-5)
+                {
+                    return Err("不同跨界河道共用出水格，请提高精度".into());
+                }
+            }
+            links.insert(
+                outlet,
+                ReturnLink {
+                    outlet,
+                    inlet,
+                    water_retention: retention,
+                },
+            );
+            exits.entry(outlet as usize).or_insert(z.max(0.));
+            Ok(())
+        };
+    for i in 0..n {
+        if i % 2048 == 0 && cancel() {
+            return Err("细化已取消".into());
+        }
+        let r = receivers[i];
+        if r == u32::MAX {
+            if let Some(p) = parent_links.get(&(i as u32)) {
+                if child.cell_at(parent.center_dir(i)).is_some() {
+                    let a = project(child, parent.center_dir(i)).unwrap();
+                    let outlet = boundary_cell(child, a.0, a.1) as u32;
+                    let j = p.inlet as usize;
+                    let (dest, ret) = if child.cell_at(parent.center_dir(j)).is_some() {
+                        let b = project(child, parent.center_dir(j)).unwrap();
+                        (boundary_cell(child, b.0, b.1) as u32, p.water_retention)
+                    } else {
+                        (
+                            returns[j],
+                            std::array::from_fn(|m| p.water_retention[m] * path_retention(j)[m]),
+                        )
+                    };
+                    add_link(
+                        outlet,
+                        dest,
+                        ret,
+                        f.elevation[i] as f64 + f.lake_depth.get(i).copied().unwrap_or(0.) as f64,
+                    )?;
+                }
+            }
+            continue;
+        }
+        let j = r as usize;
+        if returns[j] == u32::MAX {
+            continue;
+        }
+        let Some((a, b)) = project(child, parent.center_dir(i)).zip(edge_end(parent, child, i, j))
+        else {
+            continue;
+        };
+        let Some((lo, hi)) = clip(a, b, width, height) else {
+            continue;
+        };
+        if hi - lo < 1e-10 || (hi >= 1. - 1e-10 && child.cell_at(parent.center_dir(j)).is_some()) {
+            continue;
+        }
+        let p = (a.0 + (b.0 - a.0) * hi, a.1 + (b.1 - a.1) * hi);
+        let z = f.elevation[i] as f64 * (1. - hi) + f.elevation[j] as f64 * hi;
+        add_link(
+            boundary_cell(child, p.0, p.1) as u32,
+            returns[j],
+            path_retention(j),
+            z,
+        )?;
+    }
+    drop(add_link);
+    result.links = links.into_values().collect();
     // A partial coarse cell may contribute outside water straight to an exit.
     // Keeping both ports is conservative; deleting that exit makes a false lake.
     result.outlets = exits
@@ -670,9 +955,42 @@ mod tests {
             &|| false,
         )
         .unwrap();
+        assert!(
+            !b.links.is_empty(),
+            "the outgoing reach must connect to its next entry"
+        );
         for m in 0..13 {
             let input = b.inlets.iter().map(|p| p.water_m3_s[m]).sum::<f64>();
             assert!((input - 2.).abs() < 1e-12, "month {m}: {input}");
+        }
+        // Replace the outside bend by a saved ancestor port. Its seasonal
+        // retention must survive a second generation, once per outside reach.
+        receivers[8 * 32 + 30] = u32::MAX;
+        let mut retention = [0.8; 13];
+        retention[1] = 0.2;
+        retention[7] = 0.95;
+        forcing.outlets.push(Outlet {
+            cell: 8 * 32 + 30,
+            surface_m: 0.,
+        });
+        forcing.links.push(ReturnLink {
+            outlet: 8 * 32 + 30,
+            inlet: 10 * 32 + 30,
+            water_retention: retention,
+        });
+        let (linked, _) = inherit(
+            &parent,
+            &child,
+            &f,
+            &receivers,
+            Some(&forcing),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(linked.links.len(), 1);
+        for (actual, expected) in linked.links[0].water_retention.iter().zip(retention) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
     }
     #[test]

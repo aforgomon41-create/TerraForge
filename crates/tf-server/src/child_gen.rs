@@ -154,6 +154,12 @@ pub fn run_child_generation(
         })
         .transpose()
         .map_err(anyhow::Error::msg)?;
+    let parent_height = std::mem::take(&mut parent_fields.elevation);
+    let parent_climate = parent_fields.climate.take();
+    let source_reference: Option<Vec<f32>> = parent_meta
+        .pointer("/regional_climate/reference_elevation_m")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()?;
     drop(parent_fields);
     let mut fields = tf_sim::WorldFields::with_capacity(work.cell_count());
     fields.elevation = sample.elevation.clone();
@@ -215,7 +221,7 @@ pub fn run_child_generation(
         tf_sim::refinement::BoundaryGrid::new(&work, &work_forcing).map_err(anyhow::Error::msg)?;
     fields.temperature = sample.temperature.clone();
     fields.precipitation = sample.precipitation.clone();
-    fields.climate = crate::climatology::for_map(store, &parent)?;
+    fields.climate = parent_climate.clone();
     inherited_pet(&work, &mut fields, params);
     // The halo has the parent's prescribed ice background. Computing its snow
     // and melt budget does not require a second evolving ice-sheet solver.
@@ -253,7 +259,7 @@ pub fn run_child_generation(
         k_river: tf_sim::erosion::ErosionParams::default().k_river * params.erosion_strength,
         ..Default::default()
     };
-    let Some(erosion_result) = tf_sim::erosion::run_erosion_observed(
+    let Some(erosion_result) = tf_sim::erosion::run_erosion_linked_observed(
         &water_grid,
         &mut fields,
         &erosion,
@@ -267,7 +273,9 @@ pub fn run_child_generation(
             info.detail = "子区域河流与坡面细化";
             tf_sim::preview::emit(&mut live, &work, fields, info);
         },
-    ) else {
+    )
+    .map_err(anyhow::Error::msg)?
+    else {
         return Ok(());
     };
     if cancel.load(Ordering::Relaxed) {
@@ -277,17 +285,80 @@ pub fn run_child_generation(
     for i in 0..work.cell_count() {
         fields.temperature[i] -= (fields.elevation[i] - sample.elevation[i]) * 0.0065;
     }
+    let mut sediment = erosion_result.sediment;
+    let mut regional_climate = None;
+    if let Some(background) = &parent_climate {
+        for pass in 0..2 {
+            progress("局部气候", 0.55 + pass as f64 * 0.04);
+            // Both passes start from the unchanged parent rainfall, avoiding
+            // repeated application of the same orographic anomaly.
+            fields.precipitation = sample.precipitation.clone();
+            let local = tf_sim::regional_climate::refine(
+                background,
+                &parent_grid,
+                &parent_height,
+                source_reference.as_deref(),
+                &work,
+                &work_descriptor,
+                &fields,
+                params.orographic_strength,
+                &|| cancel.load(Ordering::Relaxed),
+            )
+            .map_err(anyhow::Error::msg)?;
+            fields.precipitation = local.annual_precipitation;
+            fields.climate = Some(local.atlas);
+            regional_climate = Some(local.diagnostics);
+            inherited_pet(&work, &mut fields, params);
+            if let Some((liquid, pet)) = tf_sim::cryosphere::liquid_background(
+                &work,
+                &fields,
+                background_ice.as_deref(),
+                &|| cancel.load(Ordering::Relaxed),
+            ) {
+                fields.liquid_background_mm = liquid;
+                fields.pet_background_mm = pet;
+            } else {
+                return Ok(());
+            }
+            if pass == 0 && params.erosion_strength > 0. {
+                let old = fields.elevation.clone();
+                let feedback = tf_sim::erosion::ErosionParams {
+                    iterations: 4,
+                    ..erosion
+                };
+                let Some(result) = tf_sim::erosion::run_erosion_linked_observed(
+                    &water_grid,
+                    &mut fields,
+                    &feedback,
+                    &|| cancel.load(Ordering::Relaxed),
+                    &mut |_, _| {},
+                )
+                .map_err(anyhow::Error::msg)?
+                else {
+                    return Ok(());
+                };
+                sediment += result.sediment;
+                for i in 0..work.cell_count() {
+                    fields.temperature[i] -= (fields.elevation[i] - old[i]) * 0.0065;
+                }
+            }
+        }
+    }
     inherited_pet(&work, &mut fields, params);
+    let work_water = tf_sim::erosion::refresh_linked_hydrology(&water_grid, &mut fields, &|| {
+        cancel.load(Ordering::Relaxed)
+    })
+    .map_err(anyhow::Error::msg)?;
     let forcing = if padding > 0 {
         // The halo's own rainfall becomes external only when it crosses into
         // the final crop. Grandparent inflow stays explicit through this step.
         fields.liquid_discharge =
-            tf_sim::cryosphere::annual_discharge(&water_grid, &fields, &erosion_result);
+            tf_sim::cryosphere::annual_discharge(&water_grid, &fields, &work_water);
         let (b, _) = tf_sim::refinement::inherit(
             &work,
             &patch,
             &fields,
-            &erosion_result.flow_dir,
+            &work_water.flow_dir,
             Some(&work_forcing),
             background_ice.as_deref(),
             &|| cancel.load(Ordering::Relaxed),
@@ -338,7 +409,10 @@ pub fn run_child_generation(
             return Ok(());
         }
     }
-    let water = tf_sim::erosion::refresh_hydrology(&water_grid, &mut fields);
+    let water = tf_sim::erosion::refresh_linked_hydrology(&water_grid, &mut fields, &|| {
+        cancel.load(Ordering::Relaxed)
+    })
+    .map_err(anyhow::Error::msg)?;
     tf_sim::cryosphere::update_water_surfaces(&patch, &mut fields);
     fields.liquid_discharge = tf_sim::cryosphere::annual_discharge(&water_grid, &fields, &water);
     tf_sim::erosion::compute_distance_to_sea(&patch, &mut fields);
@@ -422,11 +496,21 @@ pub fn run_child_generation(
     for (channel, data) in &inherited {
         channels.push((*channel, data.as_slice()));
     }
-    let mut metadata = serde_json::json!({"generator_version":"tf-0.7","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
-    metadata[crate::refinement::KEY] = serde_json::to_value(&forcing)?;
+    let mut metadata = serde_json::json!({"generator_version":"tf-0.8","parent":parent.id,"minerals":minerals,"plates":parent_meta.get("plates"),"planar_velocities":parent_meta.get("planar_velocities"),"motion_domain":parent_meta.get("motion_domain"),"climate_model":parent_meta.get("climate_model")});
+    metadata[crate::refinement::KEY_V2] = serde_json::to_value(&forcing)?;
+    if let Some(local) = regional_climate {
+        if let Some(atlas) = &fields.climate {
+            let mut saved = atlas.clone();
+            saved.circulation = None;
+            metadata["climate_atlas"] = crate::climatology::encode(&saved)?;
+            metadata["climate_circulation_inherited"] = true.into();
+            metadata["climate_model"] = serde_json::json!({"name":atlas.model,"parent":local.parent_model,"months":12,"cells":atlas.grid.cell_count(),"energy":"prescribed parent seasonal background; no local energy solver","water":"fine-map monthly precipitation constrained to background"});
+        }
+        metadata["regional_climate"] = serde_json::to_value(local)?;
+    }
     metadata["erosion_budget_domain"] =
         "buffered solver domain; sediment ledger is not an output-only mass balance".into();
-    metadata["refinement_model"] = serde_json::json!({"name":"continuous-parent-river-boundary-v1","halo_cells":padding,"solver_cells":work.cell_count(),"output_cells":patch.cell_count(),"river_guides":guides.len(),"sediment_inflow":"unavailable in parent; local eroded sediment only","local_climate":"parent seasonal background with elevation lapse","ice_initial_condition":if initial_ice.is_some(){"continuous parent ice + 500-year fine-grid relaxation"}else{"no parent ice; fresh spinup"}});
+    metadata["refinement_model"] = serde_json::json!({"name":"continuous-parent-river-boundary-v2","halo_cells":padding,"solver_cells":work.cell_count(),"output_cells":patch.cell_count(),"river_guides":guides.len(),"sediment_inflow":"unavailable in parent; local eroded sediment only","local_climate":if fields.climate.is_some(){"parent-constrained regional cloud-delay rainfall + elevation lapse"}else{"legacy annual background; no monthly atlas"},"ice_initial_condition":if initial_ice.is_some(){"continuous parent ice + 500-year fine-grid relaxation"}else{"no parent ice; fresh spinup"}});
     if let Some(ice) = &fields.cryosphere {
         crate::cryosphere::attach(&mut metadata, ice)?;
         channels.extend(
@@ -446,7 +530,7 @@ pub fn run_child_generation(
             .into_iter()
             .zip(ecosystems.iter().map(Vec::as_slice)),
     );
-    metadata["hydrology_model"] = serde_json::json!({"name":"depression-hierarchy-annual-balance-v1","lake_depth":"actual_supported_water","water":water.lake_budget,"sediment":erosion_result.sediment});
+    metadata["hydrology_model"] = serde_json::json!({"name":"depression-hierarchy-annual-balance-v1","lake_depth":"actual_supported_water","water":water.lake_budget,"sediment":sediment,"boundary_return_model":"acyclic-outside-reach-feedback-v2","boundary_iterations":water.boundary_iterations,"outside_loss_basis":"parent annual lake-loss ratios; no separate monthly outside solver"});
     metadata["planar_spin_rad_myr"] = parent_meta
         .get("planar_spin_rad_myr")
         .cloned()

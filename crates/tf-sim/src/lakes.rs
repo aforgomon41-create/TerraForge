@@ -73,6 +73,14 @@ pub struct LakeBudget {
     /// Water replacing extra evaporation from an externally maintained stage.
     #[serde(default)]
     pub prescribed_head_supply_m3_yr: f64,
+    #[serde(default)]
+    pub recycled_inflow_m3_yr: f64,
+    #[serde(default)]
+    pub recycled_outflow_m3_yr: f64,
+    #[serde(default)]
+    pub outside_reach_loss_m3_yr: f64,
+    #[serde(default)]
+    pub gross_terminal_runoff_m3_yr: f64,
     /// Rain/snow retained as solid water, net of melt from older snow/ice.
     #[serde(default)]
     pub solid_water_change_m3_yr: f64,
@@ -442,6 +450,7 @@ pub fn balance<G: GridOps>(grid: &G, fields: &mut WorldFields) -> (Vec<f64>, Lak
     if !liquid.iter().any(|&p| p > 0.)
         && !fields.external_water_m3_yr.iter().any(|&q| q > 0.)
         && fields.boundary_stages.is_empty()
+        && !fields.recycled_water_m3_yr.iter().any(|&q| q > 0.)
     {
         fields.lake_depth.fill(0.);
         let solid = (0..grid.cell_count())
@@ -467,16 +476,18 @@ pub fn balance<G: GridOps>(grid: &G, fields: &mut WorldFields) -> (Vec<f64>, Lak
     let mut budget = LakeBudget::default();
     for i in 0..n {
         let external = fields.external_water_m3_yr.get(i).copied().unwrap_or(0.);
+        let recycled = fields.recycled_water_m3_yr.get(i).copied().unwrap_or(0.);
+        budget.recycled_inflow_m3_yr += recycled;
         budget.external_inflow_m3_yr += external;
         if fields.elevation[i] <= 0. {
-            source[i] = external;
+            source[i] = external + recycled;
             continue;
         }
         let rain = (liquid[i] as f64).max(0.) / 1000.;
         let pet = (fields.runoff_pet(i) as f64).max(0.) / 1000.;
         source[i] = annual_runoff_m(rain * 1000., pet * 1000.) * tree.area[i];
         let actual_et = (rain * tree.area[i] - source[i]).max(0.);
-        source[i] += external;
+        source[i] += external + recycled;
         budget.precipitation_m3_yr += fields.precipitation[i].max(0.) as f64 / 1000. * tree.area[i];
         budget.solid_water_change_m3_yr +=
             (fields.precipitation[i].max(0.) as f64 / 1000. - rain) * tree.area[i];
@@ -574,9 +585,11 @@ pub fn balance<G: GridOps>(grid: &G, fields: &mut WorldFields) -> (Vec<f64>, Lak
         }
     }
     budget.terminal_runoff_m3_yr = tree.export();
+    budget.gross_terminal_runoff_m3_yr = budget.terminal_runoff_m3_yr;
     budget.residual_m3_yr = budget.precipitation_m3_yr
         + budget.external_inflow_m3_yr
         + budget.prescribed_head_supply_m3_yr
+        + budget.recycled_inflow_m3_yr
         - budget.solid_water_change_m3_yr
         - budget.land_evaporation_m3_yr
         - budget.additional_lake_evaporation_m3_yr

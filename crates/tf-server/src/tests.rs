@@ -12,6 +12,175 @@ struct Fixture {
     _dir: tempfile::TempDir,
 }
 #[tokio::test]
+async fn regional_climate_and_return_ports_round_trip_and_reject_corrupt_routing() {
+    use tf_grid::{GridDescriptor, GridOps};
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let w = f.world(&token).await;
+    let pd = GridDescriptor::plane(25., 179.9, 32000., 8, 8, 6371000.);
+    let pg = pd.build();
+    let pn = pg.cell_count();
+    let mut parent = node(&w, "regional-climate-parent");
+    parent.cells = pn as u32;
+    parent.grid = Some(pd.clone());
+    parent.cell_size_m = 4000.;
+    parent.generator_version = "tf-0.8".into();
+    parent.status = "done".into();
+    f.state.store.put_map_node(&parent).unwrap();
+    let climate = tf_sim::seasonal::ClimateAtlas {
+        grid: pd,
+        model: "saved parent climate".into(),
+        axial_tilt_deg: 23.44,
+        temperature_c: vec![vec![15.; pn]; 12],
+        precipitation_mm: vec![vec![50.; pn]; 12],
+        pet_mm: vec![vec![40.; pn]; 12],
+        energy: Default::default(),
+        water: Default::default(),
+        circulation: Some(tf_sim::circulation::CirculationAtlas {
+            model: "saved parent wind".into(),
+            wind_east_m_s: (0..12)
+                .map(|m| vec![if m < 6 { 2. } else { -2. }; pn])
+                .collect(),
+            wind_north_m_s: vec![vec![0.; pn]; 12],
+            current_east_m_s: vec![vec![0.; pn]; 12],
+            current_north_m_s: vec![vec![0.; pn]; 12],
+            ocean_fraction: vec![0.; pn],
+            relative_solver_residual: vec![0.; 12],
+            solver_iterations: vec![0; 12],
+            heat_coupled: false,
+            ..Default::default()
+        }),
+    };
+    let required = |n: usize| {
+        vec![
+            (Channel::Elevation, vec![100.; n]),
+            (Channel::Temperature, vec![15.; n]),
+            (Channel::Precipitation, vec![600.; n]),
+            (Channel::Biome, vec![1.; n]),
+            (Channel::DistanceToSea, vec![10000.; n]),
+            (Channel::FlowReceiver, vec![-1.; n]),
+            (Channel::LiquidDischarge, vec![1.; n]),
+            (Channel::LakeRunoffLossFraction, vec![0.; n]),
+        ]
+    };
+    let values = required(pn);
+    f.state
+        .store
+        .publish_fields(
+            &parent.id,
+            &values
+                .iter()
+                .map(|(c, v)| (*c, v.as_slice()))
+                .collect::<Vec<_>>(),
+            &json!({"climate_atlas":climatology::encode(&climate).unwrap()}),
+        )
+        .unwrap();
+    let d = GridDescriptor::plane(25., 179.9, 16000., 8, 8, 6371000.);
+    let g = d.build();
+    let n = g.cell_count();
+    let mut fields = tf_sim::WorldFields::with_capacity(n);
+    fields.elevation.fill(100.);
+    fields.temperature.fill(15.);
+    fields.precipitation.fill(600.);
+    let regional = tf_sim::regional_climate::refine(
+        &climate,
+        &pg,
+        &vec![100.; pn],
+        None,
+        &g,
+        &d,
+        &fields,
+        1.,
+        &|| false,
+    )
+    .unwrap();
+    let mut child = parent.clone();
+    child.id = "regional-climate-child".into();
+    child.kind = "continent".into();
+    child.parent = Some(parent.id.clone());
+    child.grid = Some(d);
+    child.cells = n as u32;
+    child.cell_size_m = 2000.;
+    f.state.store.put_map_node(&child).unwrap();
+    let mut saved = regional.atlas.clone();
+    saved.circulation = None;
+    let mut b = tf_sim::refinement::BoundaryForcing::empty(n);
+    b.monthly_available = true;
+    b.outlets.push(tf_sim::refinement::Outlet {
+        cell: 7,
+        surface_m: 100.,
+    });
+    b.links.push(tf_sim::refinement::ReturnLink {
+        outlet: 7,
+        inlet: 15,
+        water_retention: [0.8; 13],
+    });
+    let meta = json!({"climate_atlas":climatology::encode(&saved).unwrap(),"climate_circulation_inherited":true,"regional_climate":regional.diagnostics,crate::refinement::KEY_V2:b});
+    let values = required(n);
+    f.state
+        .store
+        .publish_fields(
+            &child.id,
+            &values
+                .iter()
+                .map(|(c, v)| (*c, v.as_slice()))
+                .collect::<Vec<_>>(),
+            &meta,
+        )
+        .unwrap();
+    let recovered = climatology::for_map(&f.state.store, &child)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.model, regional.atlas.model);
+    assert_eq!(recovered.precipitation_mm, regional.atlas.precipitation_mm);
+    assert_eq!(
+        recovered.circulation.unwrap().wind_east_m_s,
+        regional.atlas.circulation.unwrap().wind_east_m_s
+    );
+    let bytes = project::export(&f.state.store, &w).unwrap();
+    let imported = project::import(&f.state.store, &bytes, "new-owner", &f.state.config).unwrap();
+    let restored = f
+        .state
+        .store
+        .list_map_nodes(&imported.id)
+        .unwrap()
+        .into_iter()
+        .find(|n| n.parent.is_some())
+        .unwrap();
+    let recovered = climatology::for_map(&f.state.store, &restored)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.model, saved.model);
+    assert!(recovered.circulation.unwrap().wind_east_m_s[7][0] < 0.);
+    // An ordinary receiver plus the outside reach can make a cycle even when
+    // each graph alone is valid. Reject before importing any part of a project.
+    let mut receivers = vec![-1.; n];
+    receivers[15] = 7.;
+    f.state
+        .store
+        .put_field(&child.id, Channel::FlowReceiver, &receivers)
+        .unwrap();
+    let invalid = project::export(&f.state.store, &w).unwrap();
+    let error =
+        project::import(&f.state.store, &invalid, "new-owner", &f.state.config).unwrap_err();
+    assert!(error.to_string().contains("循环"), "{error}");
+    let mut corrupt: Value = serde_json::from_slice(&bytes).unwrap();
+    let m = corrupt["maps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|m| m["node"]["parent"].is_string())
+        .unwrap();
+    m["metadata"]["regional_climate"]["reference_elevation_m"] = json!([0.]);
+    assert!(project::import(
+        &f.state.store,
+        &serde_json::to_vec(&corrupt).unwrap(),
+        "new-owner",
+        &f.state.config
+    )
+    .is_err());
+}
+#[tokio::test]
 async fn spherical_patch_rivers_use_local_metres_instead_of_unit_sphere_vectors() {
     use tf_grid::GridOps;
     let f = Fixture::new(false);

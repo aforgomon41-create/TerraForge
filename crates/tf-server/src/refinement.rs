@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tf_grid::{GridDescriptor, GridOps, MapGrid};
 pub const KEY: &str = "refinement_boundary_v1";
+pub const KEY_V2: &str = "refinement_boundary_v2";
 /// Even padding preserves the row parity and all output cell centres exactly.
 /// A crop at its finite parent's edge gets a smaller halo, never invented data.
 pub fn buffered(desc: &GridDescriptor, parent: &MapGrid) -> (GridDescriptor, u32) {
@@ -74,17 +75,33 @@ pub fn decode(
     metadata: &Value,
     grid: &MapGrid,
 ) -> anyhow::Result<Option<tf_sim::refinement::BoundaryForcing>> {
-    let Some(value) = metadata.get(KEY) else {
+    anyhow::ensure!(
+        !(metadata.get(KEY).is_some() && metadata.get(KEY_V2).is_some()),
+        "局部边界版本重复"
+    );
+    let Some(value) = metadata.get(KEY_V2).or_else(|| metadata.get(KEY)) else {
         return Ok(None);
     };
     let b: tf_sim::refinement::BoundaryForcing = serde_json::from_value(value.clone())?;
     b.validate(grid.cell_count()).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        (metadata.get(KEY_V2).is_some() && b.version == 2)
+            || (metadata.get(KEY).is_some() && b.version == 1),
+        "局部边界编码版本不符"
+    );
     tf_sim::refinement::BoundaryGrid::new(grid, &b).map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         b.inlets
             .iter()
             .all(|p| grid.boundary_mask()[p.cell as usize]),
         "入水口不在地图边界"
+    );
+    anyhow::ensure!(
+        b.links
+            .iter()
+            .all(|p| grid.boundary_mask()[p.outlet as usize]
+                && grid.boundary_mask()[p.inlet as usize]),
+        "跨界河流端口不在地图边缘"
     );
     Ok(Some(b))
 }
