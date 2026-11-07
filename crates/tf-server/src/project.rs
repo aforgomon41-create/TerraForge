@@ -70,7 +70,7 @@ pub fn export(store: &Store, world_id: &str) -> anyhow::Result<Vec<u8>> {
     world.share_token = None;
     let mut maps = Vec::new();
     for node in store.list_map_nodes(world_id)? {
-        if node.status != "done" {
+        if node.status != "done" || node.is_draft() {
             continue;
         }
         anyhow::ensure!(
@@ -101,9 +101,14 @@ pub fn export(store: &Store, world_id: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(!maps.is_empty(), "请先完成一张地图再保存工程");
     let ids: HashSet<_> = maps.iter().map(|m| m.node.id.as_str()).collect();
     anyhow::ensure!(
-        maps.iter()
-            .all(|m| m.node.parent.as_deref().map_or(true, |p| ids.contains(p))),
-        "父图缺失，无法保存完整工程"
+        maps.iter().all(
+            |m| m.node.parent.as_deref().map_or(true, |p| ids.contains(p))
+                && m.node
+                    .revision
+                    .as_ref()
+                    .is_none_or(|r| ids.contains(r.source_id.as_str()))
+        ),
+        "父图或演化原图缺失，无法保存完整工程"
     );
     Ok(serde_json::to_vec(&Project {
         format: FORMAT.into(),
@@ -190,6 +195,32 @@ pub fn import(
     let mut maps = Vec::new();
     for m in project.maps {
         let mut node = m.node;
+        if let Some(revision) = &mut node.revision {
+            anyhow::ensure!(!revision.draft, "工程不能包含待试算版本");
+            let mut source_id = revision.source_id.as_str();
+            let mut steps = 0;
+            loop {
+                steps += 1;
+                anyhow::ensure!(
+                    steps < parent_nodes.len() && source_id != node.id,
+                    "演化版本链存在循环"
+                );
+                let source = parent_nodes
+                    .get(source_id)
+                    .ok_or_else(|| anyhow::anyhow!("缺少演化原图"))?;
+                anyhow::ensure!(
+                    source.kind == node.kind
+                        && source.parent == node.parent
+                        && source.grid == node.grid,
+                    "演化版本和原图的范围或层级不同"
+                );
+                let Some(previous) = &source.revision else {
+                    break;
+                };
+                source_id = &previous.source_id;
+            }
+            revision.source_id = ids[&revision.source_id].clone();
+        }
         let descriptor = node
             .grid
             .as_ref()

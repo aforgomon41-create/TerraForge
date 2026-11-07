@@ -398,6 +398,7 @@ fn node(world: &str, id: &str) -> MapNodeRecord {
         grid: Some(tf_grid::GridDescriptor::sphere(256, 6371000.)),
         seed: 42,
         generator_version: "tf-0.2".into(),
+        revision: None,
     }
 }
 fn job(world: &str, map: &str, id: &str) -> JobRecord {
@@ -413,6 +414,266 @@ fn job(world: &str, map: &str, id: &str) -> JobRecord {
         started_at: None,
         finished_at: None,
     }
+}
+
+#[tokio::test]
+async fn directed_evolution_repairs_a_strait_and_preserves_the_harbour_and_original() {
+    use tf_grid::{GridDescriptor, GridOps};
+    let f = Fixture::new(false);
+    let token = f.session().await;
+    let world = f.world(&token).await;
+    let descriptor = GridDescriptor::plane(25., 179.9, 64_000., 64, 48, 6_371_000.);
+    let grid = descriptor.build();
+    let count = grid.cell_count();
+    let mut original = node(&world, "strait-original");
+    original.grid = Some(descriptor.clone());
+    original.cells = count as u32;
+    original.cell_size_m = 1000.;
+    original.generator_version = "tf-0.8".into();
+    f.state.store.put_map_node(&original).unwrap();
+    let terrain: Vec<_> = (0..count)
+        .map(|i| {
+            let (x, y) = grid.local_center_m(i).unwrap();
+            if x.abs() <= 4800. {
+                40. + (y.abs() / 5000.) as f32
+            } else {
+                -100.
+            }
+        })
+        .collect();
+    let atmosphere = GridDescriptor::plane(25., 179.9, 64_000., 16, 12, 6_371_000.);
+    let climate = tf_sim::seasonal::ClimateAtlas {
+        grid: atmosphere.clone(),
+        model: "test baseline".into(),
+        axial_tilt_deg: 23.44,
+        temperature_c: vec![vec![17.; atmosphere.cell_count()]; 12],
+        precipitation_mm: vec![vec![55.; atmosphere.cell_count()]; 12],
+        pet_mm: vec![vec![40.; atmosphere.cell_count()]; 12],
+        energy: Default::default(),
+        water: Default::default(),
+        circulation: None,
+    };
+    f.state
+        .store
+        .publish_fields(
+            &original.id,
+            &[
+                (Channel::Elevation, &terrain),
+                (Channel::Temperature, &vec![17.; count]),
+                (Channel::Precipitation, &vec![660.; count]),
+                (Channel::PotentialEvaporation, &vec![480.; count]),
+                (Channel::LakeDepth, &vec![0.; count]),
+                (Channel::Biome, &vec![1.; count]),
+                (Channel::DistanceToSea, &vec![5000.; count]),
+                (Channel::CrustType, &vec![0.75; count]),
+            ],
+            &json!({"climate_atlas": climatology::encode(&climate).unwrap()}),
+        )
+        .unwrap();
+    let start = grid.locate_local(-19000., 0.).unwrap();
+    let end = grid.locate_local(19000., 0.).unwrap();
+    let port = grid.locate_local(-3600., 0.).unwrap();
+    assert!(terrain[port] > 0.);
+    let uri = format!("/api/v1/maps/{}/evolution", original.id);
+    let payload = |maximum_subsidence_m| {
+        json!({
+            "protected_areas": [{"cells": [port], "radius_m": 2600.}],
+            "strait": {
+                "corridor": {"cells": [start, end], "radius_m": 15500.},
+                "minimum_width_m": 3800., "minimum_depth_m": 12.,
+                "repair": {"maximum_subsidence_m": maximum_subsidence_m, "duration_years": 40000}
+            }
+        })
+    };
+    let wait = |id: String| {
+        let store = f.state.store.clone();
+        async move {
+            for _ in 0..3000 {
+                let j = store.get_job(&id).unwrap().unwrap();
+                if matches!(j.state.as_str(), "done" | "failed" | "cancelled") {
+                    return j;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("试算作业未结束");
+        }
+    };
+    let other = f.session().await;
+    assert_eq!(
+        f.request("POST", &uri, Some(&other), Some(payload(140.)))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let memory_gate = f.state.exports.acquire().await.unwrap();
+    let (status, queued) = f
+        .request("POST", &uri, Some(&token), Some(payload(140.)))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let queued_id = queued["job_id"].as_str().unwrap();
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/v1/jobs/{queued_id}/cancel"),
+            Some(&token),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let cancelled = wait(queued_id.into()).await;
+    assert_eq!(cancelled.state, "cancelled");
+    assert!(f
+        .state
+        .store
+        .get_field(&cancelled.map_id, Channel::Elevation)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        f.request(
+            "DELETE",
+            &format!("/api/v1/maps/{}/evolution", cancelled.map_id),
+            Some(&token),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    drop(memory_gate);
+    let (status, pending) = f
+        .request("POST", &uri, Some(&token), Some(payload(10.)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    let finished = wait(pending["job_id"].as_str().unwrap().into()).await;
+    assert_eq!(finished.state, "done", "{:?}", finished.error);
+    let draft_uri = format!("/api/v1/maps/{}/evolution", finished.map_id);
+    let (_, preview) = f.request("GET", &draft_uri, Some(&token), None).await;
+    assert_eq!(preview["evolution"]["report"]["can_apply"], false);
+    assert_eq!(
+        f.request("POST", &format!("{draft_uri}/apply"), Some(&token), None)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let exported = project::export(&f.state.store, &world).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&exported).unwrap()["maps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        f.request("DELETE", &draft_uri, Some(&token), None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(f
+        .state
+        .store
+        .get_map_node(&finished.map_id)
+        .unwrap()
+        .is_none());
+    let (status, pending) = f
+        .request("POST", &uri, Some(&token), Some(payload(140.)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    let finished = wait(pending["job_id"].as_str().unwrap().into()).await;
+    assert_eq!(finished.state, "done", "{:?}", finished.error);
+    let draft_uri = format!("/api/v1/maps/{}/evolution", finished.map_id);
+    let (_, preview) = f.request("GET", &uri, Some(&token), None).await;
+    let report = &preview["evolution"]["report"];
+    assert_eq!(report["before"]["connected"], false, "{report}");
+    assert_eq!(report["after"]["passed"], true, "{report}");
+    assert!(report["after"]["width_estimate_m"].as_f64().unwrap() >= 3800.);
+    assert!(report["after"]["shallowest_depth_m"].as_f64().unwrap() >= 12.);
+    assert_eq!(report["flooded_protected_cells"], 0);
+    assert_eq!(report["lost_protected_water_cells"], 0);
+    assert_eq!(report["can_apply"], true, "{report}");
+    let candidate = f
+        .state
+        .store
+        .get_field(&finished.map_id, Channel::Elevation)
+        .unwrap()
+        .unwrap();
+    for i in 0..count {
+        if grid.distance_m(port, i) <= 2600. || grid.boundary_mask()[i] {
+            assert_eq!(candidate[i], terrain[i]);
+        }
+    }
+    assert_eq!(
+        f.state
+            .store
+            .get_field(&original.id, Channel::Elevation)
+            .unwrap()
+            .unwrap(),
+        terrain
+    );
+    assert!(f
+        .state
+        .store
+        .get_field(&finished.map_id, Channel::FlowReceiver)
+        .unwrap()
+        .is_some());
+    assert!(f
+        .state
+        .store
+        .get_field(&finished.map_id, Channel::EcosystemGroup)
+        .unwrap()
+        .is_some());
+    let (_, listed) = f
+        .request(
+            "GET",
+            &format!("/api/v1/worlds/{world}/maps"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    let (status, saved) = f
+        .request("POST", &format!("{draft_uri}/apply"), Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["revision"]["draft"], false);
+    assert!(saved["revision"]["applied_at"].is_number());
+    assert_eq!(
+        f.request("POST", &format!("{draft_uri}/apply"), Some(&token), None)
+            .await
+            .1,
+        saved
+    );
+    assert_eq!(
+        f.request("DELETE", &draft_uri, Some(&token), None).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.request("GET", &uri, Some(&token), None).await.1,
+        Value::Null
+    );
+    let bytes = project::export(&f.state.store, &world).unwrap();
+    let restored =
+        project::import(&f.state.store, &bytes, "restored-owner", &f.state.config).unwrap();
+    let maps = f.state.store.list_map_nodes(&restored.id).unwrap();
+    let edited = maps.iter().find(|m| m.revision.is_some()).unwrap();
+    let root = maps.iter().find(|m| m.revision.is_none()).unwrap();
+    assert_eq!(edited.revision.as_ref().unwrap().source_id, root.id);
+    assert_eq!(
+        f.state
+            .store
+            .get_field(&edited.id, Channel::Elevation)
+            .unwrap()
+            .unwrap(),
+        candidate
+    );
+    assert_eq!(
+        f.state
+            .store
+            .get_field(&root.id, Channel::Elevation)
+            .unwrap()
+            .unwrap(),
+        terrain
+    );
 }
 #[tokio::test]
 async fn terminal_event_reconnects_finish_and_release_the_stream_capacity() {
@@ -1476,6 +1737,67 @@ async fn independent_region_plane_child_geometry_and_project_round_trip() {
     assert_eq!(geography.landmass, rebuilt.landmass);
     assert_eq!(geography.region, rebuilt.region);
     assert_eq!(geography.site, rebuilt.site);
+
+    // The normal child-generation path produces the boundary and climate state
+    // used by a same-level edited version, including after project import.
+    let point = child_grid.locate_local(0., 0.).unwrap();
+    let (status, revision) = f.request("POST", &format!("/api/v1/maps/{id}/evolution"), Some(&token), Some(json!({
+        "operations": [{"process":"uplift", "area":{"cells":[point], "radius_m":2500.}, "duration_years":25000, "intensity":2.}]
+    }))).await;
+    assert_eq!(status, StatusCode::OK, "{revision}");
+    let revised_id = revision["map_id"].as_str().unwrap();
+    let revision_job = revision["job_id"].as_str().unwrap();
+    for _ in 0..1000 {
+        let job = f.state.store.get_job(revision_job).unwrap().unwrap();
+        if job.state == "done" {
+            break;
+        }
+        assert_ne!(job.state, "failed", "{:?}", job.error);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (status, revision) = f
+        .request(
+            "POST",
+            &format!("/api/v1/maps/{revised_id}/evolution/apply"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{revision}");
+    let old = f.state.store.get_metadata(id).unwrap().unwrap();
+    let new = f.state.store.get_metadata(revised_id).unwrap().unwrap();
+    assert_eq!(old[refinement::KEY_V2], new[refinement::KEY_V2]);
+    assert!(new["regional_climate"].is_object());
+    let old_height = f
+        .state
+        .store
+        .get_field(id, Channel::Elevation)
+        .unwrap()
+        .unwrap();
+    let new_height = f
+        .state
+        .store
+        .get_field(revised_id, Channel::Elevation)
+        .unwrap()
+        .unwrap();
+    assert!((new_height[point] - old_height[point] - 50.).abs() < 1e-3);
+    let data = project::export(&f.state.store, &w).unwrap();
+    let restored = project::import(&f.state.store, &data, "new-owner", &f.state.config).unwrap();
+    let maps = f.state.store.list_map_nodes(&restored.id).unwrap();
+    let revision = maps.iter().find(|m| m.revision.is_some()).unwrap();
+    let source = maps
+        .iter()
+        .find(|m| m.id == revision.revision.as_ref().unwrap().source_id)
+        .unwrap();
+    assert_eq!(revision.parent, source.parent);
+    assert_eq!(
+        f.state
+            .store
+            .get_field(&revision.id, Channel::Elevation)
+            .unwrap()
+            .unwrap(),
+        new_height
+    );
 }
 
 #[tokio::test]

@@ -139,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
             grid: Some(descriptor),
             seed: p.seed,
             generator_version: "tf-0.6".into(),
+            revision: None,
         };
         store.put_map_node(&parent)?;
         let result =
@@ -162,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
             grid: Some(descriptor),
             seed: p.seed,
             generator_version: "tf-0.8".into(),
+            revision: None,
         };
         store.put_map_node(&child)?;
         let (tx, _rx) = tokio::sync::broadcast::channel(16);

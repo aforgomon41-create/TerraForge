@@ -2,6 +2,7 @@
 import { decodeGeography } from '@/geography/catalog'
 import { decodeIce, type IceResponse } from '@/cryosphere/data'
 import { decodeEcosystems, type EcosystemResponse } from '@/ecosystems/data'
+import type { EvolutionPlan, EvolutionReport } from '@/evolution/plan'
 export const API_BASE = import.meta.env.DEV
   ? ''
   : new URL(import.meta.env.BASE_URL, window.location.href).pathname.replace(/\/$/, '')
@@ -110,6 +111,7 @@ export interface MapNode {
   grid: GridDescriptor | null
   seed: number
   generator_version: string
+  revision?: { source_id: string; draft: boolean; applied_at?: number }
 }
 export interface JobStatus {
   id: string
@@ -118,6 +120,11 @@ export interface JobStatus {
   stage: string
   progress: number
   error: string | null
+}
+export interface EvolutionPreview {
+  map: MapNode
+  job: JobStatus | null
+  evolution: { version: number; plan: EvolutionPlan; report: EvolutionReport } | null
 }
 export interface ChildRequest {
   kind: string
@@ -279,7 +286,18 @@ export const api = {
   deleteWorld: (id: string) => request(`/worlds/${id}`, { method: 'DELETE' }),
   listMaps: (id: string) => request<MapNode[]>(`/worlds/${id}/maps`),
   getMap: (id: string) => request<MapNode>(`/maps/${id}`),
-  getJob: (id: string) => request<JobStatus>(`/jobs/${id}`),
+  getJob: (id: string, signal?: AbortSignal) => request<JobStatus>(`/jobs/${id}`, { signal }),
+  getEvolution: (id: string, signal?: AbortSignal) =>
+    request<EvolutionPreview | null>(`/maps/${id}/evolution`, { signal }),
+  previewEvolution: (id: string, plan: EvolutionPlan) =>
+    request<{ job_id: string; map_id: string }>(`/maps/${id}/evolution`, {
+      method: 'POST',
+      body: JSON.stringify(plan),
+    }),
+  applyEvolution: (id: string) =>
+    request<MapNode>(`/maps/${id}/evolution/apply`, { method: 'POST' }),
+  discardEvolution: (id: string) =>
+    authorizedFetch(`/api/v1/maps/${id}/evolution`, { method: 'DELETE' }),
   generateWorld: (id: string) =>
     request<{ job_id: string; map_id: string }>(`/worlds/${id}/generate`, {
       method: 'POST',

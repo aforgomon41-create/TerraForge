@@ -45,11 +45,14 @@ import {
 import AgentPanel from '@/components/AgentPanel.vue'
 import EcosystemPanel from '@/components/EcosystemPanel.vue'
 import RefinementPanel from '@/components/RefinementPanel.vue'
+import EvolutionPanel from '@/components/EvolutionPanel.vue'
+import { useDirectedEvolution, type EvolutionPick } from '@/evolution/workbench'
 import { ecosystemAt, ecosystemModes } from '@/ecosystems/view'
 import { evolutionClock } from '@/generation/progress'
 const store = useWorldStore(),
   canvas = ref<HTMLCanvasElement | null>(null),
   fileInput = ref<HTMLInputElement | null>(null)
+const directed = reactive(useDirectedEvolution(store))
 const scaleText = ref('')
 const worldProjection = ref<'sphere' | WorldProjection>('sphere')
 const liveFrame = shallowRef<DecodedFrameEvent | null>(null)
@@ -362,7 +365,15 @@ const activeLayer = computed(() => layers.find((l) => l.id === liveLayer.value)!
   modeText = computed(() =>
     store.session?.mode === 'desktop' ? '本地工程 · 自动保存' : '网页体验 · 临时会话',
   )
-const locked = computed(() => busy.value || store.generating || store.loading || !ready.value),
+const locked = computed(
+    () =>
+      busy.value ||
+      store.generating ||
+      store.loading ||
+      directed.working ||
+      directed.polling ||
+      !ready.value,
+  ),
   hasMap = computed(() => !!store.currentMap)
 const next = computed(() => nextKind[store.currentMap?.kind || ''] || ''),
   spacing = computed(() => ({ continent: 1000, region: 100, site: 1 })[next.value] || 1)
@@ -464,17 +475,19 @@ const selectedIce = computed(() => {
       }
     : null
 })
-const progress = computed(() => Math.round((store.job?.progress || 0) * 100)),
+const displayedJob = computed(() => directed.job ?? store.job),
+  jobActive = computed(() => store.generating || (!!directed.job && !directed.terminal)),
+  progress = computed(() => Math.round((displayedJob.value?.progress || 0) * 100)),
   jobState = computed(
     () =>
       ({
         queued: '排队中',
-        running: '正在演化',
+        running: directed.job ? '正在试算' : '正在演化',
         cancelling: '正在取消',
-        done: '地图已完成',
-        cancelled: '生成已取消',
-        failed: '生成未完成',
-      })[store.job?.state || ''] || '等待开始',
+        done: directed.job ? '试算已完成' : '地图已完成',
+        cancelled: directed.job ? '试算已取消' : '生成已取消',
+        failed: directed.job ? '试算未完成' : '生成未完成',
+      })[displayedJob.value?.state || ''] || '等待开始',
   )
 const mapStats = computed(() => {
   const f = store.elevation
@@ -760,7 +773,7 @@ function refreshPartitions() {
   partitionTruncated.value = partitionCache.data.truncated
 }
 watch([() => store.geography, partitionMode], refreshPartitions)
-function applyMap() {
+function applyMap(preservePlanarView = false) {
   const node = store.currentMap
   if (!renderer) return
   activeFeatureId.value = null
@@ -776,7 +789,7 @@ function applyMap() {
   let centers = store.centers
   if (node.grid && node.grid.type !== 'sphere') {
     const g = node.grid
-    renderer.setPlanarMode()
+    if (!preservePlanarView) renderer.setPlanarMode()
     centers = centers.map((v) => (v * 2) / g.width_m)
     renderer.planarHalfHeight =
       1.08 *
@@ -822,8 +835,19 @@ function applyMap() {
   selection.value = null
   pin.value = null
   refine.value = false
+  updateEvolutionOverlay()
 }
-watch(() => store.currentMap, applyMap)
+watch(
+  () => store.currentMap,
+  (node, previous) => {
+    if (node && previous?.id === node.id) return
+    const comparison =
+      !!node &&
+      !!previous &&
+      (node.revision?.source_id === previous.id || previous.revision?.source_id === node.id)
+    applyMap(comparison)
+  },
+)
 watch([() => store.ecosystems, ecosystemMode], () => {
   if (!store.generating)
     renderer?.setEcosystems(
@@ -924,6 +948,10 @@ function chooseAt(p: Vec3) {
   }
   const i = nearestCell(store.centers, point, g.type === 'sphere')
   if (i < 0) return
+  if (directed.select(i)) {
+    updateEvolutionOverlay()
+    return
+  }
   activeFeatureId.value = null
   renderer.setGeographyMask(null)
   selection.value = { ...geo, cell: i }
@@ -983,6 +1011,7 @@ function manualSelect() {
   }
 }
 function updatePin() {
+  updateEvolutionOverlay()
   const node = store.currentMap,
     s = selection.value
   if (!node?.grid || !s || !renderer) {
@@ -1000,7 +1029,62 @@ function updatePin() {
         ]
   pin.value = renderer.project(p)
 }
+const evolutionOverlay = shallowRef<
+  { kind: string; points: { x: number; y: number }[]; radius: number }[]
+>([])
+const evolutionPickHint = computed(
+  () =>
+    ({
+      area: '点一下设定圆形范围，或沿带状范围连续点选。',
+      protection: '点击要保护的位置，随后可以调整半径。',
+      corridor: '按顺序标记海峡搜索带。起点和终点各落在一侧海域。',
+    })[directed.pick ?? 'area'],
+)
+function beginEvolutionPick(target: EvolutionPick) {
+  directed.pick = target
+  canvas.value?.focus({ preventScroll: true })
+}
+function finishEvolutionPick() {
+  directed.pick = null
+  panel.value = 'layers'
+}
+watch(panel, (value) => {
+  if (value !== 'layers') directed.pick = null
+})
+function updateEvolutionOverlay() {
+  const grid = store.currentMap?.grid
+  const centers = store.centers
+  const view = renderer
+  if (
+    !directed.sourceId ||
+    !grid ||
+    grid.type === 'sphere' ||
+    !centers ||
+    !view ||
+    store.generating
+  ) {
+    if (evolutionOverlay.value.length) evolutionOverlay.value = []
+    return
+  }
+  const { area, protectedAreas, corridor, process, strait } = directed.form
+  const footprints = [
+    ...(process === 'goal' ? [] : [{ kind: 'area', ...area }]),
+    ...protectedAreas.map((p) => ({ kind: 'protection', ...p })),
+    ...(strait || process === 'goal' ? [{ kind: 'corridor', ...corridor }] : []),
+  ]
+  evolutionOverlay.value = footprints.flatMap(({ kind, cells, radius_m }) => {
+    if (!cells.length || !Number.isFinite(radius_m) || radius_m <= 0) return []
+    const scale = 2 / grid.width_m
+    const project = (i: number, offset = 0) =>
+      view.project([(centers[i * 3] + offset) * scale, centers[i * 3 + 1] * scale, 0])
+    const points = cells.map((i) => project(i)).filter((p) => p !== null)
+    const edge = project(cells[0], radius_m)
+    if (!points.length || !edge) return []
+    return [{ kind, points, radius: Math.abs(edge.x - points[0].x) }]
+  })
+}
 async function generateChild(parentId = store.currentMap?.id, kind = next.value) {
+  if (store.currentMap?.revision?.draft) throw new Error('请先套用候选图，或切回原图再提高精度')
   if (!parentId || !kind || !selection.value) throw new Error('请先在父图上选择位置')
   if (store.currentMap?.id !== parentId) throw new Error('请先切换到父图并选择位置')
   if (kind !== next.value) throw new Error('只能生成下一层地图')
@@ -1104,11 +1188,13 @@ const toolCtx: ToolContext = {
   geography: () => store.geography,
   selectFeature: selectGeographic,
   generate: async () => {
+    if (directed.polling || directed.working) throw new Error('请先等待区域试算')
     if (!store.current) throw new Error('请先创建世界')
     await store.generate(store.current.id)
   },
   drillDown: async (id, kind) => generateChild(id, kind),
   selectMap: async (id) => {
+    if (directed.polling || directed.working) throw new Error('请先等待区域试算')
     if (!store.maps.some((m) => m.id === id)) throw new Error('地图不属于当前工程')
     await store.loadMapData(id)
   },
@@ -1240,14 +1326,51 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="workbench">
+  <main
+    class="workbench"
+    :class="{
+      'evolution-active': directed.sourceId,
+      'evolution-running': jobActive && directed.job,
+    }"
+  >
     <canvas
       ref="canvas"
       class="map-canvas"
+      :class="{ 'evolution-picking': directed.pick }"
       tabindex="0"
       aria-label="交互地图：拖动旋转或平移，滚轮缩放，点击选择位置；方向键移动，Enter 选择中心，Home 复位"
+      @keydown.esc="directed.pick = null"
     />
     <div class="paper-texture" aria-hidden="true" />
+    <svg v-if="evolutionOverlay.length" class="evolution-overlay" aria-hidden="true">
+      <g v-for="(mark, index) in evolutionOverlay" :key="index" :class="mark.kind">
+        <circle
+          v-if="mark.points.length === 1"
+          :cx="mark.points[0].x"
+          :cy="mark.points[0].y"
+          :r="mark.radius"
+        />
+        <template v-else>
+          <polyline
+            class="evolution-band"
+            :points="mark.points.map((p) => `${p.x},${p.y}`).join(' ')"
+            :stroke-width="mark.radius * 2"
+          />
+          <polyline
+            class="evolution-line"
+            :points="mark.points.map((p) => `${p.x},${p.y}`).join(' ')"
+          />
+        </template>
+        <circle
+          v-for="(p, i) in mark.points"
+          :key="i"
+          class="evolution-anchor"
+          :cx="p.x"
+          :cy="p.y"
+          r="4"
+        />
+      </g>
+    </svg>
     <div v-if="!hasMap && !store.generating" class="blank-atlas" aria-hidden="true">
       <svg viewBox="0 0 700 700">
         <defs>
@@ -1313,7 +1436,10 @@ onBeforeUnmount(() => {
         </select>
         <button :disabled="!ready || store.generating" @click="startNew">＋ 新建</button>
         <button :disabled="locked" @click="fileInput?.click()">打开工程</button>
-        <button :disabled="locked || !hasMap" @click="guard(() => exportFile('json'))">
+        <button
+          :disabled="locked || !hasMap || store.currentMap?.revision?.draft"
+          @click="guard(() => exportFile('json'))"
+        >
           保存工程
         </button>
         <button :disabled="locked || !hasMap" @click="guard(() => exportFile('png'))">
@@ -1700,7 +1826,7 @@ onBeforeUnmount(() => {
       </svg>
     </div>
     <div
-      v-if="pin"
+      v-if="pin && !directed.pick"
       class="selection-pin"
       :style="{ left: pin.x + 'px', top: pin.y + 'px' }"
       aria-hidden="true"
@@ -1711,9 +1837,36 @@ onBeforeUnmount(() => {
     <div
       v-if="panel !== 'ai'"
       class="right-stack"
-      :class="{ 'mobile-hidden': panel !== 'layers', 'ecosystem-open': layer === 3 }"
+      :class="{
+        'mobile-hidden': panel !== 'layers',
+        'ecosystem-open': layer === 3,
+        'evolution-open': directed.sourceId,
+        'evolution-selecting': directed.pick,
+      }"
     >
-      <aside class="paper-panel layers-panel" aria-label="地图图层">
+      <aside v-if="directed.sourceId" class="paper-panel selection-panel">
+        <EvolutionPanel
+          v-model:form="directed.form"
+          :report="directed.report"
+          :has-candidate="!!directed.candidateId"
+          :ready-candidate="directed.readyCandidate"
+          :showing-candidate="directed.showingCandidate"
+          :terminal="!!directed.terminal"
+          :pending="directed.polling"
+          :locked="busy || store.generating || store.loading || directed.working"
+          :spacing="directed.spacing"
+          :error="directed.error"
+          :message="directed.message"
+          @pick="beginEvolutionPick"
+          @start="directed.start"
+          @compare="directed.compare"
+          @apply="directed.apply"
+          @discard="directed.discard"
+          @refresh="directed.refresh"
+          @close="directed.close"
+        />
+      </aside>
+      <aside v-if="!directed.sourceId" class="paper-panel layers-panel" aria-label="地图图层">
         <span class="eyebrow">MAP LAYERS / 图层</span>
         <div role="radiogroup" aria-label="地图图层">
           <button
@@ -1848,7 +2001,7 @@ onBeforeUnmount(() => {
           </select>
         </label>
       </aside>
-      <aside class="paper-panel selection-panel" aria-label="选区信息">
+      <aside v-if="!directed.sourceId" class="paper-panel selection-panel" aria-label="选区信息">
         <span class="eyebrow">SELECTED LANDSCAPE</span>
         <h2>{{ activeFeature?.name || (selection ? '此处的地理' : '为探索，选一个落点。') }}</h2>
         <template v-if="selectedFacts && selection">
@@ -2045,6 +2198,17 @@ onBeforeUnmount(() => {
           <br />
           从这里，进入更细的地图。
         </p>
+        <div v-if="directed.eligibility !== null" class="evolution-entry">
+          <button
+            v-if="!directed.eligibility"
+            type="button"
+            :disabled="locked"
+            @click="directed.open(store.currentMap!)"
+          >
+            区域定向演化 →
+          </button>
+          <p v-else class="hint">定向演化 · {{ directed.eligibility }}</p>
+        </div>
         <details v-if="hasMap">
           <summary>按经纬度选择</summary>
           <form class="coordinate-form" @submit.prevent="manualSelect">
@@ -2060,6 +2224,10 @@ onBeforeUnmount(() => {
           </form>
         </details>
       </aside>
+    </div>
+    <div v-if="directed.pick" class="paper-panel evolution-pick-bar">
+      <span role="status">{{ evolutionPickHint }}</span>
+      <button type="button" class="primary" @click="finishEvolutionPick">返回工具</button>
     </div>
     <AgentPanel v-if="panel === 'ai'" :tool-ctx="toolCtx" @close="panel = 'layers'" />
     <div class="map-controls paper-panel">
@@ -2114,30 +2282,35 @@ onBeforeUnmount(() => {
       </small>
     </div>
     <section
-      v-if="store.generating || store.job"
+      v-if="!directed.pick && (jobActive || (!directed.sourceId && displayedJob))"
       class="paper-panel generation-bar"
-      :class="{ settled: !store.generating }"
-      aria-label="生成进度"
+      :class="{ settled: !jobActive }"
+      :aria-label="directed.job ? '试算进度' : '生成进度'"
     >
       <div>
         <div class="generation-label">
           <strong>{{ jobState }}</strong>
-          <span>{{ store.job?.stage || '等待任务启动' }} · {{ progress }}%</span>
+          <span>{{ displayedJob?.stage || '等待任务启动' }} · {{ progress }}%</span>
         </div>
-        <progress :value="store.job?.progress || 0" max="1" :aria-label="jobState" />
+        <progress :value="displayedJob?.progress || 0" max="1" :aria-label="jobState" />
         <div v-if="store.generating" class="generation-steps live-clock">
           <span>{{ liveCaption }}</span>
           <span v-if="liveFrame && layer !== liveLayer">当前图层尚未就绪，显示地形预览</span>
         </div>
       </div>
       <button
-        v-if="store.generating"
-        :disabled="store.job?.state === 'cancelling'"
-        @click="guard(store.cancel)"
+        v-if="jobActive"
+        :disabled="displayedJob?.state === 'cancelling' || directed.working"
+        @click="directed.job ? directed.cancel() : guard(store.cancel)"
       >
-        {{ store.job?.state === 'cancelling' ? '取消中…' : '取消' }}
+        {{ displayedJob?.state === 'cancelling' ? '取消中…' : '取消' }}
       </button>
-      <button v-else class="icon-button" aria-label="收起生成结果" @click="store.job = null">
+      <button
+        v-else-if="!directed.job"
+        class="icon-button"
+        aria-label="收起生成结果"
+        @click="store.job = null"
+      >
         ×
       </button>
     </section>

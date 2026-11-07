@@ -550,7 +550,7 @@ pub fn run_child_generation(
     Ok(())
 }
 
-fn inherited_pet<G: GridOps>(
+pub(crate) fn inherited_pet<G: GridOps>(
     grid: &G,
     fields: &mut tf_sim::WorldFields,
     params: &tf_core::params::GenerationParams,

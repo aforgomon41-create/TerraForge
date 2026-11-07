@@ -363,6 +363,17 @@ pub fn run_erosion_linked_observed<G: GridOps>(
     cancel: &dyn Fn() -> bool,
     on_step: &mut dyn FnMut(u32, &WorldFields),
 ) -> Result<Option<ErosionState>, String> {
+    run_erosion_weighted(grid, fields, params, None, cancel, on_step)
+}
+
+pub(crate) fn run_erosion_weighted<G: GridOps>(
+    grid: &G,
+    fields: &mut WorldFields,
+    params: &ErosionParams,
+    weights: Option<&[f64]>,
+    cancel: &dyn Fn() -> bool,
+    on_step: &mut dyn FnMut(u32, &WorldFields),
+) -> Result<Option<ErosionState>, String> {
     if cancel() {
         return Ok(None);
     }
@@ -407,14 +418,16 @@ pub fn run_erosion_linked_observed<G: GridOps>(
         for &cell in state.topo_order.iter().rev() {
             let i = cell as usize;
             let receiver = state.flow_dir[i];
-            if receiver == u32::MAX || fields.elevation[i] <= 0. {
+            let weight = weights.map_or(1., |w| w[i]);
+            if receiver == u32::MAX || fields.elevation[i] <= 0. || weight == 0. {
                 continue;
             }
             let j = receiver as usize;
             let dist = grid.distance_m(i, j).max(1.);
             let h = fields.elevation[i] as f64;
             let down = (fields.elevation[j] + fields.lake_depth[j]).max(0.) as f64;
-            let k = params.k_river * params.timestep_years * discharge[i].powf(params.m) / dist;
+            let k = params.k_river * weight * params.timestep_years * discharge[i].powf(params.m)
+                / dist;
             fields.elevation[i] = ((h + k * down) / (1. + k)).min(h).max(0.001) as f32;
             let volume = (h - fields.elevation[i] as f64).max(0.) * grid.area_m2(i);
             sediment.eroded_m3 += volume;
@@ -423,7 +436,8 @@ pub fn run_erosion_linked_observed<G: GridOps>(
         if params.k_diffusion > 0. {
             let old = fields.elevation.clone();
             for i in 0..grid.cell_count() {
-                if old[i] <= 0. || grid.boundary_mask()[i] {
+                let weight = weights.map_or(1., |w| w[i]);
+                if old[i] <= 0. || grid.boundary_mask()[i] || weight == 0. {
                     continue;
                 }
                 let mut delta = 0.0;
@@ -438,7 +452,8 @@ pub fn run_erosion_linked_observed<G: GridOps>(
                     delta += (old[j] - old[i]) as f64 * w;
                     total += w;
                 }
-                fields.elevation[i] = (old[i] as f64 + delta / total.max(1.)).max(0.001) as f32;
+                fields.elevation[i] =
+                    (old[i] as f64 + weight * delta / total.max(1.)).max(0.001) as f32;
             }
         }
         if params.k_deposition > 0.

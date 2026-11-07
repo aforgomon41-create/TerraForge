@@ -6,6 +6,7 @@ pub mod circulation;
 pub mod climatology;
 pub mod config;
 pub mod cryosphere;
+mod directed;
 pub mod ecosystems;
 pub mod generate;
 pub mod geography;

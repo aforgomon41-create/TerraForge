@@ -87,6 +87,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/maps/{id}/sample", get(sample_map))
         .route("/api/v1/maps/{id}/children", post(generate_child))
         .route(
+            "/api/v1/maps/{id}/evolution",
+            post(crate::directed::preview)
+                .get(crate::directed::get_preview)
+                .delete(crate::directed::discard),
+        )
+        .route(
+            "/api/v1/maps/{id}/evolution/apply",
+            post(crate::directed::apply),
+        )
+        .route(
             "/api/v1/maps/{id}/refinement-plan",
             get(crate::refinement::get_plan),
         )
@@ -459,6 +469,7 @@ async fn generate_world(
         completed_at: None,
         seed: params.seed,
         generator_version: "tf-0.6".into(),
+        revision: None,
     };
 
     let job_id = st
@@ -476,7 +487,10 @@ async fn list_maps(
     State(st): State<AppState>,
     Path(world_id): Path<String>,
 ) -> Result<Json<Vec<MapNodeRecord>>, ApiError> {
-    Ok(Json(st.store.list_map_nodes(&world_id)?))
+    let mut maps = st.store.list_map_nodes(&world_id)?;
+    maps.retain(|m| !m.is_draft());
+    maps.sort_by_key(|m| m.revision.is_some());
+    Ok(Json(maps))
 }
 
 async fn get_map(
@@ -951,7 +965,7 @@ async fn generate_child(
         "region" => "site",
         _ => return Err(ApiError::bad_request("地点层不能继续细化")),
     };
-    if body.kind != expected || parent.status != "done" {
+    if body.kind != expected || parent.status != "done" || parent.is_draft() {
         return Err(ApiError::bad_request("只能从已完成的父图生成下一层"));
     }
     let default_spacing: f64 = match body.kind.as_str() {
@@ -1065,6 +1079,7 @@ async fn generate_child(
         grid: Some(grid),
         seed: params.seed,
         generator_version: "tf-0.8".into(),
+        revision: None,
     };
     let job_id = st
         .jobs
@@ -1163,6 +1178,11 @@ async fn export_json(
         .store
         .get_map_node(&map_id)?
         .ok_or_else(|| ApiError::not_found("地图不存在"))?;
+    if node.is_draft() {
+        return Err(ApiError::bad_request(
+            "请先套用候选图，或切回已保存版本再导出工程",
+        ));
+    }
     let permit = st.exports.clone().try_acquire_owned().map_err(|_| {
         ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,

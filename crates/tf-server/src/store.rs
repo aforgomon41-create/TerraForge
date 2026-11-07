@@ -50,6 +50,22 @@ pub struct MapNodeRecord {
     pub seed: u64,
     #[serde(default)]
     pub generator_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<MapRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MapRevision {
+    pub source_id: String,
+    pub draft: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<i64>,
+}
+
+impl MapNodeRecord {
+    pub fn is_draft(&self) -> bool {
+        self.revision.as_ref().is_some_and(|r| r.draft)
+    }
 }
 
 /// 一个生成作业。
@@ -675,6 +691,96 @@ impl Store {
         }
     }
 
+    /// Commit exactly the reviewed result. Repeated commits are idempotent.
+    pub fn apply_evolution(&self, id: &str) -> anyhow::Result<Option<MapNodeRecord>> {
+        let write = self.db.begin_write()?;
+        let mut node: MapNodeRecord = {
+            let table = write.open_table(MAP_NODES)?;
+            let Some(record) = table.get(id)? else {
+                return Ok(None);
+            };
+            serde_json::from_slice(record.value())?
+        };
+        let Some(revision) = node.revision.as_mut() else {
+            return Ok(None);
+        };
+        if node.status != "done" {
+            return Ok(None);
+        }
+        if revision.draft {
+            let nodes = write.open_table(MAP_NODES)?;
+            let Some(source) = nodes.get(revision.source_id.as_str())? else {
+                return Ok(None);
+            };
+            let source: MapNodeRecord = serde_json::from_slice(source.value())?;
+            if source.status != "done"
+                || source.is_draft()
+                || source.world_id != node.world_id
+                || source.grid != node.grid
+                || source.parent != node.parent
+                || source.kind != node.kind
+            {
+                return Ok(None);
+            }
+            let table = write.open_table(META)?;
+            let Some(value) = table.get(id)? else {
+                return Ok(None);
+            };
+            let metadata: serde_json::Value = serde_json::from_slice(value.value())?;
+            if metadata
+                .pointer("/directed_evolution/report/can_apply")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Ok(None);
+            }
+            revision.draft = false;
+            revision.applied_at = Some(crate::jobs::now_millis() as i64);
+        }
+        let bytes = serde_json::to_vec(&node)?;
+        write.open_table(MAP_NODES)?.insert(id, bytes.as_slice())?;
+        write.commit()?;
+        Ok(Some(node))
+    }
+
+    pub fn discard_evolution(&self, id: &str) -> anyhow::Result<bool> {
+        let write = self.db.begin_write()?;
+        let mut nodes = write.open_table(MAP_NODES)?;
+        let node: MapNodeRecord = match nodes.get(id)? {
+            Some(record) => serde_json::from_slice(record.value())?,
+            None => return Ok(true),
+        };
+        if !node.is_draft() || !matches!(node.status.as_str(), "done" | "failed" | "cancelled") {
+            return Ok(false);
+        }
+        nodes.remove(id)?;
+        drop(nodes);
+        write.open_table(META)?.remove(id)?;
+        {
+            let mut fields = write.open_table(FIELDS)?;
+            for ch in Channel::ALL {
+                fields.remove((id, ch as u8))?;
+            }
+        }
+        {
+            let mut jobs = write.open_table(JOBS)?;
+            let mut remove = None;
+            for row in jobs.iter()? {
+                let (key, value) = row?;
+                let job: JobRecord = serde_json::from_slice(value.value())?;
+                if job.map_id == id {
+                    remove = Some(key.value().to_owned());
+                    break;
+                }
+            }
+            if let Some(key) = remove {
+                jobs.remove(key.as_str())?;
+            }
+        }
+        write.commit()?;
+        Ok(true)
+    }
+
     pub fn list_map_nodes(&self, world_id: &str) -> anyhow::Result<Vec<MapNodeRecord>> {
         let read = self.db.begin_read()?;
         let t = read.open_table(MAP_NODES)?;
@@ -801,5 +907,18 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    pub fn job_for_map(&self, map_id: &str) -> anyhow::Result<Option<JobRecord>> {
+        let read = self.db.begin_read()?;
+        let jobs = read.open_table(JOBS)?;
+        for row in jobs.iter()? {
+            let (_, value) = row?;
+            let job: JobRecord = serde_json::from_slice(value.value())?;
+            if job.map_id == map_id {
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
     }
 }

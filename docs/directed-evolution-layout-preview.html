@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TerraForge · 區域演化布局預覽</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; color: #263930; background: #346b73; font: 15px/1.55 system-ui, sans-serif; }
+  .map { position: fixed; inset: 0; width: 100%; height: 100%; }
+  .paper { background: #faf7ed; border: 1px solid #d7d0ba; border-radius: 16px; box-shadow: 0 6px 24px #233e3533; }
+  header { position: fixed; inset: 20px 20px auto; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  header strong { font: 25px Georgia, serif; }
+  main { position: fixed; top: 95px; right: 20px; width: min(370px, calc(100% - 40px)); max-height: calc(100dvh - 114px); overflow: auto; padding: 16px 18px; }
+  h1 { margin: 6px 0 4px; font: 26px Georgia, serif; }
+  p { margin: 5px 0 12px; }
+  .muted { color: #566759; font-size: 13px; }
+  .eyebrow { font-size: 12px; color: #566759; letter-spacing: .13em; }
+  label { display: grid; gap: 3px; }
+  input, select, button { font: inherit; color: inherit; background: #fffdf7; border: 1px solid #c9ccbb; border-radius: 8px; padding: 6px 10px; }
+  button { cursor: pointer; }
+  button[aria-pressed="true"], .primary { color: white; background: #395e49; border-color: #395e49; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 8px 0; }
+  .row input { width: 100%; }
+  .note { background: #edf0e4; border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+  hr { border: 0; border-top: 1px solid #d7d0ba; margin: 13px 0; }
+  dl { margin: 6px 0; display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; }
+  dd { margin: 0; }
+  .key { position: fixed; left: 20px; bottom: 20px; padding: 8px 13px; }
+  .before .candidate, .after .original { display: none; }
+  @media (max-width: 650px) {
+    header { inset: 10px 10px auto; }
+    main { inset: auto 10px 10px; width: auto; max-height: 57dvh; }
+    .key { display: none; }
+  }
+</style>
+<body class="after">
+<svg class="map" viewBox="0 0 1200 810" preserveAspectRatio="xMidYMid slice" role="img" aria-label="海峽與港口位置示意圖">
+  <defs>
+    <linearGradient id="water" x2=".9" y2="1"><stop stop-color="#387980"/><stop offset="1" stop-color="#1e525f"/></linearGradient>
+    <linearGradient id="land" x2=".7" y2="1"><stop stop-color="#d7ce9f"/><stop offset=".58" stop-color="#8ca47e"/><stop offset="1" stop-color="#c4ba83"/></linearGradient>
+  </defs>
+  <path fill="url(#water)" d="M0 0h1200v810H0z"/>
+  <g fill="url(#land)" stroke="#8cb3a1" stroke-width="12" stroke-linejoin="round">
+    <path d="M-55 290L90 222 154 241 222 204 282 240 325 198 371 258 409 245 423 284 473 307 489 345 461 375 485 408 461 454 405 468 361 508 321 505 284 554 215 530 187 567 136 529 91 554 20 501-55 523Z"/>
+    <path d="M513 305L549 281 576 302 604 251 651 277 697 220 748 241 810 208 879 263 919 244 972 284 1032 260 1100 316 1200 303 1230 514 1130 549 1078 519 1040 576 971 556 908 583 848 525 788 546 724 505 682 518 619 482 574 495 552 460 517 449 497 411 527 371 507 345Z"/>
+    <path class="original" d="M472 350L508 338 530 373 506 404 475 413 450 374Z"/>
+    <path d="M354 629l29-17 24 14-12 25-25 5zM557 555l22 1 9 19-17 12-24-13zM595 604l31-4 14 21-26 23-21-19z"/>
+  </g>
+  <path d="M503 285Q466 323 503 369Q459 408 499 461" fill="none" stroke="#eac47c" stroke-width="64" stroke-opacity=".26" stroke-linecap="round"/>
+  <path d="M503 285Q466 323 503 369Q459 408 499 461" fill="none" stroke="#f4d7a2" stroke-width="2" stroke-dasharray="6 5"/>
+  <circle cx="417" cy="330" r="29" fill="#f7f4e1" fill-opacity=".25" stroke="#f7f4e1" stroke-width="2"/>
+  <circle cx="417" cy="330" r="5" fill="#294f3c"/>
+  <text x="393" y="290" fill="#243a2e" font-family="system-ui" font-size="17">保護港口</text>
+</svg>
+<header class="paper"><strong>TerraForge</strong><span class="muted">區域演化 · 布局預覽</span></header>
+<main class="paper" aria-labelledby="heading">
+  <div class="eyebrow">圖層與選區 / 修改工具</div>
+  <h1 id="heading">區域定向演化</h1>
+  <p class="muted">圈選要演化的地方，試算後比較前後差異。</p>
+  <div class="row"><button type="button" disabled>選演化範圍</button><button type="button" disabled>加保護區</button></div>
+  <div class="note">已選範圍 · 中央陸橋<br>保護區 · 西岸港口</div>
+  <label>作用方式 <select><option>下沉</option><option>抬升</option><option>侵蝕</option></select></label>
+  <div class="row"><label>累計下沉（公尺）<input type="number" value="240"></label><label>演化時間（千年）<input type="number" value="100"></label></div>
+  <details open>
+    <summary>海峽條件 · 容許自動修正</summary>
+    <p class="muted">已標記兩側海域，搜尋範圍顯示於地圖。</p>
+    <div class="row"><label>最小寬度（公里）<input type="number" value="4"></label><label>最小水深（公尺）<input type="number" value="20"></label></div>
+  </details>
+  <hr>
+  <div class="eyebrow">試算結果示例</div>
+  <div class="row"><button type="button" id="before" aria-pressed="false">看原圖</button><button type="button" id="after" aria-pressed="true">看候選圖</button></div>
+  <dl><dt>海域連通</dt><dd>已打通</dd><dt>最小寬度／深度</dt><dd>4.2 公里／31 公尺</dd><dt>港口保護區</dt><dd>通過</dd></dl>
+  <p class="muted">套用後建立新版地圖，可切回原版。</p>
+  <div class="row"><button type="button" disabled>重新試算</button><button type="button" class="primary" disabled>套用為新版本</button></div>
+</main>
+<div class="paper key">虛線 · 演化範圍　○ · 保護區</div>
+<script>
+  const before = document.getElementById('before');
+  const after = document.getElementById('after');
+  function compare(showAfter) {
+    document.body.className = showAfter ? 'after' : 'before';
+    before.setAttribute('aria-pressed', String(!showAfter));
+    after.setAttribute('aria-pressed', String(showAfter));
+  }
+  before.onclick = () => compare(false);
+  after.onclick = () => compare(true);
+</script>
+</body>
+</html>

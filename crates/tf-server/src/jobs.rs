@@ -171,6 +171,18 @@ impl JobManager {
         node: MapNodeRecord,
         params: tf_core::params::GenerationParams,
     ) -> anyhow::Result<String> {
+        self.submit_with_evolution(map_id, world_id, node, params, None)
+            .await
+    }
+
+    pub(crate) async fn submit_with_evolution(
+        &self,
+        map_id: String,
+        world_id: String,
+        node: MapNodeRecord,
+        params: tf_core::params::GenerationParams,
+        evolution: Option<tf_sim::directed::Plan>,
+    ) -> anyhow::Result<String> {
         let mut st = self.inner.state.lock().await;
         anyhow::ensure!(
             st.tickets.len() < self.inner.max_queue,
@@ -214,7 +226,7 @@ impl JobManager {
         let me = self.clone();
         let id = job_id.clone();
         tokio::spawn(async move {
-            me.run_job(id, map_id, node, params, cancel).await;
+            me.run_job(id, node, params, evolution, cancel).await;
         });
         Ok(job_id)
     }
@@ -255,9 +267,9 @@ impl JobManager {
     async fn run_job(
         &self,
         id: String,
-        map_id: String,
         node: MapNodeRecord,
         params: tf_core::params::GenerationParams,
+        evolution: Option<tf_sim::directed::Plan>,
         cancel: Arc<AtomicBool>,
     ) {
         let acquired = loop {
@@ -302,14 +314,16 @@ impl JobManager {
         let store = self.inner.store.clone();
         let tx = self.inner.tx.clone();
         let jid = id.clone();
-        let mid = map_id.clone();
+        let map_id = node.id.clone();
         let flag = cancel.clone();
         let frames = self.inner.frames.clone();
         let result = tokio::task::spawn_blocking(move || {
             let _memory_permit = memory_permit;
-            if node.parent.is_none() {
+            if let Some(plan) = evolution {
+                crate::directed::run(&store, &tx, &jid, &node, &params, &plan, &flag)
+            } else if node.parent.is_none() {
                 crate::generate::run_generation(
-                    &store, &tx, &frames, &jid, &mid, &node, &params, &flag,
+                    &store, &tx, &frames, &jid, &node.id, &node, &params, &flag,
                 )
             } else {
                 crate::child_gen::run_child_generation(

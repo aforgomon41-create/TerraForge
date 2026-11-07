@@ -675,6 +675,177 @@ details > label + label {
 .right-stack.ecosystem-open > aside {
   flex-shrink: 0;
 }
+.right-stack.evolution-open {
+  width: min(370px, calc(100vw - 40px));
+}
+.evolution-entry {
+  margin-top: 14px;
+}
+.evolution-heading,
+.evolution-protection {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.evolution-protection {
+  align-items: end;
+  margin-top: 5px;
+}
+.evolution-protection label {
+  flex: 1;
+  min-width: 0;
+}
+.evolution-panel button {
+  white-space: normal;
+}
+.evolution-panel input:not([type='checkbox']) {
+  width: 100%;
+  min-width: 0;
+}
+.evolution-panel fieldset {
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+.evolution-row {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  margin-block: 8px;
+}
+.evolution-row > * {
+  flex: 1;
+  min-width: 0;
+}
+.evolution-note {
+  background: #e9eee1;
+  padding: 8px 10px;
+  border-radius: 8px;
+  margin-block: 8px 12px;
+  font-size: 12px;
+}
+.evolution-note .evolution-row {
+  align-items: center;
+  margin-block: 0 5px;
+}
+.evolution-note .evolution-row button,
+.evolution-protection button {
+  flex: 0 0 auto;
+}
+.evolution-panel .evolution-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+}
+.evolution-form > button {
+  margin-top: 12px;
+}
+.evolution-result {
+  margin-top: 15px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.evolution-result button[aria-pressed='true'] {
+  background: #395e49;
+  color: #fffdf7;
+}
+.evolution-result dl {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 5px 10px;
+  font-size: 12px;
+}
+.evolution-result dd {
+  margin: 0;
+  text-align: right;
+}
+.evolution-error {
+  color: #863e26;
+}
+.evolution-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 4;
+}
+.evolution-overlay .area {
+  color: #f2c470;
+}
+.evolution-overlay .protection {
+  color: #fff8df;
+}
+.evolution-overlay .corridor {
+  color: #aef0ed;
+}
+.evolution-overlay circle:not(.evolution-anchor),
+.evolution-overlay .evolution-line {
+  fill: currentColor;
+  fill-opacity: 0.2;
+  stroke: currentColor;
+  stroke-width: 2px;
+  stroke-dasharray: 5 4;
+}
+.evolution-overlay .evolution-line,
+.evolution-overlay .evolution-band {
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.evolution-overlay .evolution-band {
+  stroke-opacity: 0.23;
+}
+.evolution-overlay .evolution-anchor {
+  fill: #264c41;
+  stroke: currentColor;
+  stroke-width: 2px;
+}
+.map-canvas.evolution-picking {
+  cursor: crosshair;
+}
+.evolution-pick-bar {
+  position: absolute;
+  z-index: 27;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 24px);
+  width: max-content;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.evolution-pick-bar button {
+  flex-shrink: 0;
+}
+@media (min-width: 761px) {
+  .evolution-active .map-controls {
+    right: 406px;
+  }
+}
+@media (max-width: 760px) {
+  .right-stack.evolution-open {
+    width: auto;
+    max-width: 370px;
+  }
+  .right-stack.evolution-selecting {
+    display: none;
+  }
+  .evolution-running .right-stack.evolution-open {
+    bottom: 144px;
+    max-height: calc(100% - 280px);
+  }
+  .evolution-pick-bar {
+    bottom: 82px;
+  }
+}
 .selection-facts .ecosystem-fact {
   grid-column: 1/-1;
   min-width: 0;
